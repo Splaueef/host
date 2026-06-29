@@ -431,6 +431,11 @@ class MistralModule(loader.Module):
         "loading":      "<b>⏳ Опрацьовую...</b>",
         "generating":   "<b>🎨 Генерую зображення...</b>",
         "error":        "<b>❌ Помилка:</b> <code>{error}</code>",
+        "api_unavailable": (
+            "<b>⚠️ Mistral API зараз не відповідає.</b>\n"
+            "<i>{reason}</i>\n\n"
+            "Спробуй повторити запит трохи пізніше."
+        ),
         "chat_answer": (
             "<b>👤</b> {question}\n"
             "<b>🤖</b> {answer}\n\n"
@@ -663,6 +668,42 @@ class MistralModule(loader.Module):
 
     def _ok(self) -> bool:
         return bool(self.config["api_key"].strip())
+
+    def _is_retryable_error(self, error: Exception) -> bool:
+        text = str(error)
+        return (
+            "таймаут" in text
+            or "HTTP 408" in text
+            or "HTTP 409" in text
+            or "HTTP 429" in text
+            or "HTTP 5" in text
+            or isinstance(error, (aiohttp.ClientError, asyncio.TimeoutError))
+        )
+
+    def _friendly_api_error(self, error: Exception) -> str:
+        text = str(error).strip() or error.__class__.__name__
+        if "таймаут" in text:
+            return (
+                f"Таймаут запиту до Mistral API ({self.config['timeout']}с). "
+                "Сервіс не встиг відповісти."
+            )
+        if "HTTP 429" in text:
+            return "Ліміт або rate limit Mistral API. Зачекай і повтори запит."
+        if "HTTP 401" in text or "HTTP 403" in text:
+            return "Mistral API відхилив ключ або доступ до моделі. Перевір .config MistralAI."
+        if "HTTP 404" in text:
+            return "Mistral API не знайшов endpoint, модель або агента. Перевір налаштування моделі/agent_id."
+        if "HTTP 5" in text or "Server disconnected" in text:
+            return f"Проблема на боці Mistral API: {text}"
+        if isinstance(error, aiohttp.ClientError):
+            return f"Мережева помилка підключення до Mistral API: {text}"
+        return text
+
+    def _api_error_answer(self, error: Exception) -> str:
+        reason = _html_escape(self._friendly_api_error(error))
+        if self._is_retryable_error(error):
+            return self.strings["api_unavailable"].format(reason=reason)
+        return self.strings["error"].format(error=reason)
 
     def _save_auto(self):
         self.db.set("MistralAI", "auto_chats", list(self._auto_chats.keys()))
@@ -936,11 +977,13 @@ class MistralModule(loader.Module):
             except asyncio.TimeoutError:
                 last_err = RuntimeError(f"таймаут ({self.config['timeout']}с)")
             except RuntimeError as e:
-                if "HTTP 5" not in str(e) or attempt >= retries:
+                if not self._is_retryable_error(e) or attempt >= retries:
                     raise
                 last_err = e
-            except Exception as e:
+            except aiohttp.ClientError as e:
                 last_err = RuntimeError(str(e))
+            except Exception as e:
+                raise RuntimeError(str(e))
             if attempt < retries:
                 await asyncio.sleep(1.5 * (attempt + 1))
         raise last_err
@@ -949,31 +992,41 @@ class MistralModule(loader.Module):
         url = f"{BASE_URL}{path}"
         payload = {**payload, "stream": True}
         chunks = []
-        async with self._session.post(
-            url, json=payload, headers=self._h(), timeout=self._to()
-        ) as r:
-            if r.status >= 400:
-                await self._read_json_response(r)
-            async for line in r.content:
-                line = line.decode("utf-8").strip()
-                if not line.startswith("data:"):
-                    continue
-                raw = line[5:].strip()
-                if raw == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(raw)
-                    delta = obj["choices"][0]["delta"].get("content", "")
-                    if delta:
-                        chunks.append(delta)
-                except Exception:
-                    pass
+        try:
+            async with self._session.post(
+                url, json=payload, headers=self._h(), timeout=self._to()
+            ) as r:
+                if r.status >= 400:
+                    await self._read_json_response(r)
+                async for line in r.content:
+                    line = line.decode("utf-8").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if raw == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(raw)
+                        delta = obj["choices"][0]["delta"].get("content", "")
+                        if delta:
+                            chunks.append(delta)
+                    except Exception:
+                        pass
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"таймаут ({self.config['timeout']}с)")
+        except aiohttp.ClientError as e:
+            raise RuntimeError(str(e))
         return "".join(chunks)
 
     async def _get(self, path: str) -> dict:
         url = f"{BASE_URL}{path}"
-        async with self._session.get(url, headers=self._h(), timeout=self._to()) as r:
-            return await self._read_json_response(r)
+        try:
+            async with self._session.get(url, headers=self._h(), timeout=self._to()) as r:
+                return await self._read_json_response(r)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"таймаут ({self.config['timeout']}с)")
+        except aiohttp.ClientError as e:
+            raise RuntimeError(str(e))
 
     async def _download_file(self, file_id: str) -> bytes:
         """Download a generated file from Mistral Files API."""
@@ -996,15 +1049,25 @@ class MistralModule(loader.Module):
 
     async def _delete(self, path: str) -> dict:
         url = f"{BASE_URL}{path}"
-        async with self._session.delete(url, headers=self._h(), timeout=self._to()) as r:
-            return await self._read_json_response(r)
+        try:
+            async with self._session.delete(url, headers=self._h(), timeout=self._to()) as r:
+                return await self._read_json_response(r)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"таймаут ({self.config['timeout']}с)")
+        except aiohttp.ClientError as e:
+            raise RuntimeError(str(e))
 
     async def _patch(self, path: str, payload: dict) -> dict:
         url = f"{BASE_URL}{path}"
-        async with self._session.patch(
-            url, json=payload, headers=self._h(), timeout=self._to()
-        ) as r:
-            return await self._read_json_response(r)
+        try:
+            async with self._session.patch(
+                url, json=payload, headers=self._h(), timeout=self._to()
+            ) as r:
+                return await self._read_json_response(r)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"таймаут ({self.config['timeout']}с)")
+        except aiohttp.ClientError as e:
+            raise RuntimeError(str(e))
 
     # ── API: Chat ──────────────────────────────────────────────────────────────
 
@@ -1145,31 +1208,38 @@ class MistralModule(loader.Module):
         last_update = time.monotonic()
         t0 = time.monotonic()
 
-        async with self._session.post(
-            url, json=payload, headers=self._h(), timeout=self._to()
-        ) as r:
-            async for line in r.content:
-                line = line.decode("utf-8").strip()
-                if not line.startswith("data:"):
-                    continue
-                raw = line[5:].strip()
-                if raw == "[DONE]":
-                    break
-                try:
-                    obj   = json.loads(raw)
-                    delta = obj["choices"][0]["delta"].get("content", "")
-                    if delta:
-                        chunks.append(delta)
-                except Exception:
-                    pass
-                now = time.monotonic()
-                if now - last_update >= _STREAM_UPDATE_INTERVAL and chunks:
-                    partial = "".join(chunks)
+        try:
+            async with self._session.post(
+                url, json=payload, headers=self._h(), timeout=self._to()
+            ) as r:
+                if r.status >= 400:
+                    await self._read_json_response(r)
+                async for line in r.content:
+                    line = line.decode("utf-8").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if raw == "[DONE]":
+                        break
                     try:
-                        await utils.answer(msg, f"<b>🤖</b> {_md_to_html(partial)}▌")
-                        last_update = now
+                        obj   = json.loads(raw)
+                        delta = obj["choices"][0]["delta"].get("content", "")
+                        if delta:
+                            chunks.append(delta)
                     except Exception:
                         pass
+                    now = time.monotonic()
+                    if now - last_update >= _STREAM_UPDATE_INTERVAL and chunks:
+                        partial = "".join(chunks)
+                        try:
+                            await utils.answer(msg, f"<b>🤖</b> {_md_to_html(partial)}▌")
+                            last_update = now
+                        except Exception:
+                            pass
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"таймаут ({self.config['timeout']}с)")
+        except aiohttp.ClientError as e:
+            raise RuntimeError(str(e))
 
         full = "".join(chunks)
         elapsed = time.monotonic() - t0
@@ -1327,10 +1397,15 @@ class MistralModule(loader.Module):
         h   = {"Authorization": f"Bearer {self.config['api_key']}", "Content-Type": "application/json"}
         payload = {"model": self.config["tts_model"], "voice": self.config["tts_voice"],
                    "input": text, "output_format": "pcm"}
-        async with self._session.post(url, json=payload, headers=h, timeout=self._to()) as r:
-            if r.status != 200:
-                raise RuntimeError(f"TTS {r.status}: {(await r.text())[:200]}")
-            raw = await r.read()
+        try:
+            async with self._session.post(url, json=payload, headers=h, timeout=self._to()) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"HTTP {r.status}: {(await r.text())[:200]}")
+                raw = await r.read()
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"таймаут ({self.config['timeout']}с)")
+        except aiohttp.ClientError as e:
+            raise RuntimeError(str(e))
         rate, ch, bits = 24000, 1, 16
         buf = io.BytesIO()
         buf.write(b"RIFF"); buf.write((36 + len(raw)).to_bytes(4, "little"))
@@ -1346,12 +1421,17 @@ class MistralModule(loader.Module):
         form = aiohttp.FormData()
         form.add_field("model", self.config["transcription_model"])
         form.add_field("file", audio, filename=fname, content_type="audio/ogg")
-        async with self._session.post(
-            url, data=form,
-            headers={"Authorization": f"Bearer {self.config['api_key']}"},
-            timeout=self._to()
-        ) as r:
-            d = await r.json()
+        try:
+            async with self._session.post(
+                url, data=form,
+                headers={"Authorization": f"Bearer {self.config['api_key']}"},
+                timeout=self._to()
+            ) as r:
+                d = await self._read_json_response(r)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"таймаут ({self.config['timeout']}с)")
+        except aiohttp.ClientError as e:
+            raise RuntimeError(str(e))
         if "error" in d:
             raise RuntimeError(str(d["error"]))
         return d.get("text", "")
@@ -1500,6 +1580,15 @@ class MistralModule(loader.Module):
         except RuntimeError as e:
             self._stats.inc(ok=False)
             logger.error("MistralAI watcher error: %s", e)
+            try:
+                await message.client.send_message(
+                    chat_id,
+                    self._api_error_answer(e),
+                    parse_mode="html",
+                    reply_to=message.id,
+                )
+            except Exception:
+                logger.exception("MistralAI watcher failed to send API error message")
             return
 
         # ── Обробляємо Werwolf теги у відповіді ──────────────────────────
@@ -1646,7 +1735,7 @@ class MistralModule(loader.Module):
             )
         except RuntimeError as e:
             self._stats.inc(ok=False)
-            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
+            await utils.answer(msg, self._api_error_answer(e))
 
     @loader.command(ru_doc="<питання> — Запитати з контекстом реплаю")
     async def mistralask(self, message):
@@ -1694,7 +1783,7 @@ class MistralModule(loader.Module):
             )
         except RuntimeError as e:
             self._stats.inc(ok=False)
-            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
+            await utils.answer(msg, self._api_error_answer(e))
 
     @loader.command(ru_doc="<модель> <питання> — Чат із конкретною моделлю")
     async def mistralm(self, message):
@@ -1721,7 +1810,7 @@ class MistralModule(loader.Module):
             )
         except RuntimeError as e:
             self._stats.inc(ok=False)
-            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
+            await utils.answer(msg, self._api_error_answer(e))
 
     # ── Генерація зображень ────────────────────────────────────────────────────
 
@@ -1758,7 +1847,7 @@ class MistralModule(loader.Module):
             await msg.delete()
         except RuntimeError as e:
             self._stats.inc(ok=False)
-            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
+            await utils.answer(msg, self._api_error_answer(e))
 
     # ── Mistral Platform Agents ────────────────────────────────────────────────
 
@@ -1785,7 +1874,7 @@ class MistralModule(loader.Module):
                 text = text[:4090] + "\n..."
             await utils.answer(msg, text)
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
+            await utils.answer(msg, self._api_error_answer(e))
 
     @loader.command(ru_doc="<agent_id> — Вибрати активного Mistral-агента")
     async def mistraluse(self, message):
@@ -1811,7 +1900,7 @@ class MistralModule(loader.Module):
                 self.strings["agent_set"].format(id=info["id"], name=info.get("name", "?")),
             )
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
+            await utils.answer(msg, self._api_error_answer(e))
 
     @loader.command(ru_doc="<agent_id> — Інфо про Mistral-агента")
     async def mistralагентinfo(self, message):
@@ -1834,7 +1923,7 @@ class MistralModule(loader.Module):
                 ),
             )
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
+            await utils.answer(msg, self._api_error_answer(e))
 
     @loader.command(ru_doc="<назва> | <модель> | <інструкція> | [tools] — Створити агента")
     async def mistralcreate(self, message):
@@ -1867,7 +1956,7 @@ class MistralModule(loader.Module):
                 self.strings["agent_created"].format(id=agent["id"], name=agent.get("name", name)),
             )
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
+            await utils.answer(msg, self._api_error_answer(e))
 
     @loader.command(ru_doc="<agent_id> — Видалити Mistral-агента")
     async def mistraldelete(self, message):
@@ -1886,7 +1975,7 @@ class MistralModule(loader.Module):
                 self._save_active_agent()
             await utils.answer(msg, self.strings["agent_deleted"].format(id=agent_id))
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
+            await utils.answer(msg, self._api_error_answer(e))
 
     # ── Авто-агент ────────────────────────────────────────────────────────────
 
@@ -1991,7 +2080,7 @@ class MistralModule(loader.Module):
                 text = text[:4090] + "\n..."
             await utils.answer(msg, text)
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
+            await utils.answer(msg, self._api_error_answer(e))
 
     @loader.command(ru_doc="— OCR зображення або PDF")
     async def mistralocr(self, message):
@@ -2018,7 +2107,7 @@ class MistralModule(loader.Module):
                 output = output[:4090] + "\n..."
             await utils.answer(msg, output)
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
+            await utils.answer(msg, self._api_error_answer(e))
 
     @loader.command(ru_doc="<текст> — Синтез мовлення (TTS)")
     async def mistralvoice(self, message):
@@ -2038,7 +2127,7 @@ class MistralModule(loader.Module):
             )
             await msg.delete()
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
+            await utils.answer(msg, self._api_error_answer(e))
 
     @loader.command(ru_doc="— Транскрипція аудіо")
     async def mistraltranscribe(self, message):
@@ -2060,7 +2149,7 @@ class MistralModule(loader.Module):
                 ),
             )
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
+            await utils.answer(msg, self._api_error_answer(e))
 
     @loader.command(ru_doc="<текст> — Ембединг тексту")
     async def mistralembed(self, message):
@@ -2081,7 +2170,7 @@ class MistralModule(loader.Module):
                 ),
             )
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
+            await utils.answer(msg, self._api_error_answer(e))
 
     @loader.command(ru_doc="<текст> — Модерація тексту")
     async def mistralmod(self, message):
@@ -2105,7 +2194,7 @@ class MistralModule(loader.Module):
                 ),
             )
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
+            await utils.answer(msg, self._api_error_answer(e))
 
     @loader.command(ru_doc="— Статистика використання")
     async def mistralstats(self, message):
