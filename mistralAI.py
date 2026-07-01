@@ -236,21 +236,31 @@ def _parse_conversation_output(data: dict) -> tuple[str, list[bytes]]:
         else:
             images.append(url.encode())
 
-    def walk(obj):
+    seen_texts: set[str] = set()
+
+    def add_text(value):
+        text = _mistral_content_to_text(value).strip()
+        if text and text not in seen_texts:
+            seen_texts.add(text)
+            texts.append(text)
+
+    def walk(obj, key_hint: str = ""):
         if isinstance(obj, str):
+            if key_hint in {"content", "text", "output_text"}:
+                add_text(obj)
             return
         if isinstance(obj, list):
             for item in obj:
-                walk(item)
+                walk(item, key_hint)
             return
         if not isinstance(obj, dict):
             return
 
-        ctype = obj.get("type", "")
-        if ctype in {"text", "output_text"} and obj.get("text"):
-            texts.append(str(obj.get("text")))
-        elif ctype in {"message.output", "message"}:
-            pass
+        ctype = str(obj.get("type", ""))
+        if ctype in {"text", "output_text", "message.output", "message"}:
+            for key in ("text", "content"):
+                if key in obj:
+                    add_text(obj[key])
         elif ctype in {"image_url", "input_image"}:
             img = obj.get("image_url") or obj.get("url") or ""
             add_image_url(img if isinstance(img, str) else img.get("url", ""))
@@ -267,11 +277,23 @@ def _parse_conversation_output(data: dict) -> tuple[str, list[bytes]]:
             ):
                 images.append(f"mistral-file://{file_id}".encode())
 
-        for key in ("content", "outputs", "chunks", "data"):
+        # Conversations responses have changed shape over time. Some responses
+        # put text directly into output.content as a string, while others use
+        # typed blocks under content/chunks/data. Preserve both forms.
+        for key in ("content", "outputs", "chunks", "data", "message"):
             if key in obj and obj[key] is not obj:
-                walk(obj[key])
+                walk(obj[key], key)
 
-    walk(data.get("outputs", []))
+    walk(data.get("outputs", []), "outputs")
+    if not texts:
+        # Defensive fallback for chat-completion-like payloads or future aliases.
+        for choice in data.get("choices", []) if isinstance(data.get("choices"), list) else []:
+            message = choice.get("message", {}) if isinstance(choice, dict) else {}
+            if isinstance(message, dict) and "content" in message:
+                add_text(message.get("content"))
+        for key in ("output_text", "text", "content"):
+            if key in data:
+                add_text(data[key])
     return "\n".join(t for t in texts if t).strip(), images
 
 
