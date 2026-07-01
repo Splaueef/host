@@ -165,6 +165,7 @@ class GemmaSelf(loader.Module):
             loader.ConfigValue("stream_min_chars", 24, "Мінімум нових символів перед редагуванням"),
             loader.ConfigValue("daily_user_limit", 0, "Денний ліміт ШІ-запитів на користувача (0=∞)"),
             loader.ConfigValue("limit_exempt_chats", [], "ID чатів, де ліміти ШІ-запитів не діють"),
+            loader.ConfigValue("ignored_user_ids", [7635755119], "ID користувачів, яких ШІ повністю ігнорує"),
             loader.ConfigValue("reply_all_in_allowed_groups", True, "Відповідати всім користувачам у дозволених групах"),
         )
         self._me      = None
@@ -410,6 +411,9 @@ class GemmaSelf(loader.Module):
             return
 
         sender_id = getattr(message, "sender_id", 0) or 0
+        if sender_id in self._ids(self.config["ignored_user_ids"]):
+            return
+
         if not self._quota_allowed(chat_id, sender_id):
             await message.reply(self._quota_message())
             return

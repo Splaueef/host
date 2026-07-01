@@ -635,6 +635,11 @@ class MistralModule(loader.Module):
                 "User IDs без лімітів через кому; власник Hikka також завжди без ліміту",
             ),
             loader.ConfigValue(
+                "agent_ignored_users",
+                "7635755119",
+                "User IDs, яких авто-агент повністю ігнорує через кому",
+            ),
+            loader.ConfigValue(
                 "vector_memory", False,
                 "Векторна пам'ять (потребує numpy)",
                 validator=loader.validators.Boolean(),
@@ -1521,6 +1526,8 @@ class MistralModule(loader.Module):
         if not self._ok():
             return
         if self._me and message.sender_id == self._me.id:
+            return
+        if message.sender_id in self._csv_ints(self.config["agent_ignored_users"]):
             return
 
         chat_id = message.chat_id
