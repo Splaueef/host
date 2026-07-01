@@ -4,6 +4,7 @@
 
 import calendar
 import datetime
+import time
 from collections import defaultdict
 
 from telethon.tl.types import PeerUser
@@ -21,6 +22,7 @@ class ChatAnalysisMod(loader.Module):
         "empty": "📭 <b>У цьому чаті не знайдено повідомлень для аналізу.</b>",
         "done": "📈 <b>Повний аналіз чату</b>\n",
         "error": "🚫 <b>Не вдалося проаналізувати чат:</b> <code>{}</code>",
+        "progress": "⏳ <b>Аналізую чат...</b>\n🔎 Проскановано повідомлень: <b>{}</b>",
     }
 
     def __init__(self):
@@ -56,19 +58,28 @@ class ChatAnalysisMod(loader.Module):
         status = await utils.answer(message, self.strings["started"])
 
         try:
-            text = await self._build_analysis(message)
+            text = await self._build_analysis(message, status)
         except Exception as e:
             return await utils.answer(status, self.strings["error"].format(utils.escape_html(str(e))))
 
         await utils.answer(status, text)
 
-    async def _build_analysis(self, message):
+    async def _build_analysis(self, message, status):
         stats = self._new_stats()
         chat = await message.get_chat()
         chat_title = self._chat_title(chat)
         chat_type = self._chat_type(message)
 
+        scanned = 0
+        last_progress_at = time.monotonic()
+
         async for msg in message.client.iter_messages(message.to_id, reverse=True):
+            scanned += 1
+            now = time.monotonic()
+            if now - last_progress_at >= 10:
+                await utils.answer(status, self.strings["progress"].format(scanned))
+                last_progress_at = now
+
             if not self._is_countable(msg):
                 continue
 
