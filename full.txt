@@ -1,4 +1,4 @@
-chat_analysis
+analysis
 eval
 gemmaself
 math
