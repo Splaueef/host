@@ -4,6 +4,7 @@ __version__ = (4, 0, 0)
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 
@@ -120,6 +121,7 @@ class GemmaSelf(loader.Module):
         "removed": "❌ <b>Чат видалено з білого списку</b>",
         "cleared": "🗑 <b>Історію чату очищено</b>",
         "busy":    "⏳ Зачекай, ще обробляю попереднє повідомлення…",
+        "thinking": "⏳ Думаю…",
     }
 
     def __init__(self):
@@ -153,6 +155,9 @@ class GemmaSelf(loader.Module):
             loader.ConfigValue("keep_recent",   6, "Скільки останніх не стискати"),
             loader.ConfigValue("max_tokens",  120, "Ліміт токенів відповіді"),
             loader.ConfigValue("timeout",     120, "Таймаут запиту (секунди)"),
+            loader.ConfigValue("stream", True, "Поступово редагувати повідомлення під час генерації"),
+            loader.ConfigValue("stream_edit_interval", 1.2, "Мінімальна пауза між редагуваннями (секунди)"),
+            loader.ConfigValue("stream_min_chars", 24, "Мінімум нових символів перед редагуванням"),
         )
         self._me      = None
         self._rl      = _RateLimiter()
@@ -184,20 +189,24 @@ class GemmaSelf(loader.Module):
 
     # ── AI ────────────────────────────────────────────────────────────────
 
-    async def _call_ollama(self, history: list):
-        url       = f"{self.config['api_url'].rstrip('/')}/chat/completions"
-        system    = self._pcache.get(dict(self.config))   # з кешу, не перебудовує щоразу
+    def _build_payload(self, history: list, stream: bool = False) -> dict:
+        system     = self._pcache.get(dict(self.config))   # з кешу, не перебудовує щоразу
         compressed = _compress_history(history, self.config["keep_recent"])
 
-        payload = {
+        return {
             "model":      self.config["model"],
             "max_tokens": self.config["max_tokens"],
             "temperature": 0.8,
+            "stream": stream,
             "messages": [
                 {"role": "system", "content": system},
                 *compressed,
             ],
         }
+
+    async def _call_ollama(self, history: list):
+        url     = f"{self.config['api_url'].rstrip('/')}/chat/completions"
+        payload = self._build_payload(history)
 
         t0 = time.monotonic()
         try:
@@ -211,6 +220,46 @@ class GemmaSelf(loader.Module):
         except Exception as e:
             logger.error("GemmaSelf: %s", e)
         return None
+
+    async def _stream_ollama(self, history: list):
+        url     = f"{self.config['api_url'].rstrip('/')}/chat/completions"
+        payload = self._build_payload(history, stream=True)
+
+        t0 = time.monotonic()
+        try:
+            timeout = aiohttp.ClientTimeout(total=self.config["timeout"])
+            async with self._session.post(url, json=payload, timeout=timeout) as resp:
+                async for raw_line in resp.content:
+                    line = raw_line.decode("utf-8", errors="ignore").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+
+                    chunk = line[5:].strip()
+                    if chunk == "[DONE]":
+                        break
+
+                    try:
+                        data = json.loads(chunk)
+                    except json.JSONDecodeError:
+                        continue
+
+                    delta = data.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        yield content
+
+                logger.debug("GemmaSelf stream: %.1fс", time.monotonic() - t0)
+        except asyncio.TimeoutError:
+            logger.warning("GemmaSelf stream: таймаут")
+        except Exception as e:
+            logger.error("GemmaSelf stream: %s", e)
+
+    async def _safe_edit(self, message, text: str):
+        try:
+            await message.edit(text[:4096])
+        except Exception as e:
+            if "message is not modified" not in str(e).lower():
+                logger.debug("GemmaSelf edit: %s", e)
 
     # ── Commands ──────────────────────────────────────────────────────────
 
@@ -279,11 +328,36 @@ class GemmaSelf(loader.Module):
             self._append(chat_id, "user", f"{name}: {message.text}")
 
             try:
-                async with message.client.action(chat_id, "typing"):
-                    response = await self._call_ollama(self._get_history(chat_id))
+                if self.config["stream"]:
+                    answer = await message.reply(self.strings["thinking"])
+                    response = ""
+                    last_edit_at = 0
+                    last_edit_len = 0
 
-                if response:
-                    await message.reply(response)
-                    self._append(chat_id, "assistant", response)
+                    async with message.client.action(chat_id, "typing"):
+                        async for part in self._stream_ollama(self._get_history(chat_id)):
+                            response += part
+                            now = time.monotonic()
+                            enough_time = now - last_edit_at >= self.config["stream_edit_interval"]
+                            enough_text = len(response) - last_edit_len >= self.config["stream_min_chars"]
+
+                            if enough_time and enough_text:
+                                await self._safe_edit(answer, response.strip() or self.strings["thinking"])
+                                last_edit_at = now
+                                last_edit_len = len(response)
+
+                    response = response.strip()
+                    if response:
+                        await self._safe_edit(answer, response)
+                        self._append(chat_id, "assistant", response)
+                    else:
+                        await answer.delete()
+                else:
+                    async with message.client.action(chat_id, "typing"):
+                        response = await self._call_ollama(self._get_history(chat_id))
+
+                    if response:
+                        await message.reply(response)
+                        self._append(chat_id, "assistant", response)
             except Exception as e:
                 logger.error("GemmaSelf: %s", e)
