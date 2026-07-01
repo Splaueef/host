@@ -1,12 +1,13 @@
 # meta developer: @Huai_Baike
 
-__version__ = (4, 0, 0)
+__version__ = (4, 1, 1)
 
 import asyncio
 import hashlib
 import json
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 from .. import loader, utils
@@ -122,6 +123,10 @@ class GemmaSelf(loader.Module):
         "cleared": "🗑 <b>Історію чату очищено</b>",
         "busy":    "⏳ Зачекай, ще обробляю попереднє повідомлення…",
         "thinking": "⏳ Думаю…",
+        "quota_exhausted": (
+            "⛔️ Ліміт ШІ-запитів вичерпано. "
+            "Нові запити відновляться <b>{reset_at}</b>."
+        ),
     }
 
     def __init__(self):
@@ -158,6 +163,9 @@ class GemmaSelf(loader.Module):
             loader.ConfigValue("stream", True, "Поступово редагувати повідомлення під час генерації"),
             loader.ConfigValue("stream_edit_interval", 1.2, "Мінімальна пауза між редагуваннями (секунди)"),
             loader.ConfigValue("stream_min_chars", 24, "Мінімум нових символів перед редагуванням"),
+            loader.ConfigValue("daily_user_limit", 0, "Денний ліміт ШІ-запитів на користувача (0=∞)"),
+            loader.ConfigValue("limit_exempt_chats", [], "ID чатів, де ліміти ШІ-запитів не діють"),
+            loader.ConfigValue("reply_all_in_allowed_groups", True, "Відповідати всім користувачам у дозволених групах"),
         )
         self._me      = None
         self._rl      = _RateLimiter()
@@ -187,6 +195,84 @@ class GemmaSelf(loader.Module):
         msgs.append({"role": role, "content": _truncate(content, _MSG_CHAR_LIMIT)})
         self._save_history(chat_id, msgs)
 
+
+    # ── Quotas ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _quota_day() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _quota_reset_at() -> str:
+        tomorrow = datetime.now(timezone.utc).date() + timedelta(days=1)
+        reset_at = datetime.combine(tomorrow, datetime.min.time(), timezone.utc)
+        return reset_at.strftime("%Y-%m-%d %H:%M UTC")
+
+    def _quota_state(self) -> dict:
+        state = self.get("quota", {})
+        return state if isinstance(state, dict) else {}
+
+    @staticmethod
+    def _ids(value) -> set[int]:
+        if isinstance(value, (list, tuple, set)):
+            items = value
+        else:
+            items = str(value or "").replace(";", ",").split(",")
+
+        result = set()
+        for item in items:
+            try:
+                result.add(int(item))
+            except (TypeError, ValueError):
+                logger.warning("GemmaSelf: некоректний ID у списку лімітів: %s", item)
+        return result
+
+    def _quota_key(self, user_id: int) -> str:
+        return str(user_id or 0)
+
+    def _quota_exempt(self, chat_id: int) -> bool:
+        return chat_id in self._ids(self.config["limit_exempt_chats"])
+
+    def _quota_used(self, user_id: int) -> int:
+        item = self._quota_state().get(self._quota_key(user_id), {})
+        return int(item.get("count", 0)) if item.get("day") == self._quota_day() else 0
+
+    def _quota_allowed(self, chat_id: int, user_id: int) -> bool:
+        if self._quota_exempt(chat_id):
+            return True
+
+        limit = int(self.config["daily_user_limit"] or 0)
+        return limit <= 0 or self._quota_used(user_id) < limit
+
+    def _quota_inc(self, user_id: int):
+        limit = int(self.config["daily_user_limit"] or 0)
+        if limit <= 0:
+            return
+
+        state = self._quota_state()
+        key = self._quota_key(user_id)
+        state[key] = {"day": self._quota_day(), "count": self._quota_used(user_id) + 1}
+        self.set("quota", state)
+
+    @staticmethod
+    def _retry_after_reset_at(value: str | None) -> str | None:
+        if not value:
+            return None
+        try:
+            seconds = max(0, int(value))
+        except (TypeError, ValueError):
+            return None
+
+        reset_at = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        return reset_at.strftime("%Y-%m-%d %H:%M UTC")
+
+    def _quota_message(self, reset_at: str | None = None) -> str:
+        return self.strings["quota_exhausted"].format(reset_at=reset_at or self._quota_reset_at())
+
+    @staticmethod
+    def _is_quota_message(text: str) -> bool:
+        return text.startswith("⛔️ Ліміт ШІ-запитів вичерпано.")
+
     # ── AI ────────────────────────────────────────────────────────────────
 
     def _build_payload(self, history: list, stream: bool = False) -> dict:
@@ -212,6 +298,11 @@ class GemmaSelf(loader.Module):
         try:
             timeout = aiohttp.ClientTimeout(total=self.config["timeout"])
             async with self._session.post(url, json=payload, timeout=timeout) as resp:
+                if resp.status == 429:
+                    logger.warning("GemmaSelf: API quota/rate limit exhausted")
+                    reset_at = self._retry_after_reset_at(resp.headers.get("Retry-After"))
+                    return self._quota_message(reset_at)
+
                 data = await resp.json()
                 logger.debug("GemmaSelf: %.1fс", time.monotonic() - t0)
                 return data["choices"][0]["message"]["content"].strip()
@@ -229,6 +320,12 @@ class GemmaSelf(loader.Module):
         try:
             timeout = aiohttp.ClientTimeout(total=self.config["timeout"])
             async with self._session.post(url, json=payload, timeout=timeout) as resp:
+                if resp.status == 429:
+                    logger.warning("GemmaSelf stream: API quota/rate limit exhausted")
+                    reset_at = self._retry_after_reset_at(resp.headers.get("Retry-After"))
+                    yield self._quota_message(reset_at)
+                    return
+
                 async for raw_line in resp.content:
                     line = raw_line.decode("utf-8", errors="ignore").strip()
                     if not line or not line.startswith("data:"):
@@ -309,7 +406,12 @@ class GemmaSelf(loader.Module):
             except Exception:
                 pass
 
-        if not is_private and not is_reply_to_me:
+        if not is_private and not is_reply_to_me and not self.config["reply_all_in_allowed_groups"]:
+            return
+
+        sender_id = getattr(message, "sender_id", 0) or 0
+        if not self._quota_allowed(chat_id, sender_id):
+            await message.reply(self._quota_message())
             return
 
         lock = self._rl.get(chat_id)
@@ -350,6 +452,8 @@ class GemmaSelf(loader.Module):
                     if response:
                         await self._safe_edit(answer, response)
                         self._append(chat_id, "assistant", response)
+                        if not self._is_quota_message(response) and not self._quota_exempt(chat_id):
+                            self._quota_inc(sender_id)
                     else:
                         await answer.delete()
                 else:
@@ -359,5 +463,7 @@ class GemmaSelf(loader.Module):
                     if response:
                         await message.reply(response)
                         self._append(chat_id, "assistant", response)
+                        if not self._is_quota_message(response) and not self._quota_exempt(chat_id):
+                            self._quota_inc(sender_id)
             except Exception as e:
                 logger.error("GemmaSelf: %s", e)
