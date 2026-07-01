@@ -154,6 +154,44 @@ def _md_to_html(text: str) -> str:
     text = re.sub(r"^#{1,3}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
     return text.strip()
 
+
+
+def _mistral_content_to_text(content) -> str:
+    """Normalize Mistral content chunks to plain text.
+
+    Mistral can return streamed/non-streamed content either as a string or as
+    a list of typed blocks. Older code only handled strings, so list blocks
+    were silently ignored and the module kept typing without sending anything.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                value = item.get("text") or item.get("content") or item.get("value")
+                if isinstance(value, str):
+                    parts.append(value)
+                elif value is not None:
+                    parts.append(str(value))
+        return "".join(parts)
+    return str(content)
+
+
+def _mistral_delta_to_text(obj: dict) -> str:
+    try:
+        choice = (obj.get("choices") or [{}])[0]
+        delta = choice.get("delta") or choice.get("message") or {}
+        if isinstance(delta, dict):
+            return _mistral_content_to_text(delta.get("content"))
+        return _mistral_content_to_text(delta)
+    except Exception:
+        return ""
+
 def _detect_lang(text: str) -> str:
     if not _HAS_LANGDETECT or not text.strip():
         return "uk"
@@ -1007,7 +1045,7 @@ class MistralModule(loader.Module):
                         break
                     try:
                         obj = json.loads(raw)
-                        delta = obj["choices"][0]["delta"].get("content", "")
+                        delta = _mistral_delta_to_text(obj)
                         if delta:
                             chunks.append(delta)
                     except Exception:
@@ -1087,9 +1125,13 @@ class MistralModule(loader.Module):
         t0 = time.monotonic()
         if stream:
             text = await self._post_stream("/v1/chat/completions", payload)
+            if not text.strip():
+                logger.warning("MistralAI: stream returned empty content; retrying without stream")
+                data = await self._post("/v1/chat/completions", payload)
+                text = _mistral_content_to_text(data["choices"][0]["message"].get("content"))
         else:
             data = await self._post("/v1/chat/completions", payload)
-            text = data["choices"][0]["message"]["content"]
+            text = _mistral_content_to_text(data["choices"][0]["message"].get("content"))
         return text, m, time.monotonic() - t0
 
     async def _chat_history(
@@ -1167,7 +1209,7 @@ class MistralModule(loader.Module):
             "messages": messages,
         }
         data = await self._post("/v1/chat/completions", payload)
-        return data["choices"][0]["message"]["content"]
+        return _mistral_content_to_text(data["choices"][0]["message"].get("content"))
 
     async def _chat_with_reply(self, question: str, reply_text: str,
                                 model: str | None = None) -> tuple[str, str, float]:
@@ -1185,7 +1227,7 @@ class MistralModule(loader.Module):
         }
         t0   = time.monotonic()
         data = await self._post("/v1/chat/completions", payload)
-        text = data["choices"][0]["message"]["content"]
+        text = _mistral_content_to_text(data["choices"][0]["message"].get("content"))
         return text, m, time.monotonic() - t0
 
     # ── API: Стрімінг ──────────────────────────────────────────────────────────
@@ -1223,7 +1265,7 @@ class MistralModule(loader.Module):
                         break
                     try:
                         obj   = json.loads(raw)
-                        delta = obj["choices"][0]["delta"].get("content", "")
+                        delta = _mistral_delta_to_text(obj)
                         if delta:
                             chunks.append(delta)
                     except Exception:
@@ -1242,6 +1284,10 @@ class MistralModule(loader.Module):
             raise RuntimeError(str(e))
 
         full = "".join(chunks)
+        if not full.strip():
+            logger.warning("MistralAI: live stream returned empty content; retrying without stream")
+            data = await self._post("/v1/chat/completions", {k: v for k, v in payload.items() if k != "stream"})
+            full = _mistral_content_to_text(data["choices"][0]["message"].get("content"))
         elapsed = time.monotonic() - t0
         return full, m, elapsed
 
@@ -1590,6 +1636,10 @@ class MistralModule(loader.Module):
             except Exception:
                 logger.exception("MistralAI watcher failed to send API error message")
             return
+
+        if not (reply_text or "").strip() and not images:
+            logger.warning("MistralAI watcher got an empty response")
+            reply_text = "⚠️ Mistral API повернув порожню відповідь. Спробуй вимкнути agent_stream або повторити запит."
 
         # ── Обробляємо Werwolf теги у відповіді ──────────────────────────
         if self._ww_ok():
