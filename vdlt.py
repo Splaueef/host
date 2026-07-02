@@ -418,10 +418,10 @@ class VideoDownloaderMod(loader.Module):
         ),
         "js_runtime_status":  "<b>🟢 JS Runtime: <code>{rt}</code></b>",
         "js_runtime_missing": "<b>🔴 JS Runtime: не знайдено (YouTube може не працювати!)</b>",
-        "caption_video":      "<b>✅ Завантажено через Юзербота.</b>",
-        "caption_audio":      "<b>🎵 MP3 через Юзербота.</b>",
-        "caption_photo":      "<b>🖼 Фото через Юзербота.</b>",
-        "caption_file":       "<b>📎 Файл через Юзербота.</b>",
+        "caption_video":      "<b>✅ <a href=\"https://t.me/RotKranz\">VIA</a></b>",
+        "caption_audio":      "<b>🎵 <a href=\"https://t.me/RotKranz\">VIA</a></b>",
+        "caption_photo":      "<b>🖼 <a href=\"https://t.me/RotKranz\">VIA</a></b>",
+        "caption_file":       "<b>📎 <a href=\"https://t.me/RotKranz\">VIA</a></b>",
         "caption_playlist":   "<b>📋 {title} ({idx}/{total})</b>",
         "transcript_header":  "<b>📝 Транскрипт: {title}</b>\n\n",
         "help_text": (
@@ -438,6 +438,7 @@ class VideoDownloaderMod(loader.Module):
             "<b>Транскрипт:</b>\n"
             "• <code>.vdlt [URL]</code> — транскрипт YouTube/Bilibili\n\n"
             "<b>Групи:</b> .vdladd / .vdlrm / .vdllist\n"
+            "<b>ЛС:</b> .vdlpm / .vdlpmlist — увімкнути автозавантаження для контакту\n"
             "<b>Бан:</b> .vdlban / .vdlunban / .vdlbans\n"
             "<b>Стат:</b> .vdlstats / .vdlreset\n\n"
             "<b>.vdlset [параметр] [значення]:</b>\n"
@@ -467,6 +468,7 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("playlist_enabled", False, "Дозволити плейлисти?"),
             loader.ConfigValue("playlist_max",     10,    "Макс. відео з плейлиста"),
             loader.ConfigValue("group_whitelist",  [],    "Білий список груп"),
+            loader.ConfigValue("private_whitelist", [],    "Контакти в ЛС з дозволеним автозавантаженням"),
             loader.ConfigValue("user_blacklist",   [],    "Чорний список юзерів"),
             loader.ConfigValue("ig_username",      "",    "Instagram логін"),
             loader.ConfigValue("ig_password",      "",    "Instagram пароль"),
@@ -568,8 +570,13 @@ class VideoDownloaderMod(loader.Module):
             self._stats["today"] = 0
             self._stats["day"] = today
 
+    def _private_peer_id(self, message):
+        return getattr(message, "chat_id", None) or getattr(message, "sender_id", None)
+
     def _is_allowed(self, message) -> bool:
-        return message.is_private or message.chat_id in self.config["group_whitelist"]
+        if message.is_private:
+            return self._private_peer_id(message) in self.config.get("private_whitelist", [])
+        return message.chat_id in self.config["group_whitelist"]
 
     def _is_banned(self, message) -> bool:
         uid = getattr(message.sender_id, "user_id", message.sender_id)
@@ -2556,6 +2563,40 @@ class VideoDownloaderMod(loader.Module):
             self.strings("whitelist_list").format(
                 "\n".join(f"• <code>{g}</code>" for g in wl)
             )
+        )
+
+
+    @loader.command()
+    async def vdlpm(self, message):
+        """Увімкнути/вимкнути автозавантаження для поточного контакту в ЛС"""
+        if not message.is_private:
+            return await utils.answer(message, "<b>❌ Тільки в особистих повідомленнях.</b>")
+        peer_id = self._private_peer_id(message)
+        if peer_id is None:
+            return await utils.answer(message, "<b>❌ Не вдалося визначити контакт.</b>")
+        wl = list(self.config.get("private_whitelist", []))
+        if peer_id in wl:
+            wl.remove(peer_id)
+            enabled = False
+        else:
+            wl.append(peer_id)
+            enabled = True
+        self.config["private_whitelist"] = wl
+        await utils.answer(
+            message,
+            f"<b>ЛС автозавантаження для <code>{peer_id}</code>: {'✅ ON' if enabled else '❌ OFF'}</b>",
+        )
+
+    @loader.command()
+    async def vdlpmlist(self, message):
+        """Список контактів у ЛС з дозволеним автозавантаженням"""
+        wl = self.config.get("private_whitelist", [])
+        if not wl:
+            return await utils.answer(message, "<b>📋 ЛС-білий список порожній.</b>")
+        await utils.answer(
+            message,
+            "<b>📋 ЛС автозавантаження дозволено для:</b>\n"
+            + "\n".join(f"• <code>{u}</code>" for u in wl),
         )
 
     @loader.command()
