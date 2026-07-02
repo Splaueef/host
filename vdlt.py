@@ -1859,18 +1859,51 @@ class VideoDownloaderMod(loader.Module):
 
     async def _get_transcript(self, url: str) -> tuple[str, str] | None:
         import yt_dlp
+        import requests
 
         cookies = _get_cookies(url)
         lang = self.config.get("transcript_lang", "uk")
+
+        def _lang_candidates() -> list[str]:
+            ordered = []
+            for candidate in (lang, "en", "uk", "ru"):
+                if candidate and candidate not in ordered:
+                    ordered.append(candidate)
+            return ordered
+
+        def _pick_caption_track(info: dict) -> dict | None:
+            requested = _lang_candidates()
+            sources = (info.get("subtitles") or {}, info.get("automatic_captions") or {})
+            for captions in sources:
+                if not captions:
+                    continue
+                keys = list(captions)
+                ordered_keys = []
+                for wanted in requested:
+                    ordered_keys.extend(
+                        key for key in keys
+                        if key == wanted or key.startswith(f"{wanted}-")
+                    )
+                ordered_keys.extend(key for key in keys if key not in ordered_keys)
+                for key in ordered_keys:
+                    tracks = captions.get(key) or []
+                    if not tracks:
+                        continue
+                    for track in tracks:
+                        if track.get("ext") == "vtt" and track.get("url"):
+                            return track
+                    for track in tracks:
+                        if track.get("url"):
+                            return track
+            return None
 
         def _fetch():
             opts = {
                 "quiet": True, "no_warnings": True,
                 "skip_download": True,
                 "writesubtitles": True, "writeautomaticsub": True,
-                "subtitleslangs": [lang, "en", "uk", "ru"],
+                "subtitleslangs": _lang_candidates(),
                 "subtitlesformat": "vtt",
-                "outtmpl": "/tmp/transcript_%(id)s.%(ext)s",
             }
             if cookies:
                 opts["cookiefile"] = cookies
@@ -1884,30 +1917,19 @@ class VideoDownloaderMod(loader.Module):
 
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
+                    info = ydl.extract_info(url, download=False)
                 if not info:
                     return None
 
                 title = _sanitize_filename(info.get("title", "Video"))
-                vid_id = info.get("id", "unknown")
-                sub_path = None
-                for l in [lang, "en", "uk", "ru"]:
-                    p = f"/tmp/transcript_{vid_id}.{l}.vtt"
-                    if os.path.isfile(p) and os.path.getsize(p) > 0:
-                        sub_path = p
-                        break
-                if not sub_path:
-                    for p in glob.glob(f"/tmp/transcript_{vid_id}*.vtt"):
-                        if os.path.isfile(p) and os.path.getsize(p) > 0:
-                            sub_path = p
-                            break
-                if not sub_path:
+                track = _pick_caption_track(info)
+                if not track:
                     return None
-                text = _parse_vtt(sub_path)
-                try:
-                    os.remove(sub_path)
-                except Exception:
-                    pass
+
+                headers = {"User-Agent": "Mozilla/5.0"}
+                resp = requests.get(track["url"], headers=headers, timeout=15)
+                resp.raise_for_status()
+                text = _parse_vtt_text(resp.text)
                 return (title, text) if text.strip() else None
             except Exception as e:
                 logger.warning("Transcript fetch failed: %s", e)
@@ -2684,14 +2706,10 @@ class VideoDownloaderMod(loader.Module):
 
 # ── VTT parser ────────────────────────────────────────────────────────────────
 
-def _parse_vtt(path: str) -> str:
+def _parse_vtt_text(raw: str) -> str:
     lines = []
     seen = set()
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            raw = f.read()
-    except Exception:
-        return ""
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
 
     for block in re.split(r"\n\n+", raw.strip()):
         block = block.strip()
@@ -2710,3 +2728,11 @@ def _parse_vtt(path: str) -> str:
             lines.append(text)
 
     return "\n".join(lines)
+
+
+def _parse_vtt(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return _parse_vtt_text(f.read())
+    except Exception:
+        return ""
