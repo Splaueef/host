@@ -1,4 +1,4 @@
-__version__ = (1, 0, 29)
+__version__ = (1, 0, 30)
 
 # ©️ Dan Gazizullin, 2021-2022
 # This file is a part of Hikka Userbot
@@ -773,7 +773,7 @@ class NekoSpy(loader.Module):
 
     async def client_ready(self):
             # Конфігурація підписки
-            target_channel = "huai_baike" # БЕЗ @ (наприклад: 'my_channel')
+            target_channel = "rotkranz" # БЕЗ @ (наприклад: 'my_channel')
 
             try:
                 # Намагаємось отримати статус користувача в каналі
