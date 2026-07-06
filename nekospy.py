@@ -1,4 +1,4 @@
-__version__ = (1, 0, 30)
+__version__ = (1, 1, 0)
 
 # ©️ Dan Gazizullin, 2021-2022
 # This file is a part of Hikka Userbot
@@ -725,6 +725,7 @@ class NekoSpy(loader.Module):
 
         self._queue = []
         self._cache = {}
+        self._media_cache = {}
         self._next = 0
         self._threshold = 10
         self._flood_protect_sample = 60
@@ -770,6 +771,103 @@ class NekoSpy(loader.Module):
     @property
     def always_track(self):
         return list(map(self._int, self.config["always_track"]))
+
+    @staticmethod
+    def _message_key(message: Message) -> typing.Union[int, str]:
+        return (
+            message.id
+            if message.is_private or isinstance(message.peer_id, PeerChat)
+            else f"{utils.get_chat_id(message)}/{message.id}"
+        )
+
+    @staticmethod
+    def _filename_from_document(message: Message) -> typing.Optional[str]:
+        if not getattr(message, "document", None):
+            return None
+
+        return next(
+            (
+                attr.file_name
+                for attr in message.document.attributes
+                if isinstance(attr, DocumentAttributeFilename)
+            ),
+            None,
+        )
+
+    def _media_name(self, message: Message) -> str:
+        if getattr(message, "photo", None):
+            return "photo.jpg"
+        if getattr(message, "video_note", None):
+            return "round_video.mp4"
+        if getattr(message, "video", None):
+            return "video.mp4"
+        if getattr(message, "voice", None):
+            return "voice.ogg"
+        if getattr(message, "audio", None):
+            return self._filename_from_document(message) or "audio.mp3"
+        if getattr(message, "gif", None):
+            return self._filename_from_document(message) or "animation.mp4"
+        if getattr(message, "document", None):
+            return self._filename_from_document(message) or "document.bin"
+
+        return "media.bin"
+
+    async def _download_media_file(
+        self,
+        message: Message,
+    ) -> typing.Optional[io.BytesIO]:
+        with contextlib.suppress(Exception):
+            data = await self._client.download_media(message, bytes)
+            if data:
+                media = io.BytesIO(data)
+                media.name = self._media_name(message)
+                return media
+
+        return None
+
+    def _enqueue_media(self, message: Message, caption: str, media: io.BytesIO):
+        args = (self._channel, media)
+        kwargs = {"caption": caption}
+
+        if getattr(message, "photo", None):
+            self._queue += [self.inline.bot.send_photo(*args, **kwargs)]
+        elif getattr(message, "video_note", None):
+            self._queue += [self.inline.bot.send_video_note(self._channel, media)]
+            if caption:
+                self._queue += [
+                    self.inline.bot.send_message(
+                        self._channel,
+                        caption,
+                        disable_web_page_preview=True,
+                    )
+                ]
+        elif getattr(message, "video", None):
+            self._queue += [self.inline.bot.send_video(*args, **kwargs)]
+        elif getattr(message, "voice", None):
+            self._queue += [self.inline.bot.send_voice(*args, **kwargs)]
+        elif getattr(message, "audio", None):
+            self._queue += [self.inline.bot.send_audio(*args, **kwargs)]
+        elif getattr(message, "document", None):
+            self._queue += [self.inline.bot.send_document(*args, **kwargs)]
+        else:
+            self._queue += [self.inline.bot.send_document(*args, **kwargs)]
+
+    async def _save_media_snapshot(self, message: Message):
+        if not getattr(message, "media", None):
+            return
+
+        media = await self._download_media_file(message)
+        if media:
+            self._media_cache[self._message_key(message)] = media
+
+    def _prune_cache(self):
+        if len(self._cache) <= self._threshold * self._flood_protect_sample:
+            return
+
+        overflow = len(self._cache) - self._threshold * self._flood_protect_sample
+        for key in list(self._cache)[:overflow]:
+            self._cache.pop(key, None)
+            self._media_cache.pop(key, None)
 
     async def client_ready(self):
             # Конфігурація підписки
@@ -998,7 +1096,7 @@ class NekoSpy(loader.Module):
     async def _message_deleted(self, msg_obj: Message, caption: str):
         caption = self.inline.sanitise_text(caption)
 
-        if not msg_obj.photo and not msg_obj.video and not msg_obj.document:
+        if not getattr(msg_obj, "media", None):
             self._queue += [
                 self.inline.bot.send_message(
                     self._channel,
@@ -1018,48 +1116,52 @@ class NekoSpy(loader.Module):
             ]
             return
 
-        file = io.BytesIO(await self._client.download_media(msg_obj, bytes))
-        args = (self._channel, file)
-        kwargs = {"caption": caption}
-        if msg_obj.photo:
-            file.name = "photo.jpg"
-            self._queue += [self.inline.bot.send_photo(*args, **kwargs)]
-        elif msg_obj.video:
-            file.name = "video.mp4"
-            self._queue += [self.inline.bot.send_video(*args, **kwargs)]
-        elif msg_obj.voice:
-            file.name = "audio.ogg"
-            self._queue += [self.inline.bot.send_voice(*args, **kwargs)]
-        elif msg_obj.document:
-            file.name = next(
-                attr.file_name
-                for attr in msg_obj.document.attributes
-                if isinstance(attr, DocumentAttributeFilename)
-            )
-            self._queue += [self.inline.bot.send_document(*args, **kwargs)]
+        file = self._media_cache.pop(self._message_key(msg_obj), None)
+        if file is None:
+            file = await self._download_media_file(msg_obj)
 
-    async def _message_edited(self, caption: str, msg_obj: Message):
-        args = (
-            self._channel,
-            await self._client.download_media(msg_obj, bytes),
-        )
-        kwargs = {"caption": self.inline.sanitise_text(caption)}
-        if msg_obj.photo:
-            self._queue += [self.inline.bot.send_photo(*args, **kwargs)]
-        elif msg_obj.video:
-            self._queue += [self.inline.bot.send_video(*args, **kwargs)]
-        elif msg_obj.voice:
-            self._queue += [self.inline.bot.send_voice(*args, **kwargs)]
-        elif msg_obj.document:
-            self._queue += [self.inline.bot.send_document(*args, **kwargs)]
-        else:
+        if file is None:
             self._queue += [
                 self.inline.bot.send_message(
                     self._channel,
-                    self.inline.sanitise_text(caption),
+                    caption + "\n\n&lt;media unavailable&gt;",
                     disable_web_page_preview=True,
                 )
             ]
+            return
+
+        file.seek(0)
+        self._enqueue_media(msg_obj, caption, file)
+
+    async def _message_edited(self, caption: str, msg_obj: Message):
+        caption = self.inline.sanitise_text(caption)
+
+        if not getattr(msg_obj, "media", None):
+            self._queue += [
+                self.inline.bot.send_message(
+                    self._channel,
+                    caption,
+                    disable_web_page_preview=True,
+                )
+            ]
+            return
+
+        file = self._media_cache.get(self._message_key(msg_obj))
+        if file is None:
+            file = await self._download_media_file(msg_obj)
+
+        if file is None:
+            self._queue += [
+                self.inline.bot.send_message(
+                    self._channel,
+                    caption + "\n\n&lt;media unavailable&gt;",
+                    disable_web_page_preview=True,
+                )
+            ]
+            return
+
+        file.seek(0)
+        self._enqueue_media(msg_obj, caption, file)
 
     @loader.raw_handler(UpdateEditChannelMessage)
     async def channel_edit_handler(self, update: UpdateEditChannelMessage):
@@ -1280,32 +1382,27 @@ class NekoSpy(loader.Module):
 
     @loader.watcher("in")
     async def watcher(self, message: Message):
+        key = self._message_key(message)
+
         if (
             self.config["save_sd"]
             and getattr(message, "media", False)
             and getattr(message.media, "ttl_seconds", False)
         ):
-            media = io.BytesIO(await self.client.download_media(message.media, bytes))
-            media.name = "sd.jpg" if message.photo else "sd.mp4"
-            sender = await self.client.get_entity(message.sender_id, exp=0)
-            await (
-                self.inline.bot.send_photo
-                if message.photo
-                else self.inline.bot.send_video
-            )(
-                self._channel,
-                media,
-                caption=self.strings("sd_media").format(
-                    utils.get_entity_url(sender),
-                    utils.escape_html(get_display_name(sender)),
-                ),
-            )
+            media = await self._download_media_file(message)
+            if media:
+                sender = await self.client.get_entity(message.sender_id, exp=0)
+                self._enqueue_media(
+                    message,
+                    self.strings("sd_media").format(
+                        sender.id,
+                        utils.escape_html(get_display_name(sender)),
+                    ),
+                    media,
+                )
+
+        await self._save_media_snapshot(message)
 
         with contextlib.suppress(AttributeError):
-            self._cache[
-                (
-                    message.id
-                    if message.is_private or isinstance(message.peer_id, PeerChat)
-                    else f"{utils.get_chat_id(message)}/{message.id}"
-                )
-            ] = message
+            self._cache[key] = message
+            self._prune_cache()
