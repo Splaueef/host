@@ -1,4 +1,4 @@
-__version__ = (6, 0, 4)
+__version__ = (6, 0, 5)
 
 import os
 import re
@@ -255,6 +255,36 @@ def _file_type(path: str) -> str:
         if mime.startswith("audio"): return "audio"
         if mime.startswith("image"): return "image"
     return "other"
+
+
+def _media_dimensions_from_info(info: dict | None) -> tuple[int | None, int | None]:
+    """Return the most reliable width/height pair available in yt-dlp info."""
+    if not info:
+        return None, None
+    width = info.get("width")
+    height = info.get("height")
+    if width and height:
+        return int(width), int(height)
+
+    formats = [
+        f for f in (info.get("requested_formats") or info.get("formats") or [])
+        if f and f.get("vcodec") not in (None, "none", "")
+    ]
+    if not formats:
+        return None, None
+    # Prefer the selected/requested format; otherwise the biggest available
+    # video format gives a stable orientation signal for short-form platforms.
+    formats.sort(key=lambda f: (int(f.get("height") or 0), int(f.get("width") or 0)))
+    width = formats[-1].get("width")
+    height = formats[-1].get("height")
+    return (int(width), int(height)) if width and height else (None, None)
+
+
+def _info_is_vertical(info: dict | None, fallback: bool = False) -> bool:
+    width, height = _media_dimensions_from_info(info)
+    if width and height:
+        return height > width
+    return fallback
 
 
 def _is_vertical_url(url: str) -> bool:
@@ -788,6 +818,43 @@ class VideoDownloaderMod(loader.Module):
 
     # ── orientation fix ───────────────────────────────────────────────────────
 
+    async def _normalize_video_container(self, path: str) -> str:
+        """Keep video files in an extension/container Telegram handles reliably."""
+        if _file_type(path) != "video":
+            return path
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".mp4":
+            return path
+
+        fixed_path = re.sub(r"\.\w+$", ".mp4", path)
+        if fixed_path == path:
+            fixed_path = path + ".mp4"
+
+        def _remux():
+            cmd = [
+                "ffmpeg", "-i", path,
+                "-map", "0", "-c", "copy",
+                "-movflags", "+faststart",
+                "-y", fixed_path,
+            ]
+            r = subprocess.run(cmd, capture_output=True, timeout=180)
+            if r.returncode == 0 and os.path.isfile(fixed_path) and os.path.getsize(fixed_path) > 0:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                return fixed_path
+            # If stream-copy remux is not possible, keep the original instead
+            # of failing a successful download.
+            try:
+                if os.path.isfile(fixed_path):
+                    os.remove(fixed_path)
+            except Exception:
+                pass
+            return path
+
+        return await utils.run_sync(_remux)
+
     async def _maybe_fix_orientation(self, path: str, status_msg) -> str:
         if not self.config["fix_orientation"] or _file_type(path) != "video":
             return path
@@ -1265,6 +1332,15 @@ class VideoDownloaderMod(loader.Module):
                 if fsize > 0 and fsize > self.config["max_size"] * 1024 * 1024:
                     _cleanup(base_name)
                     return "TOO_LARGE"
+                if not audio and vertical:
+                    width, height = _media_dimensions_from_info(info)
+                    if width and height and height <= width:
+                        logger.info(
+                            "Skipping mismatched orientation fmt='%s': %sx%s expected_vertical=%s",
+                            fmt, width, height, vertical,
+                        )
+                        _cleanup(base_name)
+                        return None
 
                 requested = ydl.prepare_filename(info)
 
@@ -1409,6 +1485,15 @@ class VideoDownloaderMod(loader.Module):
                 if fsize > 0 and fsize > self.config["max_size"] * 1024 * 1024:
                     _cleanup(base_name)
                     return "TOO_LARGE"
+                if not audio and _is_vertical_url(url):
+                    width, height = _media_dimensions_from_info(info)
+                    if width and height and height <= width:
+                        logger.info(
+                            "Skipping mismatched YouTube orientation fmt='%s': %sx%s",
+                            fmt, width, height,
+                        )
+                        _cleanup(base_name)
+                        return None
 
                 requested = ydl.prepare_filename(info)
 
@@ -1517,6 +1602,7 @@ class VideoDownloaderMod(loader.Module):
         if audio:
             return "bestaudio/best", None
         formats = info.get("formats") or []
+        want_vertical = _info_is_vertical(info, _is_vertical_url(info.get("webpage_url") or info.get("original_url") or ""))
 
         def _is_real_video(fmt: dict) -> bool:
             return (
@@ -1526,20 +1612,29 @@ class VideoDownloaderMod(loader.Module):
                 and fmt.get("ext") not in ("mhtml", "images")
             )
 
+        def _orientation_matches(fmt: dict) -> bool:
+            width, height = fmt.get("width"), fmt.get("height")
+            if not width or not height:
+                return True
+            return (height > width) if want_vertical else (width >= height)
+
+        video_formats = [fmt for fmt in formats if _is_real_video(fmt) and _orientation_matches(fmt)]
+        if not video_formats:
+            video_formats = [fmt for fmt in formats if _is_real_video(fmt)]
+
         # Prefer progressive files first. They are the same family that usually
         # succeeds in manual ``yt-dlp -F`` checks with cookies and do not require
         # a second audio request that may hit YouTube POT restrictions.
-        for fmt in reversed(formats):
-            if _is_real_video(fmt) and fmt.get("acodec") not in (None, "none"):
+        for fmt in reversed(video_formats):
+            if fmt.get("acodec") not in (None, "none"):
                 fmt_id = fmt.get("format_id")
                 ext = fmt.get("ext") or "mp4"
                 return fmt_id, ext
 
-        for fmt in reversed(formats):
-            if _is_real_video(fmt):
-                fmt_id = fmt.get("format_id")
-                ext = fmt.get("ext") or "mp4"
-                return f"{fmt_id}+bestaudio/best", ext
+        for fmt in reversed(video_formats):
+            fmt_id = fmt.get("format_id")
+            ext = fmt.get("ext") or "mp4"
+            return f"{fmt_id}+bestaudio/best", ext
         return "best[ext=mp4]/bestvideo*+bestaudio/best", "mp4"
 
     def _run_ytdlp_cli_sync(self, url: str, base_name: str, audio: bool) -> list[str] | str | None:
@@ -2112,6 +2207,12 @@ class VideoDownloaderMod(loader.Module):
                 if not valid:
                     self._stats["err"] += 1
                     continue
+                for i, path in enumerate(valid):
+                    if _file_type(path) == "video":
+                        path = await self._normalize_video_container(path)
+                        if len(valid) == 1:
+                            path = await self._maybe_fix_orientation(path, status_msg)
+                        valid[i] = path
 
                 raw_title = entry.get("title") or f"Video {idx}"
                 cap = self.strings("caption_playlist").format(
@@ -2189,8 +2290,12 @@ class VideoDownloaderMod(loader.Module):
                     await status_msg.edit(self.strings("err_file"))
                     return
 
-                if len(valid) == 1 and _file_type(valid[0]) == "video":
-                    valid[0] = await self._maybe_fix_orientation(valid[0], status_msg)
+                for i, path in enumerate(valid):
+                    if _file_type(path) == "video":
+                        path = await self._normalize_video_container(path)
+                        if len(valid) == 1:
+                            path = await self._maybe_fix_orientation(path, status_msg)
+                        valid[i] = path
 
                 all_images = all(_file_type(f) == "image" for f in valid)
                 all_audio  = all(_file_type(f) == "audio" for f in valid)
