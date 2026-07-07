@@ -1,4 +1,4 @@
-__version__ = (6, 0, 8)
+__version__ = (6, 1, 0)
 
 import os
 import re
@@ -340,6 +340,26 @@ def _file_type(path: str) -> str:
         if mime.startswith("image"): return "image"
     return "other"
 
+
+def _video_has_audio(path: str) -> bool:
+    """Return True when ffprobe can see at least one audio stream."""
+    if _file_type(path) != "video":
+        return True
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        # Do not reject downloads on systems without ffprobe; the format
+        # selectors above already prefer audio and merged outputs.
+        return True
+    try:
+        r = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10,
+        )
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except Exception as e:
+        logger.debug("Could not probe audio stream for %s: %s", path, e)
+        return True
 
 def _media_dimensions_from_info(info: dict | None) -> tuple[int | None, int | None]:
     """Return the most reliable width/height pair available in yt-dlp info."""
@@ -786,26 +806,24 @@ class VideoDownloaderMod(loader.Module):
         q = quality.lower().replace("p", "")
         if vertical:
             h = {"360": 640, "480": 854, "720": 1280, "1080": 1920}.get(q, 1280)
-            return [
-                f"best[height<={h}][ext=mp4]",
-                f"bestvideo[ext=mp4][height<={h}]+bestaudio[ext=m4a]",
-                f"bestvideo[height<={h}]+bestaudio",
-                f"best[height<={h}]",
-                "best[ext=mp4]", "best", "worst",
-            ]
-        h = {"360": 360, "480": 480, "720": 720, "1080": 1080}.get(q, 720)
-        if q == "best":
-            return [
-                "best[ext=mp4]",
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio",
-                "bestvideo+bestaudio", "best", "worst",
-            ]
+        else:
+            h = {"360": 360, "480": 480, "720": 720, "1080": 1080}.get(q, 720)
+        limit = "" if q == "best" else f"[height<={h}]"
+        # Prefer progressive files that already contain audio.  Some platforms
+        # expose video-only MP4 as ``best[ext=mp4]``; selecting that first was
+        # the main reason Instagram/X/etc. videos arrived muted.  If a
+        # progressive audio+video file is unavailable, explicitly merge best
+        # video with best audio and only then fall back to generic best/worst.
         return [
-            f"best[height<={h}][ext=mp4]",
-            f"bestvideo[ext=mp4][height<={h}]+bestaudio[ext=m4a]",
-            f"bestvideo[height<={h}]+bestaudio",
-            f"best[height<={h}]",
-            "best[ext=mp4]", "best", "worst",
+            f"best[ext=mp4][vcodec!=none][acodec!=none]{limit}",
+            f"best[vcodec!=none][acodec!=none]{limit}",
+            f"bestvideo[ext=mp4]{limit}+bestaudio[ext=m4a]/bestvideo[ext=mp4]{limit}+bestaudio",
+            f"bestvideo{limit}+bestaudio",
+            "best[ext=mp4][vcodec!=none][acodec!=none]",
+            "best[vcodec!=none][acodec!=none]",
+            "bestvideo+bestaudio",
+            "best",
+            "worst",
         ]
 
     def _youtube_format_chain(self, quality: str, vertical: bool = False) -> list[str]:
@@ -813,23 +831,18 @@ class VideoDownloaderMod(loader.Module):
         h = {"360": 360, "480": 480, "720": 720, "1080": 1080}.get(q, 720) if q != "best" else 9999
         if vertical:
             h = {"360": 640, "480": 854, "720": 1280, "1080": 1920}.get(q, 1280)
-        if q == "best" or h >= 1080:
-            return [
-                "best[ext=mp4]",
-                "bestvideo[protocol=m3u8_native][ext=mp4]+bestaudio[ext=m4a]",
-                "bestvideo[protocol=m3u8_native]+bestaudio",
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]",
-                "bestvideo+bestaudio",
-                "best", "worst",
-            ]
+        limit = "" if q == "best" else f"[height<={h}]"
         return [
-            f"best[height<={h}][ext=mp4]",
-            f"bestvideo[protocol=m3u8_native][ext=mp4][height<={h}]+bestaudio[ext=m4a]",
-            f"bestvideo[protocol=m3u8_native][height<={h}]+bestaudio",
-            f"bestvideo[ext=mp4][height<={h}]+bestaudio[ext=m4a]",
-            f"bestvideo[height<={h}]+bestaudio",
-            f"best[height<={h}]",
-            "best[ext=mp4]", "best", "worst",
+            f"best[ext=mp4][vcodec!=none][acodec!=none]{limit}",
+            f"best[vcodec!=none][acodec!=none]{limit}",
+            f"bestvideo[protocol=m3u8_native][ext=mp4]{limit}+bestaudio[ext=m4a]",
+            f"bestvideo[protocol=m3u8_native]{limit}+bestaudio",
+            f"bestvideo[ext=mp4]{limit}+bestaudio[ext=m4a]",
+            f"bestvideo{limit}+bestaudio",
+            "best[ext=mp4][vcodec!=none][acodec!=none]",
+            "bestvideo+bestaudio",
+            "best",
+            "worst",
         ]
 
     def _quality_steps(self) -> list[str]:
@@ -1166,6 +1179,9 @@ class VideoDownloaderMod(loader.Module):
                     "postprocessors": postprocessors,
                 }
                 opts.update(self._fast_ytdlp_opts())
+                ffmpeg_location = self._ffmpeg_location()
+                if ffmpeg_location:
+                    opts["ffmpeg_location"] = ffmpeg_location
                 if cookies:
                     opts["cookiefile"] = cookies
                 try:
@@ -1427,6 +1443,7 @@ class VideoDownloaderMod(loader.Module):
         import yt_dlp
 
         audio_fmt = self.config["audio_format"]
+        vertical = _is_vertical_url(url)
         extractor_args = self._build_yt_extractor_args(player_clients, allow_missing_pot)
 
         opts = {
@@ -1444,6 +1461,9 @@ class VideoDownloaderMod(loader.Module):
             },
         }
         opts.update(self._fast_ytdlp_opts())
+        ffmpeg_location = self._ffmpeg_location()
+        if ffmpeg_location:
+            opts["ffmpeg_location"] = ffmpeg_location
         opts.update(_js_runtime_opts(self._js_runtime))
         if cookies:
             opts["cookiefile"] = cookies
@@ -1481,9 +1501,18 @@ class VideoDownloaderMod(loader.Module):
                         return found
 
                 if os.path.isfile(requested) and os.path.getsize(requested) > 0:
+                    if not audio and _file_type(requested) == "video" and not _video_has_audio(requested):
+                        logger.warning("Downloaded video has no audio, retrying with merged format: %s", requested)
+                        _cleanup(base_name)
+                        return None
                     return requested
 
-                return _find_file(base_name)
+                found = _find_file(base_name)
+                if found and not audio and _file_type(found) == "video" and not _video_has_audio(found):
+                    logger.warning("Found video has no audio, retrying with merged format: %s", found)
+                    _cleanup(base_name)
+                    return None
+                return found
 
         except yt_dlp.utils.DownloadError as e:
             client_label = ",".join(player_clients) if isinstance(player_clients, list) else player_clients
@@ -1601,6 +1630,9 @@ class VideoDownloaderMod(loader.Module):
             "progress_hooks": [self._progress_hook(status_msg, loop)] if status_msg else [],
         }
         opts.update(self._fast_ytdlp_opts())
+        ffmpeg_location = self._ffmpeg_location()
+        if ffmpeg_location:
+            opts["ffmpeg_location"] = ffmpeg_location
         if cookies:
             opts["cookiefile"] = cookies
         self._apply_browser_cookies(
@@ -1647,8 +1679,17 @@ class VideoDownloaderMod(loader.Module):
                         return found
 
                 if os.path.isfile(requested) and os.path.getsize(requested) > 0:
+                    if not audio and _file_type(requested) == "video" and not _video_has_audio(requested):
+                        logger.warning("Downloaded video has no audio, retrying with merged format: %s", requested)
+                        _cleanup(base_name)
+                        return None
                     return requested
-                return _find_file(base_name)
+                found = _find_file(base_name)
+                if found and not audio and _file_type(found) == "video" and not _video_has_audio(found):
+                    logger.warning("Found video has no audio, retrying with merged format: %s", found)
+                    _cleanup(base_name)
+                    return None
+                return found
 
         except yt_dlp.utils.DownloadError as e:
             if ("youtube.com" in url.lower() or "youtu.be" in url.lower()) and _is_youtube_auth_error(e):
