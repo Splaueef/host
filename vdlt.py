@@ -1,4 +1,4 @@
-__version__ = (6, 0, 5)
+__version__ = (6, 0, 8)
 
 import os
 import re
@@ -11,7 +11,9 @@ import sys
 import asyncio
 import mimetypes
 import unicodedata
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+import ipaddress
+import socket
+from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 from collections import defaultdict
 
 from .. import loader, utils
@@ -93,6 +95,83 @@ _MAX_FNAME_LEN = 180
 _TASK_TIMEOUT = 600
 
 
+def _is_safe_http_url(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+        if parts.scheme not in {"http", "https"} or not parts.hostname:
+            return False
+        if parts.username or parts.password:
+            return False
+        host = parts.hostname.strip().lower().rstrip(".")
+        if (
+            host in {"localhost", "localhost.localdomain"}
+            or host.endswith(".localhost")
+            or host.endswith(".local")
+        ):
+            return False
+
+        def _ip_is_public(value: str) -> bool:
+            ip = ipaddress.ip_address(value)
+            return not (
+                ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+            )
+
+        try:
+            return _ip_is_public(host)
+        except ValueError:
+            try:
+                infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            except socket.gaierror:
+                return False
+            addresses = {info[4][0] for info in infos if info and info[4]}
+            return bool(addresses) and all(_ip_is_public(address) for address in addresses)
+    except Exception:
+        return False
+
+
+def _safe_requests_get(
+    requests_module, url: str, *, timeout: int,
+    headers: dict | None = None, stream: bool = False, max_redirects: int = 5
+):
+    current = url
+    for _ in range(max_redirects + 1):
+        if not _is_safe_http_url(current):
+            raise ValueError(f"Unsafe URL blocked: {current}")
+        resp = requests_module.get(
+            current, timeout=timeout, headers=headers, stream=stream, allow_redirects=False
+        )
+        if resp.is_redirect or resp.is_permanent_redirect:
+            location = resp.headers.get("location")
+            resp.close()
+            if not location:
+                raise ValueError("Redirect without location")
+            current = urljoin(current, location)
+            continue
+        return resp
+    raise ValueError("Too many redirects")
+
+
+def _response_too_large(resp, max_bytes: int) -> bool:
+    try:
+        content_length = int(resp.headers.get("content-length") or 0)
+    except Exception:
+        content_length = 0
+    return bool(max_bytes and content_length and content_length > max_bytes)
+
+
+def _write_response_limited(resp, path: str, max_bytes: int) -> bool:
+    written = 0
+    with open(path, "wb") as f:
+        for chunk in resp.iter_content(1024 * 1024):
+            if not chunk:
+                continue
+            written += len(chunk)
+            if max_bytes and written > max_bytes:
+                raise ValueError("download exceeds max_size")
+            f.write(chunk)
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+
 def _sanitize_filename(name: str) -> str:
     name = unicodedata.normalize("NFC", name)
     name = re.sub(_INVALID_FNAME_CHARS, "_", name)
@@ -149,6 +228,11 @@ def _merge_platform_cookies() -> bool:
         except Exception as e:
             logger.warning("Could not merge cookies %s -> %s: %s", path, COOKIES_DEFAULT, e)
     return changed
+
+
+def _is_youtube_url(url: str) -> bool:
+    host = (urlsplit(url).netloc or "").lower().lstrip("www.")
+    return host == "youtu.be" or host.endswith(".youtu.be") or host == "youtube.com" or host.endswith(".youtube.com")
 
 
 def _get_cookies(url: str) -> str | None:
@@ -388,7 +472,7 @@ class VideoDownloaderMod(loader.Module):
         "loading_fix":        "<b>🔧 Виправляю орієнтацію відео...</b>",
         "loading_transcript": "<b>📝 Витягую транскрипт...</b>",
         "err_file":           "<b>❌ Не вдалося отримати файл.</b>",
-        "err_youtube_auth":   "<b>❌ YouTube просить підтвердити, що це не бот. Онови cookies: <code>.vdlcookies</code> і поклади актуальний Netscape cookies.txt у <code>/home/rkbot/URKbot/cookies.txt</code>, або задай <code>.vdlset yt_browser_cookies chrome</code>/<code>firefox</code> на хості з браузером.</b>",
+        "err_youtube_auth":   "<b>❌ YouTube просить підтвердити, що це не бот. Якщо відео приватне/18+, онови cookies: <code>.vdlcookies</code>. Для публічних відео модуль спершу пробує режим без cookies, щоб YouTube рідше ротував сесію.</b>",
         "err_size":           "<b>❌ Файл завеликий ({} МБ). Знижую якість...</b>",
         "err_size_final":     "<b>❌ Файл завеликий навіть у найнижчій якості.</b>",
         "err_limit":          "<b>🚫 Денний ліміт ({} завантажень) вичерпано.</b>",
@@ -443,7 +527,9 @@ class VideoDownloaderMod(loader.Module):
             "├ Файл: {default}\n"
             "├ Legacy YouTube: {yt}\n"
             "├ Шлях: <code>/home/rkbot/URKbot/cookies.txt</code>\n"
-            "├ Порада: оновлюй cookies час від часу — YouTube може їх ротувати.\n"
+            "├ Режим YouTube: <code>{mode}</code>\n"
+            "├ Browser cookies: <code>{browser}</code>\n"
+            "├ Порада: режим <code>auto</code> бере YouTube cookies лише як fallback, щоб їх рідше ротувало.\n"
             "└ Домени в cookies.txt:\n{domains}"
         ),
         "js_runtime_status":  "<b>🟢 JS Runtime: <code>{rt}</code></b>",
@@ -512,7 +598,8 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("allow_any_url",     False, "Автозавантажувати будь-які URL, які підтримує yt-dlp"),
             loader.ConfigValue("yt_dlp_path",       "", "Шлях до yt-dlp binary (порожньо = auto/python -m yt_dlp)"),
             loader.ConfigValue("ffmpeg_path",       "", "Шлях до ffmpeg або директорії з ffmpeg (порожньо = auto)"),
-            loader.ConfigValue("yt_browser_cookies", "", "YouTube cookies-from-browser для yt-dlp: chrome/firefox або browser:profile"),
+            loader.ConfigValue("yt_browser_cookies", "firefox", "YouTube cookies-from-browser для yt-dlp: firefox/chrome або browser:profile"),
+            loader.ConfigValue("yt_cookies_mode",   "auto", "YouTube cookies: auto/always/never. auto = спочатку без cookies, потім fallback"),
         )
         self._stats = {
             "total": 0, "ok": 0, "err": 0, "retried": 0,
@@ -932,8 +1019,10 @@ class VideoDownloaderMod(loader.Module):
                     ),
                     "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
                 }
-                resp = requests.get(url, timeout=30, stream=True, headers=headers)
-                if resp.status_code != 200:
+                max_bytes = int(self.config.get("max_size", 0) or 0) * 1024 * 1024
+                resp = _safe_requests_get(requests, url, timeout=30, stream=True, headers=headers)
+                if resp.status_code != 200 or _response_too_large(resp, max_bytes):
+                    resp.close()
                     return None
                 ct = resp.headers.get("content-type", "")
                 ext_map = {
@@ -950,11 +1039,10 @@ class VideoDownloaderMod(loader.Module):
                 if not ext:
                     return None
                 p = f"{base_name}_direct.{ext}"
-                with open(p, "wb") as f:
-                    for chunk in resp.iter_content(1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-                return p if os.path.getsize(p) > 0 else None
+                try:
+                    return p if _write_response_limited(resp, p, max_bytes) else None
+                finally:
+                    resp.close()
             except Exception as e:
                 logger.warning("Direct download failed: %s", e)
             return None
@@ -1116,10 +1204,10 @@ class VideoDownloaderMod(loader.Module):
                 )}
                 target_url = url
                 if "pin.it" in url:
-                    r = requests.get(url, timeout=15, headers=headers, allow_redirects=True)
+                    r = _safe_requests_get(requests, url, timeout=15, headers=headers)
                     target_url = r.url
 
-                r = requests.get(target_url, timeout=20, headers=headers)
+                r = _safe_requests_get(requests, target_url, timeout=20, headers=headers)
                 if r.status_code != 200:
                     return None
                 html = r.text
@@ -1133,12 +1221,14 @@ class VideoDownloaderMod(loader.Module):
                     if m:
                         v_url = m.group(1).replace("\\u002F", "/")
                         try:
-                            content = requests.get(v_url, timeout=30, headers=headers).content
+                            max_bytes = int(self.config.get("max_size", 0) or 0) * 1024 * 1024
+                            vr = _safe_requests_get(requests, v_url, timeout=30, headers=headers, stream=True)
                             p = f"{base_name}_pin.mp4"
-                            with open(p, "wb") as f:
-                                f.write(content)
-                            if os.path.getsize(p) > 0:
-                                return [p]
+                            try:
+                                if vr.status_code == 200 and not _response_too_large(vr, max_bytes) and _write_response_limited(vr, p, max_bytes):
+                                    return [p]
+                            finally:
+                                vr.close()
                         except Exception:
                             pass
                         break
@@ -1156,15 +1246,17 @@ class VideoDownloaderMod(loader.Module):
                             continue
                         seen.add(img_url)
                         try:
-                            rc = requests.get(img_url, timeout=20, headers=headers)
-                            if rc.status_code == 200:
-                                ct = rc.headers.get("content-type", "")
-                                ext = "png" if "png" in ct else "webp" if "webp" in ct else "jpg"
-                                p = f"{base_name}_pin{len(media_urls)}.{ext}"
-                                with open(p, "wb") as f:
-                                    f.write(rc.content)
-                                if os.path.getsize(p) > 0:
-                                    media_urls.append(p)
+                            max_bytes = int(self.config.get("max_size", 0) or 0) * 1024 * 1024
+                            rc = _safe_requests_get(requests, img_url, timeout=20, headers=headers, stream=True)
+                            try:
+                                if rc.status_code == 200 and not _response_too_large(rc, max_bytes):
+                                    ct = rc.headers.get("content-type", "")
+                                    ext = "png" if "png" in ct else "webp" if "webp" in ct else "jpg"
+                                    p = f"{base_name}_pin{len(media_urls)}.{ext}"
+                                    if _write_response_limited(rc, p, max_bytes):
+                                        media_urls.append(p)
+                            finally:
+                                rc.close()
                         except Exception:
                             pass
                     if media_urls:
@@ -1195,12 +1287,14 @@ class VideoDownloaderMod(loader.Module):
                         paths = []
                         for i, img_url in enumerate(images):
                             try:
-                                content = requests.get(img_url, timeout=30).content
+                                max_bytes = int(self.config.get("max_size", 0) or 0) * 1024 * 1024
+                                ir = _safe_requests_get(requests, img_url, timeout=30, stream=True)
                                 p = f"{base_name}_img{i}.jpg"
-                                with open(p, "wb") as f:
-                                    f.write(content)
-                                if os.path.getsize(p) > 0:
-                                    paths.append(p)
+                                try:
+                                    if ir.status_code == 200 and not _response_too_large(ir, max_bytes) and _write_response_limited(ir, p, max_bytes):
+                                        paths.append(p)
+                                finally:
+                                    ir.close()
                             except Exception as e:
                                 logger.warning("TikTok image %d failed: %s", i, e)
                         return paths if paths else None
@@ -1210,11 +1304,13 @@ class VideoDownloaderMod(loader.Module):
                     if not v_url:
                         return None
                     ext = self.config["audio_format"] if audio else "mp4"
-                    content = requests.get(v_url, timeout=30).content
+                    max_bytes = int(self.config.get("max_size", 0) or 0) * 1024 * 1024
+                    vr = _safe_requests_get(requests, v_url, timeout=30, stream=True)
                     p = f"{base_name}.{ext}"
-                    with open(p, "wb") as f:
-                        f.write(content)
-                    return [p] if os.path.getsize(p) > 0 else None
+                    try:
+                        return [p] if vr.status_code == 200 and not _response_too_large(vr, max_bytes) and _write_response_limited(vr, p, max_bytes) else None
+                    finally:
+                        vr.close()
                 logger.warning("TikWM API error: code=%s", res.get("code"))
             except Exception as e:
                 logger.exception("TikTok failed: %s", e)
@@ -1265,15 +1361,15 @@ class VideoDownloaderMod(loader.Module):
                 if not thumb:
                     continue
                 try:
-                    r = requests.get(thumb, timeout=30, headers={
-                        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"
-                    })
-                    if r.status_code == 200:
-                        p = f"{base_name}_tw{i}.jpg"
-                        with open(p, "wb") as f:
-                            f.write(r.content)
-                        if os.path.getsize(p) > 0:
+                    headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"}
+                    max_bytes = int(self.config.get("max_size", 0) or 0) * 1024 * 1024
+                    r = _safe_requests_get(requests, thumb, timeout=30, headers=headers, stream=True)
+                    p = f"{base_name}_tw{i}.jpg"
+                    try:
+                        if r.status_code == 200 and not _response_too_large(r, max_bytes) and _write_response_limited(r, p, max_bytes):
                             results.append(p)
+                    finally:
+                        r.close()
                 except Exception as e:
                     logger.warning("Twitter photo %d failed: %s", i, e)
 
@@ -1283,18 +1379,49 @@ class VideoDownloaderMod(loader.Module):
 
     # ── YouTube ───────────────────────────────────────────────────────────────
 
-    def _apply_browser_cookies(self, opts: dict, url: str) -> None:
-        if "youtube.com" not in url.lower() and "youtu.be" not in url.lower():
+
+    def _yt_cookies_mode(self) -> str:
+        mode = str(self.config.get("yt_cookies_mode", "auto") or "auto").strip().lower()
+        return mode if mode in {"auto", "always", "never"} else "auto"
+
+    def _yt_browser_cookies_value(self) -> str:
+        return str(self.config.get("yt_browser_cookies", "firefox") or "firefox").strip()
+
+    def _youtube_cookie_candidates(self, url: str) -> list[tuple[str | None, bool, str]]:
+        cookies = _get_cookies(url)
+        browser = self._yt_browser_cookies_value()
+        use_browser = bool(browser)
+        if not _is_youtube_url(url):
+            return [(cookies, False, "cookies" if cookies else "anon")]
+        mode = self._yt_cookies_mode()
+        if mode == "never":
+            return [(None, False, "anon")]
+
+        cookie_candidate = (cookies, use_browser, "cookies" if cookies else "browser")
+        if mode == "always":
+            return [cookie_candidate] if cookies or use_browser else [(None, False, "anon")]
+
+        # YouTube often rotates/invalidates account cookies after repeated bot
+        # challenges from server IPs.  In auto mode, public videos are attempted
+        # anonymously first and the account/browser cookies are used only as a
+        # fallback for age/private/login-gated videos.
+        candidates: list[tuple[str | None, bool, str]] = [(None, False, "anon")]
+        if cookies or use_browser:
+            candidates.append(cookie_candidate)
+        return candidates
+
+    def _apply_browser_cookies(self, opts: dict, url: str, allow: bool = True) -> None:
+        if not allow or not _is_youtube_url(url):
             return
         browser_cookies = _parse_browser_cookies(
-            self.config.get("yt_browser_cookies", "")
+            self._yt_browser_cookies_value()
         )
         if browser_cookies:
             opts["cookiesfrombrowser"] = browser_cookies
 
     def _try_ydl_format_youtube(
         self, url: str, base_name: str, fmt: str,
-        audio: bool, cookies: str | None,
+        audio: bool, cookies: str | None, use_browser_cookies: bool,
         status_msg, loop, player_clients: str | list[str], allow_missing_pot: bool = False
     ) -> str | None:
         import yt_dlp
@@ -1320,7 +1447,7 @@ class VideoDownloaderMod(loader.Module):
         opts.update(_js_runtime_opts(self._js_runtime))
         if cookies:
             opts["cookiefile"] = cookies
-        self._apply_browser_cookies(opts, url)
+        self._apply_browser_cookies(opts, url, allow=use_browser_cookies)
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -1363,7 +1490,7 @@ class VideoDownloaderMod(loader.Module):
             if _is_youtube_auth_error(e):
                 logger.warning(
                     "YT auth/POT challenge fmt='%s' client=%s; cookies=%s browser_cookies=%s",
-                    fmt, client_label, bool(cookies), bool(self.config.get("yt_browser_cookies", "")),
+                    fmt, client_label, bool(cookies), use_browser_cookies,
                 )
                 _cleanup(base_name)
                 return "AUTH_REQUIRED"
@@ -1382,7 +1509,7 @@ class VideoDownloaderMod(loader.Module):
         self, url: str, base_name: str, status_msg, audio: bool, quality: str
     ) -> str | None:
         loop = asyncio.get_event_loop()
-        cookies = _get_cookies(url)
+        cookie_candidates = self._youtube_cookie_candidates(url)
         vertical = _is_vertical_url(url)
 
         fmt_chain = (
@@ -1400,32 +1527,43 @@ class VideoDownloaderMod(loader.Module):
             ("mweb", ["mweb"], False),
             ("missing_pot", ["default", "ios", "web_embedded", "-tv"], True),
         ]
-        for client_label, clients, allow_missing_pot in client_profiles:
-            for fmt in fmt_chain[:4]:
-                result = await utils.run_sync(
-                    self._try_ydl_format_youtube,
-                    url, f"{base_name}_{client_label}",
-                    fmt, audio, cookies, status_msg, loop, clients, allow_missing_pot
-                )
-                if result in ("TOO_LARGE", "AUTH_REQUIRED"):
-                    return result
-                if result:
-                    logger.info(
-                        "YT OK: client=%s fmt='%s' missing_pot=%s",
-                        clients, fmt, allow_missing_pot,
+        saw_auth_required = False
+        for cookies, use_browser_cookies, cookie_suffix in cookie_candidates:
+            for client_label, clients, allow_missing_pot in client_profiles:
+                for fmt in fmt_chain[:4]:
+                    result = await utils.run_sync(
+                        self._try_ydl_format_youtube,
+                        url, f"{base_name}_{cookie_suffix}_{client_label}",
+                        fmt, audio, cookies, use_browser_cookies, status_msg, loop, clients, allow_missing_pot
                     )
+                    if result == "TOO_LARGE":
+                        return result
+                    if result == "AUTH_REQUIRED":
+                        saw_auth_required = True
+                        continue
+                    if result:
+                        logger.info(
+                            "YT OK: cookies=%s client=%s fmt='%s' missing_pot=%s",
+                            bool(cookies), clients, fmt, allow_missing_pot,
+                        )
+                        return result
+
+            # Останній шанс — стандартний yt-dlp без extractor_args
+            for fmt in fmt_chain:
+                result = await utils.run_sync(
+                    self._try_ydl_format,
+                    url, f"{base_name}_{cookie_suffix}_default", fmt, audio, cookies, status_msg, loop, False, use_browser_cookies
+                )
+                if result == "TOO_LARGE":
+                    return "TOO_LARGE"
+                if result == "AUTH_REQUIRED":
+                    saw_auth_required = True
+                    continue
+                if result:
                     return result
 
-        # Останній шанс — стандартний yt-dlp без extractor_args
-        for fmt in fmt_chain:
-            result = await utils.run_sync(
-                self._try_ydl_format,
-                url, f"{base_name}_default", fmt, audio, cookies, status_msg, loop, False
-            )
-            if result == "TOO_LARGE":
-                return "TOO_LARGE"
-            if result:
-                return result
+        if saw_auth_required and all(not c and not b for c, b, _ in cookie_candidates):
+            return "AUTH_REQUIRED"
 
         if self.config.get("auto_update_ytdlp", True):
             ok, _ = await self._auto_update_ytdlp(force=True)
@@ -1433,7 +1571,7 @@ class VideoDownloaderMod(loader.Module):
                 for fmt in fmt_chain[-2:]:
                     result = await utils.run_sync(
                         self._try_ydl_format,
-                        url, f"{base_name}_updated", fmt, audio, cookies, status_msg, loop, False
+                        url, f"{base_name}_updated", fmt, audio, cookie_candidates[-1][0], status_msg, loop, False, cookie_candidates[-1][1]
                     )
                     if result == "TOO_LARGE":
                         return "TOO_LARGE"
@@ -1447,7 +1585,7 @@ class VideoDownloaderMod(loader.Module):
     def _try_ydl_format(
         self, url: str, base_name: str, fmt: str,
         audio: bool, cookies: str | None,
-        status_msg, loop, vertical: bool = False
+        status_msg, loop, vertical: bool = False, use_browser_cookies: bool | None = None
     ) -> str | None:
         import yt_dlp
 
@@ -1465,7 +1603,9 @@ class VideoDownloaderMod(loader.Module):
         opts.update(self._fast_ytdlp_opts())
         if cookies:
             opts["cookiefile"] = cookies
-        self._apply_browser_cookies(opts, url)
+        self._apply_browser_cookies(
+            opts, url, allow=bool(cookies) if use_browser_cookies is None else use_browser_cookies
+        )
 
         u_lower = url.lower()
         if "youtube.com" in u_lower or "youtu.be" in u_lower:
@@ -1639,88 +1779,92 @@ class VideoDownloaderMod(loader.Module):
 
     def _run_ytdlp_cli_sync(self, url: str, base_name: str, audio: bool) -> list[str] | str | None:
         cmd = self._ytdlp_cli_prefix()
-        common = []
-        if self.config.get("force_ipv4", False):
-            common.append("--force-ipv4")
-        cookies = _get_cookies(url)
-        if cookies:
-            common += ["--cookies", cookies]
-        browser_cookies = (self.config.get("yt_browser_cookies", "") or "").strip()
-        if ("youtube.com" in url.lower() or "youtu.be" in url.lower()) and browser_cookies:
-            common += ["--cookies-from-browser", browser_cookies]
-        runtime = self._js_runtime or _preferred_js_runtime_arg()
-        if runtime:
-            common += ["--js-runtimes", runtime]
-        ffmpeg_location = self._ffmpeg_location()
-        if ffmpeg_location:
-            common += ["--ffmpeg-location", ffmpeg_location]
+        browser_cookies = self._yt_browser_cookies_value()
+        cookie_candidates = self._youtube_cookie_candidates(url)
+        saw_auth_required = False
 
-        info_cmd = cmd + common + ["--no-playlist", "--dump-json", "--format-sort=resolution,ext,tbr", url]
-        try:
-            info_proc = subprocess.run(info_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90, env=_subprocess_env_for_cookie_owner())
-        except Exception as e:
-            logger.warning("yt-dlp CLI info failed: %s", e)
-            return None
-        if info_proc.returncode != 0 or not info_proc.stdout.strip():
-            info_err = info_proc.stderr or info_proc.stdout
-            if _is_youtube_auth_error(info_err):
-                logger.warning("yt-dlp CLI YouTube auth/POT challenge; cookies=%s browser_cookies=%s", bool(cookies), bool(browser_cookies))
-                return "AUTH_REQUIRED"
-            logger.warning("yt-dlp CLI info error: %s", info_err[-500:])
-            return None
-        try:
-            import json
-            info = json.loads(info_proc.stdout)
-        except Exception as e:
-            logger.warning("yt-dlp CLI JSON parse failed: %s", e)
-            return None
-        if info.get("live_status") not in (None, "not_live"):
-            logger.warning("Live streams are not supported by CLI fallback: %s", info.get("live_status"))
-            return None
+        for cookies, use_browser_cookies, _cookie_suffix in cookie_candidates:
+            common = []
+            if self.config.get("force_ipv4", False):
+                common.append("--force-ipv4")
+            if cookies:
+                common += ["--cookies", cookies]
+            if _is_youtube_url(url) and browser_cookies and use_browser_cookies:
+                common += ["--cookies-from-browser", browser_cookies]
+            runtime = self._js_runtime or _preferred_js_runtime_arg()
+            if runtime:
+                common += ["--js-runtimes", runtime]
+            ffmpeg_location = self._ffmpeg_location()
+            if ffmpeg_location:
+                common += ["--ffmpeg-location", ffmpeg_location]
 
-        # Keep the CLI fallback output template intentionally simple.  Some
-        # yt-dlp builds/plugins are stricter about advanced template specifiers,
-        # while the user's known-good manual command only relies on standard
-        # yt-dlp options.
-        outtmpl = f"{base_name}_cli_%(id)s.%(ext)s"
-        dl_cmd = cmd + common + ["--no-playlist", "--newline", "--print", "after_move:filepath", "-o", outtmpl]
-        if audio:
-            dl_cmd += ["--format", self._tuitube_format_value(info, True)[0], "--extract-audio", "--audio-format", self.config.get("audio_format", "mp3")]
-        else:
-            fmt, recode = self._tuitube_format_value(info, False)
-            dl_cmd += ["--format", fmt]
-            if recode:
-                dl_cmd += ["--recode-video", recode]
-        max_size = int(self.config.get("max_size", 0) or 0)
-        if max_size > 0:
-            dl_cmd += ["--max-filesize", f"{max_size}M"]
-        try:
-            proc = subprocess.run(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=int(self.config.get("task_timeout", _TASK_TIMEOUT)), env=_subprocess_env_for_cookie_owner())
-        except subprocess.TimeoutExpired:
-            return None
-        except Exception as e:
-            logger.warning("yt-dlp CLI download failed: %s", e)
-            return None
-        if proc.returncode != 0:
-            output = proc.stdout or ""
-            if "File is larger than max-filesize" in output or "exceeds limit" in output:
+            info_cmd = cmd + common + ["--no-playlist", "--dump-json", "--format-sort=resolution,ext,tbr", url]
+            try:
+                info_proc = subprocess.run(info_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90, env=_subprocess_env_for_cookie_owner())
+            except Exception as e:
+                logger.warning("yt-dlp CLI info failed: %s", e)
+                continue
+            if info_proc.returncode != 0 or not info_proc.stdout.strip():
+                info_err = info_proc.stderr or info_proc.stdout
+                if _is_youtube_auth_error(info_err):
+                    saw_auth_required = True
+                    logger.warning("yt-dlp CLI YouTube auth/POT challenge; cookies=%s browser_cookies=%s", bool(cookies), bool(browser_cookies))
+                    continue
+                logger.warning("yt-dlp CLI info error: %s", info_err[-500:])
+                continue
+            try:
+                import json
+                info = json.loads(info_proc.stdout)
+            except Exception as e:
+                logger.warning("yt-dlp CLI JSON parse failed: %s", e)
+                continue
+            if info.get("live_status") not in (None, "not_live"):
+                logger.warning("Live streams are not supported by CLI fallback: %s", info.get("live_status"))
+                continue
+
+            outtmpl = f"{base_name}_cli_%(id)s.%(ext)s"
+            dl_cmd = cmd + common + ["--no-playlist", "--newline", "--print", "after_move:filepath", "-o", outtmpl]
+            if audio:
+                dl_cmd += ["--format", self._tuitube_format_value(info, True)[0], "--extract-audio", "--audio-format", self.config.get("audio_format", "mp3")]
+            else:
+                fmt, recode = self._tuitube_format_value(info, False)
+                dl_cmd += ["--format", fmt]
+                if recode:
+                    dl_cmd += ["--recode-video", recode]
+            max_size = int(self.config.get("max_size", 0) or 0)
+            if max_size > 0:
+                dl_cmd += ["--max-filesize", f"{max_size}M"]
+            try:
+                proc = subprocess.run(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=int(self.config.get("task_timeout", _TASK_TIMEOUT)), env=_subprocess_env_for_cookie_owner())
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception as e:
+                logger.warning("yt-dlp CLI download failed: %s", e)
+                continue
+            if proc.returncode != 0:
+                output = proc.stdout or ""
+                if "File is larger than max-filesize" in output or "exceeds limit" in output:
+                    _cleanup(f"{base_name}_cli")
+                    return "TOO_LARGE"
+                if _is_youtube_auth_error(output):
+                    saw_auth_required = True
+                    logger.warning("yt-dlp CLI YouTube auth/POT challenge during download")
+                    _cleanup(f"{base_name}_cli")
+                    continue
+                logger.warning("yt-dlp CLI error: %s", output[-700:])
                 _cleanup(f"{base_name}_cli")
-                return "TOO_LARGE"
-            if _is_youtube_auth_error(output):
-                logger.warning("yt-dlp CLI YouTube auth/POT challenge during download")
-                _cleanup(f"{base_name}_cli")
-                return "AUTH_REQUIRED"
-            logger.warning("yt-dlp CLI error: %s", output[-700:])
-            _cleanup(f"{base_name}_cli")
-            return None
-        paths = []
-        for line in (proc.stdout or "").splitlines():
-            line = line.strip()
-            if os.path.isabs(line) and os.path.isfile(line) and os.path.getsize(line) > 0:
-                paths.append(line)
-        if not paths:
-            paths = [p for p in glob.glob(f"{base_name}_cli_*") if os.path.isfile(p) and os.path.getsize(p) > 0 and os.path.splitext(p)[1].lower() in VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS]
-        return sorted(dict.fromkeys(paths)) or None
+                continue
+            paths = []
+            for line in (proc.stdout or "").splitlines():
+                line = line.strip()
+                if os.path.isabs(line) and os.path.isfile(line) and os.path.getsize(line) > 0:
+                    paths.append(line)
+            if not paths:
+                paths = [p for p in glob.glob(f"{base_name}_cli_*") if os.path.isfile(p) and os.path.getsize(p) > 0 and os.path.splitext(p)[1].lower() in VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS]
+            if paths:
+                return sorted(dict.fromkeys(paths))
+
+        return "AUTH_REQUIRED" if saw_auth_required else None
 
     async def _dl_ytdlp_cli(self, url: str, base_name: str, audio: bool) -> list[str] | str | None:
         if not self.config.get("use_cli_ytdlp", True):
@@ -2022,7 +2166,7 @@ class VideoDownloaderMod(loader.Module):
                     return None
 
                 headers = {"User-Agent": "Mozilla/5.0"}
-                resp = requests.get(track["url"], headers=headers, timeout=15)
+                resp = _safe_requests_get(requests, track["url"], headers=headers, timeout=15)
                 resp.raise_for_status()
                 text = _parse_vtt_text(resp.text)
                 return (title, text) if text.strip() else None
@@ -2508,7 +2652,8 @@ class VideoDownloaderMod(loader.Module):
                 "fix_orientation, playlist, playlist_max,\n"
                 "audio_format (mp3/m4a/wav/opus/flac),\n"
                 "timeout (сек, таймаут завдання),\n"
-                "cli, any_url, ipv4 (0/1)"
+                "cli, any_url, ipv4 (0/1),\n"
+                "yt_browser, yt_cookies_mode"
             )
         key, raw = args[0].lower(), args[1]
         mapping = {
@@ -2528,6 +2673,18 @@ class VideoDownloaderMod(loader.Module):
             "any_url":         ("allow_any_url",    bool, ""),
             "ipv4":            ("force_ipv4",       bool, ""),
         }
+        if key == "yt_browser":
+            self.config["yt_browser_cookies"] = raw.strip() or "firefox"
+            browser = utils.escape_html(self.config["yt_browser_cookies"])
+            return await utils.answer(message, f"<b>✅ yt_browser = <code>{browser}</code></b>")
+
+        if key == "yt_cookies_mode":
+            mode = raw.strip().lower()
+            if mode not in {"auto", "always", "never"}:
+                return await utils.answer(message, "<b>❌ yt_cookies_mode: auto / always / never</b>")
+            self.config["yt_cookies_mode"] = mode
+            return await utils.answer(message, f"<b>✅ yt_cookies_mode = <code>{mode}</code></b>")
+
         if key == "audio_format":
             valid = {"mp3", "m4a", "wav", "opus", "flac", "aac"}
             if raw.lower() not in valid:
@@ -2627,7 +2784,9 @@ class VideoDownloaderMod(loader.Module):
         await utils.answer(
             message,
             self.strings("cookies_status").format(
-                yt=_s(COOKIES_YOUTUBE), default=_s(COOKIES_DEFAULT), domains=domains
+                yt=_s(COOKIES_YOUTUBE), default=_s(COOKIES_DEFAULT),
+                mode=self.config.get("yt_cookies_mode", "auto"),
+                browser=self._yt_browser_cookies_value(), domains=domains
             )
         )
 
