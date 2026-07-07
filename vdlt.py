@@ -773,11 +773,8 @@ class VideoDownloaderMod(loader.Module):
 
     def _fast_ytdlp_opts(self) -> dict:
         return {
-            # YouTube/DASH downloads are split into many fragments.  More
-            # parallel fragment workers materially reduces wall-clock time for
-            # normal network links while still keeping retries conservative.
-            "concurrent_fragment_downloads": 16,
-            "buffersize": 16 * 1024 * 1024,
+            "concurrent_fragment_downloads": 8,
+            "buffersize": 4 * 1024 * 1024,
             "http_chunk_size": 10 * 1024 * 1024,
             "socket_timeout": 20,
             "retries": 5,
@@ -1741,24 +1738,6 @@ class VideoDownloaderMod(loader.Module):
         ffmpeg = self._find_executable("", ["ffmpeg"])
         return os.path.dirname(ffmpeg) if ffmpeg else None
 
-    def _cli_format_value(self, url: str, audio: bool) -> str:
-        """Fast yt-dlp CLI format selector without a slow preliminary JSON pass."""
-        if audio:
-            return "bestaudio/best"
-        q = str(self.config.get("quality", "720") or "720").lower().replace("p", "")
-        if q == "best":
-            return "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
-        if _is_vertical_url(url):
-            h = {"360": 640, "480": 854, "720": 1280, "1080": 1920}.get(q, 1280)
-        else:
-            h = {"360": 360, "480": 480, "720": 720, "1080": 1080}.get(q, 720)
-        return (
-            f"best[height<={h}][ext=mp4]/"
-            f"bestvideo[ext=mp4][height<={h}]+bestaudio[ext=m4a]/"
-            f"bestvideo[height<={h}]+bestaudio/"
-            f"best[height<={h}]/best[ext=mp4]/best"
-        )
-
     def _tuitube_format_value(self, info: dict, audio: bool) -> tuple[str, str | None]:
         if audio:
             return "bestaudio/best", None
@@ -1799,14 +1778,6 @@ class VideoDownloaderMod(loader.Module):
         return "best[ext=mp4]/bestvideo*+bestaudio/best", "mp4"
 
     def _run_ytdlp_cli_sync(self, url: str, base_name: str, audio: bool) -> list[str] | str | None:
-        """Run yt-dlp CLI in one pass.
-
-        The previous path first executed ``--dump-json`` and only then started a
-        second yt-dlp process to download.  On YouTube this doubles extractor
-        startup time and may repeat PO-token/player checks.  A direct download
-        with a robust format chain is both faster and closer to the manual
-        yt-dlp command users usually test in shell.
-        """
         cmd = self._ytdlp_cli_prefix()
         browser_cookies = self._yt_browser_cookies_value()
         cookie_candidates = self._youtube_cookie_candidates(url)
@@ -1826,54 +1797,52 @@ class VideoDownloaderMod(loader.Module):
             ffmpeg_location = self._ffmpeg_location()
             if ffmpeg_location:
                 common += ["--ffmpeg-location", ffmpeg_location]
-            if _is_youtube_url(url):
-                common += [
-                    "--extractor-args",
-                    "youtube:player_client=default,ios,web_embedded,-tv;formats=missing_pot",
-                ]
+
+            info_cmd = cmd + common + ["--no-playlist", "--dump-json", "--format-sort=resolution,ext,tbr", url]
+            try:
+                info_proc = subprocess.run(info_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90, env=_subprocess_env_for_cookie_owner())
+            except Exception as e:
+                logger.warning("yt-dlp CLI info failed: %s", e)
+                continue
+            if info_proc.returncode != 0 or not info_proc.stdout.strip():
+                info_err = info_proc.stderr or info_proc.stdout
+                if _is_youtube_auth_error(info_err):
+                    saw_auth_required = True
+                    logger.warning("yt-dlp CLI YouTube auth/POT challenge; cookies=%s browser_cookies=%s", bool(cookies), bool(browser_cookies))
+                    continue
+                logger.warning("yt-dlp CLI info error: %s", info_err[-500:])
+                continue
+            try:
+                import json
+                info = json.loads(info_proc.stdout)
+            except Exception as e:
+                logger.warning("yt-dlp CLI JSON parse failed: %s", e)
+                continue
+            if info.get("live_status") not in (None, "not_live"):
+                logger.warning("Live streams are not supported by CLI fallback: %s", info.get("live_status"))
+                continue
 
             outtmpl = f"{base_name}_cli_%(id)s.%(ext)s"
-            dl_cmd = cmd + common + [
-                "--no-playlist",
-                "--newline",
-                "--no-mtime",
-                "--concurrent-fragments", "16",
-                "--buffer-size", "16M",
-                "--http-chunk-size", "10M",
-                "--retries", "5",
-                "--fragment-retries", "5",
-                "--print", "after_move:filepath",
-                "-o", outtmpl,
-                "--format", self._cli_format_value(url, audio),
-            ]
+            dl_cmd = cmd + common + ["--no-playlist", "--newline", "--print", "after_move:filepath", "-o", outtmpl]
             if audio:
-                dl_cmd += ["--extract-audio", "--audio-format", self.config.get("audio_format", "mp3")]
+                dl_cmd += ["--format", self._tuitube_format_value(info, True)[0], "--extract-audio", "--audio-format", self.config.get("audio_format", "mp3")]
             else:
-                # Merge separate DASH video/audio streams into MP4 without the
-                # expensive full transcode caused by --recode-video.
-                dl_cmd += ["--merge-output-format", "mp4"]
+                fmt, recode = self._tuitube_format_value(info, False)
+                dl_cmd += ["--format", fmt]
+                if recode:
+                    dl_cmd += ["--recode-video", recode]
             max_size = int(self.config.get("max_size", 0) or 0)
             if max_size > 0:
                 dl_cmd += ["--max-filesize", f"{max_size}M"]
-            dl_cmd.append(url)
-
             try:
-                proc = subprocess.run(
-                    dl_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    timeout=int(self.config.get("task_timeout", _TASK_TIMEOUT)),
-                    env=_subprocess_env_for_cookie_owner(),
-                )
+                proc = subprocess.run(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=int(self.config.get("task_timeout", _TASK_TIMEOUT)), env=_subprocess_env_for_cookie_owner())
             except subprocess.TimeoutExpired:
-                logger.warning("yt-dlp CLI timed out")
                 continue
             except Exception as e:
                 logger.warning("yt-dlp CLI download failed: %s", e)
                 continue
-            output = proc.stdout or ""
             if proc.returncode != 0:
+                output = proc.stdout or ""
                 if "File is larger than max-filesize" in output or "exceeds limit" in output:
                     _cleanup(f"{base_name}_cli")
                     return "TOO_LARGE"
@@ -1886,17 +1855,12 @@ class VideoDownloaderMod(loader.Module):
                 _cleanup(f"{base_name}_cli")
                 continue
             paths = []
-            for line in output.splitlines():
+            for line in (proc.stdout or "").splitlines():
                 line = line.strip()
                 if os.path.isabs(line) and os.path.isfile(line) and os.path.getsize(line) > 0:
                     paths.append(line)
             if not paths:
-                paths = [
-                    p for p in glob.glob(f"{base_name}_cli_*")
-                    if os.path.isfile(p)
-                    and os.path.getsize(p) > 0
-                    and os.path.splitext(p)[1].lower() in VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS
-                ]
+                paths = [p for p in glob.glob(f"{base_name}_cli_*") if os.path.isfile(p) and os.path.getsize(p) > 0 and os.path.splitext(p)[1].lower() in VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS]
             if paths:
                 return sorted(dict.fromkeys(paths))
 
@@ -2220,7 +2184,6 @@ class VideoDownloaderMod(loader.Module):
             reply_to=message.id, caption=caption,
             parse_mode="html",
             force_document=force_document,
-            supports_streaming=(_file_type(path) == "video" and not force_document),
             part_size_kb=512,
         )
         ad = self.config["auto_delete"]
@@ -2278,7 +2241,6 @@ class VideoDownloaderMod(loader.Module):
                             caption=chunk_caption,
                             parse_mode="html",
                             force_document=(ftype == "other"),
-                            supports_streaming=(ftype == "video"),
                             part_size_kb=512,
                         )
                     except Exception as e:
@@ -2309,7 +2271,6 @@ class VideoDownloaderMod(loader.Module):
                                 caption=fb_caption,
                                 parse_mode="html",
                                 force_document=(ftype == "other"),
-                                supports_streaming=(ftype == "video"),
                                 part_size_kb=512,
                             )
                         except Exception as e2:
