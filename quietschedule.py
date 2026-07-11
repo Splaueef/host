@@ -1,4 +1,4 @@
-# meta developer: @OpenAI
+# meta developer: @Huang_Baike
 # meta version: 1.0.0
 # meta description: Планувальник тиші: вимикає сповіщення та/або архівує чати за розкладом.
 
