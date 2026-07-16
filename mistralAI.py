@@ -520,6 +520,12 @@ class MistralModule(loader.Module):
         "autoagent_off":        "😴 <b>Авто-агент вимкнено</b> у чаті <code>{chat}</code>",
         "autoagent_list_empty": "<b>🤖 Авто-агент ніде не активний.</b>",
         "autoagent_list":       "<b>🤖 Активні авто-агент чати:</b>\n{chats}",
+        "agent_thoughts_unavailable": (
+            "<b>❌ Інсайт доступний тільки коли у цьому чаті увімкнено авто-агент "
+            "і підключено Mistral-агента.</b>"
+        ),
+        "agent_thoughts_empty": "<b>ℹ️ Авто-агент ще не має історії цього чату.</b>",
+        "agent_thoughts_result": "<b>🧠 Що агент думає про співрозмовника:</b>\n\n{text}",
         "memory_cleared":       "🧹 <b>Пам'ять очищена</b> у чаті <code>{chat}</code>",
         "models_header":        "<b>📋 Доступні моделі:</b>\n\n",
         "ocr_result":           "<b>📄 OCR:</b>\n\n{text}",
@@ -860,6 +866,18 @@ class MistralModule(loader.Module):
         if chat_id not in self._memory or not isinstance(self._memory[chat_id], collections.deque):
             self._memory[chat_id] = collections.deque(maxlen=lim)
         return self._memory[chat_id]
+
+    def _agent_id(self) -> str | None:
+        return self._active_agent_id or (str(self.config["agent_mistral_id"] or "").strip() or None)
+
+    def _history_for_prompt(self, history) -> str:
+        lines = []
+        for m in list(history):
+            role = "Assistant" if m.get("role") == ROLE_ASSISTANT else "User"
+            content = str(m.get("content") or "").strip()
+            if content:
+                lines.append(f"{role}: {content}")
+        return "\n".join(lines)
 
     def _get_vec_mem(self, chat_id: int) -> list:
         if not hasattr(self, "_vec_mem"):
@@ -1621,7 +1639,7 @@ class MistralModule(loader.Module):
         stored_content = f"[{sender_name}]: {text}" if is_group else text
         history.append({"role": ROLE_USER, "content": stored_content})
 
-        agent_id = self._active_agent_id or (self.config["agent_mistral_id"].strip() or None)
+        agent_id = self._agent_id()
 
         # ── Виклик моделі ─────────────────────────────────────────────────
         try:
@@ -1781,7 +1799,7 @@ class MistralModule(loader.Module):
         if not args:
             return await utils.answer(message, self.strings["no_args"])
 
-        agent_id = self._active_agent_id or (self.config["agent_mistral_id"].strip() or None)
+        agent_id = self._agent_id()
         msg = await utils.answer(message, self.strings["loading"])
 
         try:
@@ -2094,6 +2112,46 @@ class MistralModule(loader.Module):
                     del self._vec_mem[key]
         await utils.answer(message, self.strings["memory_cleared"].format(chat=chat_id))
 
+    @loader.command(ru_doc="— Думка агента про співрозмовника та короткий переказ історії")
+    async def mistralthoughts(self, message):
+        """— Показати, що авто-агент думає про співрозмовника, без запису у пам'ять"""
+        if not self._ok():
+            return await utils.answer(message, self.strings["no_api_key"])
+
+        chat_id = message.chat_id
+        agent_id = self._agent_id()
+        if chat_id not in self._auto_chats or not agent_id:
+            return await utils.answer(message, self.strings["agent_thoughts_unavailable"])
+
+        history = self._memory.get(chat_id)
+        if not history:
+            return await utils.answer(message, self.strings["agent_thoughts_empty"])
+
+        history_text = self._history_for_prompt(history)
+        if not history_text:
+            return await utils.answer(message, self.strings["agent_thoughts_empty"])
+
+        msg = await utils.answer(message, self.strings["loading"])
+        prompt = (
+            "Ти маєш історію розмови авто-агента нижче. "
+            "Це одноразовий службовий запит для власника акаунту: НЕ змінюй свою поведінку, "
+            "НЕ вважай цей запит частиною майбутньої розмови і НЕ давай інструкцій собі на майбутнє.\n\n"
+            "Стисло українською дай:\n"
+            "1) що ти думаєш про поточного співрозмовника / людей у чаті;\n"
+            "2) короткий переказ важливої історії розмови;\n"
+            "3) важливі факти або патерни, які варто пам'ятати власнику.\n"
+            "Не вигадуй того, чого немає в історії. Якщо даних мало — так і скажи.\n\n"
+            f"Історія:\n{history_text}"
+        )
+        try:
+            answer, _images = await self._conversation(prompt=prompt, agent_id=agent_id)
+            await utils.answer(
+                msg,
+                self.strings["agent_thoughts_result"].format(text=_md_to_html(answer or "—")),
+            )
+        except RuntimeError as e:
+            await utils.answer(msg, self._api_error_answer(e))
+
     # ── Werwolf команди ───────────────────────────────────────────────────────
 
     @loader.command(ru_doc="<ключ> — Встановити Werwolf API ключ")
@@ -2333,6 +2391,7 @@ class MistralModule(loader.Module):
             "<code>.mistralauto</code> — Увімк/вимк у чаті\n"
             "<code>.mistralautolist</code> — Активні чати\n"
             "<code>.mistralclear</code> — Очистити пам'ять\n"
+            "<code>.mistralthoughts</code> — Думка агента + коротка історія\n"
             "<i>Ліміти авто-відповідей: 10/день і 80/місяць на групу або OP-користувача; винятки у .config</i>\n\n"
             "<b>🎮 Werwolf інтеграція</b>\n"
             "<code>.wwkey &lt;ключ&gt;</code> — Встановити Werwolf ключ\n"
