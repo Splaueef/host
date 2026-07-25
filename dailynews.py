@@ -1,5 +1,5 @@
 # meta developer: @Codex
-# meta version: 1.3.0
+# meta version: 1.4.0
 # meta description: Щоденний AI-дайджест новин із Telegram-каналів через Mistral Agent.
 
 import asyncio
@@ -350,26 +350,45 @@ class DailyNewsMod(loader.Module):
 
     async def newstodaycmd(self, message):
         """Примусово зібрати новини від початку сьогоднішнього дня до цієї миті"""
+        now_local = datetime.datetime.now(self._timezone())
+        since = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        await self._run_period(message, since, now_local, "today")
+
+    async def newsyesterdaycmd(self, message):
+        """Зібрати та опублікувати новини за вчорашній календарний день"""
+        today = datetime.datetime.now(self._timezone()).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        await self._run_period(message, today - datetime.timedelta(days=1), today, "yesterday")
+
+    async def newsweekcmd(self, message):
+        """Зібрати та опублікувати новини за останні сім календарних днів"""
+        now_local = datetime.datetime.now(self._timezone())
+        since = (now_local - datetime.timedelta(days=6)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        await self._run_period(message, since, now_local, "week")
+
+    async def _run_period(self, message, since, until, period_name):
+        """Run an on-demand digest for timezone-aware local period boundaries."""
         missing = self._missing_config()
         if missing:
             return await utils.answer(
                 message, self.strings("bad_config", message).format(html.escape(", ".join(missing)))
             )
 
-        now_local = datetime.datetime.now(self._timezone())
-        since = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         await utils.answer(message, self.strings("running", message))
         try:
             count = await self._run_digest(
                 since=since.astimezone(datetime.timezone.utc),
-                until=now_local.astimezone(datetime.timezone.utc),
+                until=until.astimezone(datetime.timezone.utc),
                 mark_run=False,
             )
             if not count:
                 return await utils.answer(message, self.strings("no_news", message))
             await utils.answer(message, self.strings("done", message).format(count))
         except (aiohttp.ClientError, asyncio.TimeoutError, RPCError, RuntimeError, ValueError) as error:
-            logger.exception("DailyNews today run failed")
+            logger.exception("DailyNews %s run failed", period_name)
             await utils.answer(
                 message, self.strings("failed", message).format(html.escape(str(error)[:500]))
             )
