@@ -1,5 +1,5 @@
 # meta developer: @Codex
-# meta version: 1.4.0
+# meta version: 1.5.0
 # meta description: Щоденний AI-дайджест новин із Telegram-каналів через Mistral Agent.
 
 import asyncio
@@ -64,6 +64,10 @@ class DailyNewsMod(loader.Module):
         "done": "✅ <b>Дайджест опубліковано.</b> Зібрано дописів: <b>{}</b>",
         "no_news": "📭 <b>За вказаний період новин не знайдено.</b>",
         "failed": "❌ <b>Не вдалося створити дайджест:</b> <code>{}</code>",
+        "analysis_running": "🔎 <b>Аналізую повтори в новинах за останні 2 дні…</b>",
+        "analysis_done": (
+            "✅ <b>Аналіз завершено.</b> Опрацьовано дописів: <b>{}</b>, каналів: <b>{}</b>"
+        ),
         "sources_usage": (
             "❌ <b>Надішли список каналів після команди або відповіддю на повідомлення.</b>\n"
             "Підтримуються нові рядки, пробіли, коми та крапки з комою."
@@ -253,6 +257,28 @@ class DailyNewsMod(loader.Module):
         news_input = f"Дата випуску: {edition_date}\nМатеріали:\n{payload}"
         return f"{instructions}\n\n{news_input}" if instructions else news_input
 
+    def _build_repetition_prompt(self, items, since, until):
+        """Build a focused request for cross-channel semantic overlap analysis."""
+        selected = list(items)
+        payload = json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
+        while len(payload) > 120_000 and len(selected) > 1:
+            selected = selected[max(1, len(selected) // 10) :]
+            payload = json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
+
+        return (
+            "Проаналізуй наведені Telegram-дописи саме на повторення однакової інформації "
+            "між різними каналами. Семантично згрупуй повідомлення про ту саму подію, навіть "
+            "якщо формулювання відрізняються. Не вважай повтором лише однакові рубрики, рекламу "
+            "або службовий текст. Для кожної групи вкажи коротку тему, канали та кількість їхніх "
+            "дописів; за можливості додай посилання-докази. Наприкінці склади рейтинг каналів за "
+            "кількістю груп повторюваної інформації, а при рівності — за кількістю дописів у цих "
+            "групах. Не вигадуй збігів і не плутай source_title/source_ref. Якщо між різними "
+            "каналами збігів немає, прямо повідом про це. Відповідай українською у "
+            "Telegram-сумісному Markdown, без таблиць, до 3900 символів.\n\n"
+            f"Період UTC: {since.isoformat()} — {until.isoformat()}\n"
+            f"Матеріали:\n{payload}"
+        )
+
     async def _ask_agent(self, prompt):
         headers = {
             "Authorization": f"Bearer {str(self.config['api_key']).strip()}",
@@ -368,6 +394,57 @@ class DailyNewsMod(loader.Module):
             hour=0, minute=0, second=0, microsecond=0
         )
         await self._run_period(message, since, now_local, "week")
+
+    async def newscomparecmd(self, message):
+        """Знайти повторення новин між каналами за останні 2 дні"""
+        missing = [
+            key for key in ("sources", "api_key", "agent_id")
+            if not str(self.config[key]).strip()
+        ]
+        if missing:
+            return await utils.answer(
+                message, self.strings("bad_config", message).format(html.escape(", ".join(missing)))
+            )
+        if self._running:
+            return await utils.answer(
+                message, self.strings("failed", message).format("інша обробка вже виконується")
+            )
+
+        status = await utils.answer(message, self.strings("analysis_running", message))
+        until = datetime.datetime.now(datetime.timezone.utc)
+        since = until - datetime.timedelta(days=2)
+        self._running = True
+        try:
+            items = await self._collect_news(since=since, until=until)
+            if not items:
+                return await utils.answer(status, self.strings("no_news", message))
+
+            report = await self._ask_agent(
+                self._build_repetition_prompt(items, since=since, until=until)
+            )
+            text, entities = markdown.parse(report)
+            parts = list(telethon_utils.split_text(text, entities, limit=4096))
+            first_text, first_entities = parts[0]
+            await status.edit(first_text, formatting_entities=first_entities)
+            for part, part_entities in parts[1:]:
+                await self._client.send_message(
+                    message.peer_id,
+                    part,
+                    formatting_entities=part_entities,
+                    reply_to=getattr(message, "id", None),
+                )
+
+            channels = len({item["source_ref"] for item in items})
+            logger.info(
+                self.strings("analysis_done", message).format(len(items), channels)
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError, RPCError, RuntimeError, ValueError) as error:
+            logger.exception("DailyNews repetition analysis failed")
+            await utils.answer(
+                status, self.strings("failed", message).format(html.escape(str(error)[:500]))
+            )
+        finally:
+            self._running = False
 
     async def _run_period(self, message, since, until, period_name):
         """Run an on-demand digest for timezone-aware local period boundaries."""
