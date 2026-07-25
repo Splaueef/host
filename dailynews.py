@@ -1,5 +1,5 @@
 # meta developer: @Codex
-# meta version: 1.2.1
+# meta version: 1.3.0
 # meta description: Щоденний AI-дайджест новин із Telegram-каналів через Mistral Agent.
 
 import asyncio
@@ -11,7 +11,9 @@ import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
+from telethon import utils as telethon_utils
 from telethon.errors import RPCError
+from telethon.extensions import markdown
 
 from .. import loader, utils
 
@@ -43,7 +45,7 @@ def _content_to_text(value):
 
 @loader.tds
 class DailyNewsMod(loader.Module):
-    """Збирає дописи каналів і раз на день публікує один дайджест"""
+    """Збирає дописи каналів і раз на день публікує дайджест"""
 
     strings = {
         "name": "DailyNews",
@@ -275,7 +277,19 @@ class DailyNewsMod(loader.Module):
         result = _content_to_text(data).strip()
         if not result:
             raise RuntimeError("Mistral Agent повернув порожню відповідь")
-        return result[:4096]
+        return result
+
+    async def _send_digest(self, digest):
+        """Send every part while preserving Markdown entities across boundaries."""
+        text, entities = markdown.parse(digest)
+        parts = telethon_utils.split_text(text, entities, limit=4096)
+        target = self._peer(self.config["target"])
+        for part, part_entities in parts:
+            await self._client.send_message(
+                target,
+                part,
+                formatting_entities=part_entities,
+            )
 
     async def _run_digest(self, run_date=None, since=None, until=None, mark_run=True):
         if self._running:
@@ -291,9 +305,7 @@ class DailyNewsMod(loader.Module):
                     self.set("last_run", run_date)
                 return 0
             digest = await self._ask_agent(self._build_prompt(items))
-            await self._client.send_message(
-                self._peer(self.config["target"]), digest, parse_mode="md"
-            )
+            await self._send_digest(digest)
             if mark_run:
                 self.set(
                     "last_run",
