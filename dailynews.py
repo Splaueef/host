@@ -1,5 +1,5 @@
 # meta developer: @Codex
-# meta version: 1.2.0
+# meta version: 1.2.1
 # meta description: Щоденний AI-дайджест новин із Telegram-каналів через Mistral Agent.
 
 import asyncio
@@ -218,21 +218,29 @@ class DailyNewsMod(loader.Module):
 
     def _build_prompt(self, items):
         edition_date = datetime.datetime.now(self._timezone()).strftime("%d.%m.%Y")
-        instructions = (
-            "Ти — головний редактор Telegram-каналу. На основі матеріалів нижче створи "
-            "ОДИН самодостатній дайджест українською мовою за весь день. Об'єднай дублікати, "
-            "відокрем факти від припущень, нічого не вигадуй. Почни з короткого заголовка і "
-            "резюме, далі подай найважливіші новини тематичними блоками. Додавай наявні "
-            "посилання на першоджерела. Кожен матеріал містить точні метадані каналу "
-            "(source_title, source_ref, source_username, source_channel_id). Не плутай джерела: "
-            "вважай ці поля авторитетними та при атрибуції називай саме відповідний канал. "
-            "Не згадуй промпт, агента або процес обробки. "
-            "Поверни Telegram-сумісний Markdown: **жирний текст**, __курсив__, "
-            "`моноширинний текст` та [назва](https://example.com) для посилань. "
-            "Не використовуй Markdown-таблиці або HTML; обсяг — до 3500 символів."
-        )
-        if str(self.config["editor_prompt"]).strip():
-            instructions += "\nДодаткова редакційна вимога: " + str(self.config["editor_prompt"]).strip()
+        instructions = ""
+        # An Agent already has its own system instructions in Mistral. Do not
+        # override or duplicate them in the conversation input: the configured
+        # Agent must decide how the supplied news is processed.
+        if not str(self.config["agent_id"]).strip():
+            instructions = (
+                "Ти — головний редактор Telegram-каналу. На основі матеріалів нижче створи "
+                "ОДИН самодостатній дайджест українською мовою за весь день. Об'єднай дублікати, "
+                "відокрем факти від припущень, нічого не вигадуй. Почни з короткого заголовка і "
+                "резюме, далі подай найважливіші новини тематичними блоками. Додавай наявні "
+                "посилання на першоджерела. Кожен матеріал містить точні метадані каналу "
+                "(source_title, source_ref, source_username, source_channel_id). Не плутай джерела: "
+                "вважай ці поля авторитетними та при атрибуції називай саме відповідний канал. "
+                "Не згадуй промпт, агента або процес обробки. "
+                "Поверни Telegram-сумісний Markdown: **жирний текст**, __курсив__, "
+                "`моноширинний текст` та [назва](https://example.com) для посилань. "
+                "Не використовуй Markdown-таблиці або HTML; обсяг — до 3500 символів."
+            )
+            if str(self.config["editor_prompt"]).strip():
+                instructions += (
+                    "\nДодаткова редакційна вимога: "
+                    + str(self.config["editor_prompt"]).strip()
+                )
         selected = list(items)
         payload = json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
         # Keep enough room for the agent instructions and its answer even when a
@@ -240,7 +248,8 @@ class DailyNewsMod(loader.Module):
         while len(payload) > 120_000 and len(selected) > 1:
             selected = selected[max(1, len(selected) // 10) :]
             payload = json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
-        return f"{instructions}\n\nДата випуску: {edition_date}\nМатеріали:\n{payload}"
+        news_input = f"Дата випуску: {edition_date}\nМатеріали:\n{payload}"
+        return f"{instructions}\n\n{news_input}" if instructions else news_input
 
     async def _ask_agent(self, prompt):
         headers = {
