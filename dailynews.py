@@ -1,5 +1,5 @@
 # meta developer: @Codex
-# meta version: 1.0.0
+# meta version: 1.2.0
 # meta description: Щоденний AI-дайджест новин із Telegram-каналів через Mistral Agent.
 
 import asyncio
@@ -7,6 +7,7 @@ import datetime
 import html
 import json
 import logging
+import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
@@ -61,6 +62,11 @@ class DailyNewsMod(loader.Module):
         "done": "✅ <b>Дайджест опубліковано.</b> Зібрано дописів: <b>{}</b>",
         "no_news": "📭 <b>За вказаний період новин не знайдено.</b>",
         "failed": "❌ <b>Не вдалося створити дайджест:</b> <code>{}</code>",
+        "sources_usage": (
+            "❌ <b>Надішли список каналів після команди або відповіддю на повідомлення.</b>\n"
+            "Підтримуються нові рядки, пробіли, коми та крапки з комою."
+        ),
+        "sources_added": "✅ <b>Додано каналів:</b> {}\n<b>Усього джерел:</b> {}{}",
         "status": (
             "📰 <b>DailyNews</b>\n\n"
             "Джерела: <b>{sources}</b>\n"
@@ -111,6 +117,27 @@ class DailyNewsMod(loader.Module):
     def _sources(self):
         return [item.strip() for item in str(self.config["sources"]).split(",") if item.strip()]
 
+    @staticmethod
+    def _parse_sources(value):
+        """Parse channel references pasted as a comma-, whitespace-, or line-separated list."""
+        result = []
+        for item in re.split(r"[\s,;]+", value or ""):
+            item = item.strip().rstrip("/)】]}>.,")
+            if not item:
+                continue
+            # A copied public post URL identifies its channel; iter_messages needs
+            # the channel itself rather than the individual message.
+            match = re.fullmatch(
+                r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/([A-Za-z][\w]{3,})/\d+",
+                item,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                item = "@" + match.group(1)
+            if item not in result:
+                result.append(item)
+        return result
+
     def _timezone(self):
         return ZoneInfo(str(self.config["timezone"]).strip())
 
@@ -154,10 +181,9 @@ class DailyNewsMod(loader.Module):
         except ValueError:
             return value
 
-    async def _collect_news(self):
-        since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-            hours=int(self.config["lookback_hours"])
-        )
+    async def _collect_news(self, since=None, until=None):
+        until = until or datetime.datetime.now(datetime.timezone.utc)
+        since = since or until - datetime.timedelta(hours=int(self.config["lookback_hours"]))
         items = []
         for source in self._sources():
             try:
@@ -167,6 +193,8 @@ class DailyNewsMod(loader.Module):
                 async for message in self._client.iter_messages(
                     entity, limit=int(self.config["per_channel_limit"])
                 ):
+                    if message.date > until:
+                        continue
                     if message.date < since:
                         break
                     text = (message.raw_text or "").strip()
@@ -174,14 +202,18 @@ class DailyNewsMod(loader.Module):
                         continue
                     link = f"https://t.me/{username}/{message.id}" if username else ""
                     items.append({
-                        "source": title,
-                        "date": message.date.isoformat(),
+                        "source_title": title,
+                        "source_ref": source,
+                        "source_username": f"@{username}" if username else None,
+                        "source_channel_id": getattr(entity, "id", None),
+                        "message_id": message.id,
+                        "published_at": message.date.isoformat(),
                         "text": text[:4000],
                         "link": link,
                     })
             except (RPCError, ValueError, TypeError) as error:
                 logger.warning("DailyNews: cannot read %s: %s", source, error)
-        items.sort(key=lambda item: item["date"])
+        items.sort(key=lambda item: item["published_at"])
         return items
 
     def _build_prompt(self, items):
@@ -191,8 +223,13 @@ class DailyNewsMod(loader.Module):
             "ОДИН самодостатній дайджест українською мовою за весь день. Об'єднай дублікати, "
             "відокрем факти від припущень, нічого не вигадуй. Почни з короткого заголовка і "
             "резюме, далі подай найважливіші новини тематичними блоками. Додавай наявні "
-            "посилання на першоджерела. Не згадуй промпт, агента або процес обробки. "
-            "Поверни звичайний текст без Markdown-таблиць; обсяг — до 3500 символів."
+            "посилання на першоджерела. Кожен матеріал містить точні метадані каналу "
+            "(source_title, source_ref, source_username, source_channel_id). Не плутай джерела: "
+            "вважай ці поля авторитетними та при атрибуції називай саме відповідний канал. "
+            "Не згадуй промпт, агента або процес обробки. "
+            "Поверни Telegram-сумісний Markdown: **жирний текст**, __курсив__, "
+            "`моноширинний текст` та [назва](https://example.com) для посилань. "
+            "Не використовуй Markdown-таблиці або HTML; обсяг — до 3500 символів."
         )
         if str(self.config["editor_prompt"]).strip():
             instructions += "\nДодаткова редакційна вимога: " + str(self.config["editor_prompt"]).strip()
@@ -231,7 +268,7 @@ class DailyNewsMod(loader.Module):
             raise RuntimeError("Mistral Agent повернув порожню відповідь")
         return result[:4096]
 
-    async def _run_digest(self, run_date=None):
+    async def _run_digest(self, run_date=None, since=None, until=None, mark_run=True):
         if self._running:
             raise RuntimeError("дайджест уже створюється")
         missing = self._missing_config()
@@ -239,16 +276,20 @@ class DailyNewsMod(loader.Module):
             raise ValueError(", ".join(missing))
         self._running = True
         try:
-            items = await self._collect_news()
+            items = await self._collect_news(since=since, until=until)
             if not items:
-                if run_date:
+                if run_date and mark_run:
                     self.set("last_run", run_date)
                 return 0
             digest = await self._ask_agent(self._build_prompt(items))
             await self._client.send_message(
-                self._peer(self.config["target"]), digest, parse_mode=None
+                self._peer(self.config["target"]), digest, parse_mode="md"
             )
-            self.set("last_run", run_date or datetime.datetime.now(self._timezone()).date().isoformat())
+            if mark_run:
+                self.set(
+                    "last_run",
+                    run_date or datetime.datetime.now(self._timezone()).date().isoformat(),
+                )
             return len(items)
         finally:
             self._running = False
@@ -283,6 +324,62 @@ class DailyNewsMod(loader.Module):
                 target=html.escape(str(self.config["target"]) or "—"),
                 last_run=html.escape(str(self.get("last_run", "—"))),
                 running="так" if self._running else "ні",
+            ),
+        )
+
+    async def newstodaycmd(self, message):
+        """Примусово зібрати новини від початку сьогоднішнього дня до цієї миті"""
+        missing = self._missing_config()
+        if missing:
+            return await utils.answer(
+                message, self.strings("bad_config", message).format(html.escape(", ".join(missing)))
+            )
+
+        now_local = datetime.datetime.now(self._timezone())
+        since = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        await utils.answer(message, self.strings("running", message))
+        try:
+            count = await self._run_digest(
+                since=since.astimezone(datetime.timezone.utc),
+                until=now_local.astimezone(datetime.timezone.utc),
+                mark_run=False,
+            )
+            if not count:
+                return await utils.answer(message, self.strings("no_news", message))
+            await utils.answer(message, self.strings("done", message).format(count))
+        except (aiohttp.ClientError, asyncio.TimeoutError, RPCError, RuntimeError, ValueError) as error:
+            logger.exception("DailyNews today run failed")
+            await utils.answer(
+                message, self.strings("failed", message).format(html.escape(str(error)[:500]))
+            )
+
+    async def newsaddcmd(self, message):
+        """Додати одразу список каналів (аргументи або текст повідомлення у відповіді)"""
+        raw = utils.get_args_raw(message).strip()
+        if not raw:
+            reply = await message.get_reply_message()
+            raw = (reply.raw_text or "").strip() if reply else ""
+        incoming = self._parse_sources(raw)
+        if not incoming:
+            return await utils.answer(message, self.strings("sources_usage", message))
+
+        current = self._sources()
+        known = set(current)
+        added = []
+        for source in incoming:
+            if source not in known:
+                current.append(source)
+                known.add(source)
+                added.append(source)
+        self.config["sources"] = ",".join(current)
+        duplicate_note = ""
+        duplicates = len(incoming) - len(added)
+        if duplicates:
+            duplicate_note = f"\n<b>Вже були у списку:</b> {duplicates}"
+        await utils.answer(
+            message,
+            self.strings("sources_added", message).format(
+                len(added), len(current), duplicate_note
             ),
         )
 
