@@ -1,4 +1,4 @@
-__version__ = (6, 1, 0)
+__version__ = (6, 2, 0)
 
 import os
 import re
@@ -13,6 +13,7 @@ import mimetypes
 import unicodedata
 import ipaddress
 import socket
+import json
 from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 from collections import defaultdict
 
@@ -815,9 +816,10 @@ class VideoDownloaderMod(loader.Module):
         # progressive audio+video file is unavailable, explicitly merge best
         # video with best audio and only then fall back to generic best/worst.
         return [
+            f"best[ext=mp4][vcodec^=avc1][acodec!=none]{limit}",
             f"best[ext=mp4][vcodec!=none][acodec!=none]{limit}",
             f"best[vcodec!=none][acodec!=none]{limit}",
-            f"bestvideo[ext=mp4]{limit}+bestaudio[ext=m4a]/bestvideo[ext=mp4]{limit}+bestaudio",
+            f"bestvideo[ext=mp4][vcodec^=avc1]{limit}+bestaudio[ext=m4a]/bestvideo[ext=mp4]{limit}+bestaudio",
             f"bestvideo{limit}+bestaudio",
             "best[ext=mp4][vcodec!=none][acodec!=none]",
             "best[vcodec!=none][acodec!=none]",
@@ -833,11 +835,12 @@ class VideoDownloaderMod(loader.Module):
             h = {"360": 640, "480": 854, "720": 1280, "1080": 1920}.get(q, 1280)
         limit = "" if q == "best" else f"[height<={h}]"
         return [
+            f"best[ext=mp4][vcodec^=avc1][acodec!=none]{limit}",
             f"best[ext=mp4][vcodec!=none][acodec!=none]{limit}",
             f"best[vcodec!=none][acodec!=none]{limit}",
             f"bestvideo[protocol=m3u8_native][ext=mp4]{limit}+bestaudio[ext=m4a]",
             f"bestvideo[protocol=m3u8_native]{limit}+bestaudio",
-            f"bestvideo[ext=mp4]{limit}+bestaudio[ext=m4a]",
+            f"bestvideo[ext=mp4][vcodec^=avc1]{limit}+bestaudio[ext=m4a]",
             f"bestvideo{limit}+bestaudio",
             "best[ext=mp4][vcodec!=none][acodec!=none]",
             "bestvideo+bestaudio",
@@ -919,41 +922,66 @@ class VideoDownloaderMod(loader.Module):
     # ── orientation fix ───────────────────────────────────────────────────────
 
     async def _normalize_video_container(self, path: str) -> str:
-        """Keep video files in an extension/container Telegram handles reliably."""
+        """Produce a compact, streamable MP4 that works reliably on iOS.
+
+        A .mp4 suffix alone does not imply iPhone compatibility: downloads may
+        contain AV1/VP9, an unsupported pixel format, or Opus audio.  Compatible
+        H.264/AAC files are only remuxed when needed; other files are encoded at
+        a visually transparent CRF and the optimized copy is kept only when it
+        is smaller (unless conversion is required for compatibility).
+        """
         if _file_type(path) != "video":
             return path
         ext = os.path.splitext(path)[1].lower()
-        if ext == ".mp4":
+
+        def _convert():
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_streams", "-of", "json", path],
+                capture_output=True, text=True, timeout=20,
+            )
+            streams = json.loads(probe.stdout).get("streams", []) if probe.returncode == 0 else []
+            video = next((s for s in streams if s.get("codec_type") == "video"), {})
+            audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+            compatible = (
+                ext == ".mp4"
+                and video.get("codec_name") == "h264"
+                and video.get("pix_fmt") in {"yuv420p", "yuvj420p"}
+                and all(s.get("codec_name") in {"aac", "mp3"} for s in audio_streams)
+            )
+
+            output = os.path.splitext(path)[0] + "_ios.mp4"
+            if compatible:
+                cmd = ["ffmpeg", "-i", path, "-map", "0:v:0", "-map", "0:a?",
+                       "-c", "copy", "-movflags", "+faststart", "-y", output]
+            else:
+                # CRF 21 preserves perceived source quality while H.264 + AAC +
+                # yuv420p avoids the black-screen/unplayable files seen on iOS.
+                cmd = [
+                    "ffmpeg", "-i", path, "-map", "0:v:0", "-map", "0:a?",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "21",
+                    "-pix_fmt", "yuv420p", "-profile:v", "high",
+                    "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+                    "-movflags", "+faststart", "-y", output,
+                ]
+            result = subprocess.run(cmd, capture_output=True, timeout=600)
+            if result.returncode != 0 or not os.path.isfile(output) or os.path.getsize(output) <= 0:
+                if os.path.isfile(output):
+                    os.remove(output)
+                return path
+
+            # A compatible source is already usable. Avoid replacing it with a
+            # larger remux; incompatible sources must use the iOS-safe result.
+            if compatible and os.path.getsize(output) >= os.path.getsize(path):
+                os.remove(output)
+                return path
+            os.remove(path)
+            return output
+
+        try:
+            return await utils.run_sync(_convert)
+        except Exception as e:
+            logger.warning("Video compatibility conversion failed for %s: %s", path, e)
             return path
-
-        fixed_path = re.sub(r"\.\w+$", ".mp4", path)
-        if fixed_path == path:
-            fixed_path = path + ".mp4"
-
-        def _remux():
-            cmd = [
-                "ffmpeg", "-i", path,
-                "-map", "0", "-c", "copy",
-                "-movflags", "+faststart",
-                "-y", fixed_path,
-            ]
-            r = subprocess.run(cmd, capture_output=True, timeout=180)
-            if r.returncode == 0 and os.path.isfile(fixed_path) and os.path.getsize(fixed_path) > 0:
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
-                return fixed_path
-            # If stream-copy remux is not possible, keep the original instead
-            # of failing a successful download.
-            try:
-                if os.path.isfile(fixed_path):
-                    os.remove(fixed_path)
-            except Exception:
-                pass
-            return path
-
-        return await utils.run_sync(_remux)
 
     async def _maybe_fix_orientation(self, path: str, status_msg) -> str:
         if not self.config["fix_orientation"] or _file_type(path) != "video":
@@ -1803,9 +1831,25 @@ class VideoDownloaderMod(loader.Module):
         if not video_formats:
             video_formats = [fmt for fmt in formats if _is_real_video(fmt)]
 
-        # Prefer progressive files first. They are the same family that usually
-        # succeeds in manual ``yt-dlp -F`` checks with cookies and do not require
-        # a second audio request that may hit YouTube POT restrictions.
+        quality = str(self.config.get("quality", "720")).lower().replace("p", "")
+        limit = 99999 if quality == "best" else int(quality) if quality.isdigit() else 720
+        if want_vertical and limit != 99999:
+            limit = {360: 640, 480: 854, 720: 1280, 1080: 1920}.get(limit, limit)
+        bounded = [fmt for fmt in video_formats if not fmt.get("height") or int(fmt["height"]) <= limit]
+        if bounded:
+            video_formats = bounded
+
+        def _rank(fmt: dict) -> tuple:
+            codec = str(fmt.get("vcodec") or "")
+            ios_codec = codec.startswith(("avc1", "h264"))
+            return (ios_codec, int(fmt.get("height") or 0), float(fmt.get("tbr") or 0))
+
+        video_formats.sort(key=_rank)
+
+        # Prefer progressive H.264 files within the configured resolution.
+        # This avoids downloading an enormous "best" source merely to encode
+        # it later and normally eliminates a second audio request that may hit
+        # YouTube POT restrictions.
         for fmt in reversed(video_formats):
             if fmt.get("acodec") not in (None, "none"):
                 fmt_id = fmt.get("format_id")
