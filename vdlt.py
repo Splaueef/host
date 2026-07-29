@@ -1,4 +1,4 @@
-__version__ = (6, 2, 0)
+__version__ = (6, 2, 1)
 
 import os
 import re
@@ -361,6 +361,37 @@ def _video_has_audio(path: str) -> bool:
     except Exception as e:
         logger.debug("Could not probe audio stream for %s: %s", path, e)
         return True
+
+
+def _rotation_filter_from_stream(stream: dict) -> str | None:
+    """Return the filter needed to bake a video's display rotation into pixels.
+
+    The legacy ``rotate`` tag uses clockwise degrees, while ffprobe's Display
+    Matrix reports counter-clockwise degrees.  Treating them as equivalent
+    rotates phone recordings in the opposite direction.  Prefer the modern
+    display matrix and translate it to the legacy/FFmpeg filter convention.
+    """
+    rotation = None
+    for side_data in stream.get("side_data_list", []):
+        if side_data.get("side_data_type") == "Display Matrix":
+            try:
+                rotation = -int(round(float(side_data.get("rotation", 0))))
+            except (TypeError, ValueError):
+                pass
+            break
+
+    if rotation is None:
+        try:
+            rotation = int(round(float(stream.get("tags", {}).get("rotate", 0))))
+        except (TypeError, ValueError):
+            rotation = 0
+
+    rotation %= 360
+    return {
+        90: "transpose=clock",
+        180: "hflip,vflip",
+        270: "transpose=cclock",
+    }.get(rotation)
 
 def _media_dimensions_from_info(info: dict | None) -> tuple[int | None, int | None]:
     """Return the most reliable width/height pair available in yt-dlp info."""
@@ -1001,17 +1032,7 @@ class VideoDownloaderMod(loader.Module):
                 if not streams:
                     return path, None
                 s = streams[0]
-                rotation = int(s.get("tags", {}).get("rotate", 0))
-                for sd in s.get("side_data_list", []):
-                    if sd.get("side_data_type") == "Display Matrix":
-                        rotation = rotation or int(sd.get("rotation", 0))
-                vf_map = {
-                    90: "transpose=1",
-                    -90: "transpose=2", 270: "transpose=2",
-                    180: "transpose=1,transpose=1", -180: "transpose=1,transpose=1",
-                }
-                vf = vf_map.get(rotation)
-                return path, vf
+                return path, _rotation_filter_from_stream(streams[0])
             except Exception as e:
                 logger.warning("_check_and_fix error: %s", e)
                 return path, None
@@ -1028,7 +1049,10 @@ class VideoDownloaderMod(loader.Module):
         def _do_fix():
             import subprocess
             cmd = [
-                "ffmpeg", "-i", original_path,
+                # We apply the display transform explicitly.  Without
+                # -noautorotate FFmpeg applies it once on input and the filter
+                # applies it again, which swaps portrait/landscape on phones.
+                "ffmpeg", "-noautorotate", "-i", original_path,
                 "-vf", vf_filter,
                 "-metadata:s:v:0", "rotate=0",
                 "-c:v", "libx264", "-preset", "fast",
