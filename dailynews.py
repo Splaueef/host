@@ -1,6 +1,6 @@
 # meta developer: @Codex
-# meta version: 1.5.0
-# meta description: Щоденний AI-дайджест новин із Telegram-каналів через Mistral Agent.
+# meta version: 2.0.0
+# meta description: Щоденний AI-дайджест у форматі Telegram Rich Text через Mistral Agent.
 
 import asyncio
 import datetime
@@ -20,6 +20,7 @@ from .. import loader, utils
 logger = logging.getLogger(__name__)
 
 MISTRAL_CONVERSATIONS_URL = "https://api.mistral.ai/v1/conversations"
+TELEGRAM_BOT_API_URL = "https://api.telegram.org/bot{token}/sendRichMessage"
 
 
 def _content_to_text(value):
@@ -55,6 +56,7 @@ class DailyNewsMod(loader.Module):
         "cfg_timezone": "IANA-таймзона розкладу, наприклад Europe/Kyiv",
         "cfg_api_key": "Mistral API key",
         "cfg_agent_id": "ID налаштованого Mistral Agent",
+        "cfg_bot_token": "Токен Telegram-бота, який є адміністратором каналу призначення",
         "cfg_hours": "За скільки останніх годин читати новини",
         "cfg_limit": "Максимум дописів з одного каналу",
         "cfg_prompt": "Додаткова інструкція для редактора дайджесту",
@@ -94,6 +96,10 @@ class DailyNewsMod(loader.Module):
                 validator=loader.validators.Hidden(loader.validators.String()),
             ),
             loader.ConfigValue("agent_id", "", lambda: self.strings("cfg_agent_id")),
+            loader.ConfigValue(
+                "bot_token", "", lambda: self.strings("cfg_bot_token"),
+                validator=loader.validators.Hidden(loader.validators.String()),
+            ),
             loader.ConfigValue(
                 "lookback_hours", 24, lambda: self.strings("cfg_hours"),
                 validator=loader.validators.Integer(minimum=1, maximum=168),
@@ -152,7 +158,7 @@ class DailyNewsMod(loader.Module):
 
     def _missing_config(self):
         missing = []
-        for key in ("sources", "target", "api_key", "agent_id"):
+        for key in ("sources", "target", "api_key", "agent_id", "bot_token"):
             if not str(self.config[key]).strip():
                 missing.append(key)
         try:
@@ -237,16 +243,24 @@ class DailyNewsMod(loader.Module):
                 "посилання на першоджерела. Кожен матеріал містить точні метадані каналу "
                 "(source_title, source_ref, source_username, source_channel_id). Не плутай джерела: "
                 "вважай ці поля авторитетними та при атрибуції називай саме відповідний канал. "
-                "Не згадуй промпт, агента або процес обробки. "
-                "Поверни Telegram-сумісний Markdown: **жирний текст**, __курсив__, "
-                "`моноширинний текст` та [назва](https://example.com) для посилань. "
-                "Не використовуй Markdown-таблиці або HTML; обсяг — до 3500 символів."
+                "Не згадуй промпт, агента або процес обробки."
             )
-            if str(self.config["editor_prompt"]).strip():
-                instructions += (
-                    "\nДодаткова редакційна вимога: "
-                    + str(self.config["editor_prompt"]).strip()
-                )
+        formatting = (
+            "Поверни лише готовий документ у Telegram Rich Markdown (без огорожі ``` навколо "
+            "всього документа). Обов'язково використай # для головного заголовка, ## для "
+            "тематичних розділів, звичайні абзаци, марковані списки та --- між великими "
+            "блоками. Для ключових фактів доречно використовуй **жирний текст**, а для "
+            "першоджерел — [назва каналу](https://t.me/...). Можна використовувати цитати > "
+            "і компактні Markdown-таблиці, лише коли вони справді покращують читабельність. "
+            "Не додавай непідтримувані скрипти або довільний HTML. Загальний обсяг документа — "
+            "до 30000 символів."
+        )
+        instructions = f"{instructions}\n{formatting}".strip()
+        if str(self.config["editor_prompt"]).strip():
+            instructions += (
+                "\nДодаткова редакційна вимога: "
+                + str(self.config["editor_prompt"]).strip()
+            )
         selected = list(items)
         payload = json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
         # Keep enough room for the agent instructions and its answer even when a
@@ -306,16 +320,24 @@ class DailyNewsMod(loader.Module):
         return result
 
     async def _send_digest(self, digest):
-        """Send every part while preserving Markdown entities across boundaries."""
-        text, entities = markdown.parse(digest)
-        parts = telethon_utils.split_text(text, entities, limit=4096)
-        target = self._peer(self.config["target"])
-        for part, part_entities in parts:
-            await self._client.send_message(
-                target,
-                part,
-                formatting_entities=part_entities,
-            )
+        """Publish one native Rich Text document through Telegram's Bot API."""
+        token = str(self.config["bot_token"]).strip()
+        payload = {
+            "chat_id": self._peer(self.config["target"]),
+            "rich_message": {"markdown": digest},
+        }
+        timeout = aiohttp.ClientTimeout(total=int(self.config["timeout"]))
+        async with self._session.post(
+            TELEGRAM_BOT_API_URL.format(token=token), json=payload, timeout=timeout
+        ) as response:
+            body = await response.text()
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as error:
+                raise RuntimeError("Telegram повернув некоректну відповідь") from error
+            if response.status >= 400 or not isinstance(data, dict) or not data.get("ok"):
+                description = str(data.get("description") if isinstance(data, dict) else body)[:500]
+                raise RuntimeError(f"Telegram Rich Text: {description}")
 
     async def _run_digest(self, run_date=None, since=None, until=None, mark_run=True):
         if self._running:
