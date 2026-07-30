@@ -1,4 +1,4 @@
-__version__ = (6, 5, 0)
+__version__ = (6, 6, 0)
 
 import os
 import re
@@ -252,6 +252,30 @@ def _sanitize_filename(name: str) -> str:
     if len(name) > _MAX_FNAME_LEN:
         name = name[:_MAX_FNAME_LEN].rstrip()
     return name or "media"
+
+
+def _parse_music_channels(value) -> list[str | int]:
+    """Normalize configured Telegram channel usernames and ``-100`` IDs."""
+    if isinstance(value, (list, tuple, set)):
+        raw_items = value
+    else:
+        raw_items = re.split(r"[,;\s]+", str(value or ""))
+
+    result: list[str | int] = []
+    for raw in raw_items:
+        item = str(raw or "").strip()
+        if not item:
+            continue
+        item = re.sub(r"^https?://t\.me/", "", item, flags=re.I).strip("/")
+        # A copied post URL points to the channel, not to a separate source.
+        item = item.split("/", 1)[0]
+        if re.fullmatch(r"-100\d+", item):
+            source: str | int = int(item)
+        else:
+            source = "@" + item.lstrip("@")
+        if source not in result:
+            result.append(source)
+    return result
 
 
 def _ig_shortcode(url: str) -> str | None:
@@ -602,6 +626,11 @@ class VideoDownloaderMod(loader.Module):
         "loading_fix":        "<b>🔧 Виправляю орієнтацію відео...</b>",
         "loading_transcript": "<b>📝 Витягую транскрипт...</b>",
         "loading_music":      "<b>🎵 Шукаю та завантажую музику...</b>",
+        "searching_music":    "<b>🔎 Шукаю музику в налаштованих каналах...</b>",
+        "music_no_query":     "<b>❌ Вкажи назву та/або автора композиції чи URL.</b>",
+        "music_no_channels":  "<b>❌ Додай канали для пошуку в <code>music_channels</code> (юзернейм або <code>-100ID</code>).</b>",
+        "music_not_found":    "<b>❌ У налаштованих каналах нічого не знайдено.</b>",
+        "music_found":        "<b>🎵 {title}</b>\n<b>Виконавець:</b> {artist}",
         "err_file":           "<b>❌ Не вдалося отримати файл.</b>",
         "err_youtube_auth":   "<b>❌ YouTube просить підтвердити, що це не бот. Якщо відео приватне/18+, онови cookies: <code>.vdlcookies</code>. Для публічних відео модуль спершу пробує режим без cookies, щоб YouTube рідше ротував сесію.</b>",
         "err_size":           "<b>❌ Файл завеликий ({} МБ). Знижую якість...</b>",
@@ -672,11 +701,11 @@ class VideoDownloaderMod(loader.Module):
         "caption_playlist":   "<b>📋 {title} ({idx}/{total})</b>",
         "transcript_header":  "<b>📝 Транскрипт: {title}</b>\n\n",
         "help_text": (
-            "<b>🎬 VideoDownloader v6.5.0</b>\n\n"
+            "<b>🎬 VideoDownloader v6.6.0</b>\n\n"
             "<b>Основні команди:</b>\n"
             "• <code>.vdl</code> — увімк/вимк авто-завантаження\n"
             "• <code>.vdldl [URL]</code> — ручне завантаження\n"
-            "• <code>.vdlmusic [URL]</code> — музика зі Spotify та інших сервісів\n"
+            "• <code>.vdlmusic [назва / автор / URL]</code> — знайти музику в каналах або сервісах\n"
             "• <code>.vdlaudio</code> — перемкнути MP3/відео\n"
             "• <code>.vdlq [360/480/720/1080/best]</code> — якість\n"
             "• <code>.vdlcookies</code> — статус cookies\n"
@@ -733,6 +762,8 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("yt_browser_cookies", "firefox", "YouTube cookies-from-browser для yt-dlp: firefox/chrome або browser:profile"),
             loader.ConfigValue("yt_cookies_mode",   "auto", "YouTube cookies: auto/always/never. auto = спочатку без cookies, потім fallback"),
             loader.ConfigValue("songlink_enabled",  True, "Шукати альтернативні музичні платформи через song.link"),
+            loader.ConfigValue("music_channels", [], "Канали для пошуку музики: @username або -100ID"),
+            loader.ConfigValue("music_search_limit", 25, "Скільки повідомлень перевіряти в кожному музичному каналі"),
             loader.ConfigValue("cobalt_api_url", "", "Cobalt API fallback для YouTube (URL власного/доступного інстансу)"),
             loader.ConfigValue("cobalt_api_key", "", "Необов'язковий API key для Cobalt"),
         )
@@ -2690,6 +2721,88 @@ class VideoDownloaderMod(loader.Module):
                         except Exception as e2:
                             logger.warning("Single file send failed: %s", e2)
 
+    @staticmethod
+    def _telegram_audio_metadata(candidate) -> tuple[str, str] | None:
+        """Return Telegram's embedded title/performer for an audio message."""
+        document = getattr(candidate, "document", None)
+        if document is None:
+            media = getattr(candidate, "media", None)
+            document = getattr(media, "document", None)
+        if document is None:
+            return None
+
+        mime = str(getattr(document, "mime_type", "") or "").lower()
+        title = artist = ""
+        for attribute in getattr(document, "attributes", []) or []:
+            if hasattr(attribute, "title") or hasattr(attribute, "performer"):
+                title = str(getattr(attribute, "title", "") or "").strip()
+                artist = str(getattr(attribute, "performer", "") or "").strip()
+                if title or artist:
+                    break
+        if not mime.startswith("audio/") and not (title or artist):
+            return None
+
+        # Telegram files without ID3 tags often still have a useful filename.
+        if not title:
+            for attribute in getattr(document, "attributes", []) or []:
+                filename = str(getattr(attribute, "file_name", "") or "").strip()
+                if filename:
+                    title = os.path.splitext(filename)[0]
+                    break
+        return (title or "Без назви", artist or "Невідомий виконавець")
+
+    async def _find_music_in_channels(self, query: str):
+        """Find the best tagged audio message in the configured channels."""
+        sources = _parse_music_channels(self.config.get("music_channels", []))
+        if not sources or not self._client:
+            return None
+
+        query_words = set(re.findall(r"\w+", query.casefold(), flags=re.UNICODE))
+        best = None
+        best_score = -1
+        limit = max(1, min(100, int(self.config.get("music_search_limit", 25) or 25)))
+        for source in sources:
+            try:
+                entity = await self._client.get_entity(source)
+                async for candidate in self._client.iter_messages(
+                    entity, search=query, limit=limit
+                ):
+                    metadata = self._telegram_audio_metadata(candidate)
+                    if not metadata:
+                        continue
+                    title, artist = metadata
+                    searchable = f"{title} {artist} {getattr(candidate, 'raw_text', '')}".casefold()
+                    score = sum(1 for word in query_words if word in searchable)
+                    if score > best_score:
+                        best = (candidate, title, artist)
+                        best_score = score
+                    if query_words and score == len(query_words):
+                        return best
+            except Exception as e:
+                logger.warning("Music search failed in %s: %s", source, e)
+        return best
+
+    async def _send_channel_music(self, message, status, query: str) -> bool:
+        await status.edit(self.strings("searching_music"))
+        found = await self._find_music_in_channels(query)
+        if not found:
+            return False
+        candidate, title, artist = found
+        caption = self.strings("music_found").format(
+            title=utils.escape_html(title), artist=utils.escape_html(artist)
+        )
+        await message.client.send_file(
+            message.chat_id, candidate.media, reply_to=message.id,
+            caption=caption, parse_mode="html",
+        )
+        self._stats["total"] += 1
+        self._stats["ok"] += 1
+        self._stats["audio"] += 1
+        self._stats["today"] += 1
+        self._stats["platforms"]["Telegram"] += 1
+        await status.delete()
+        return True
+
     # ── notify ────────────────────────────────────────────────────────────────
 
     async def _notify(self, platform: str, url: str):
@@ -3047,15 +3160,28 @@ class VideoDownloaderMod(loader.Module):
 
     @loader.command()
     async def vdlmusic(self, message):
-        """Завантажити музику: .vdlmusic [Spotify/YouTube Music/SoundCloud URL]"""
+        """Знайти музику: .vdlmusic [назва, автор або URL]"""
         args = utils.get_args_raw(message).strip()
         url = self._extract_url(args) if args else None
         if not url:
             reply = await message.get_reply_message()
             if reply and reply.raw_text:
                 url = self._extract_url(reply.raw_text)
+                if not args:
+                    args = reply.raw_text.strip()
         if not url:
-            return await utils.answer(message, self.strings("dl_no_url"))
+            if not args:
+                return await utils.answer(message, self.strings("music_no_query"))
+            if not _parse_music_channels(self.config.get("music_channels", [])):
+                return await utils.answer(message, self.strings("music_no_channels"))
+            status = await utils.answer(message, self.strings("searching_music"))
+            try:
+                if not await self._send_channel_music(message, status, args):
+                    await status.edit(self.strings("music_not_found"))
+            except Exception:
+                logger.exception("Telegram music search failed")
+                await status.edit(self.strings("music_not_found"))
+            return
         url = self._normalize(url)
         if self._queue is None:
             return
