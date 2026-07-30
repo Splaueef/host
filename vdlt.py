@@ -1,4 +1,4 @@
-__version__ = (6, 3, 0)
+__version__ = (6, 5, 0)
 
 import os
 import re
@@ -14,6 +14,7 @@ import unicodedata
 import ipaddress
 import socket
 import json
+from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 from collections import defaultdict
 
@@ -69,6 +70,43 @@ def _is_spotify_url(url: str) -> bool:
     except Exception:
         return False
     return any(_hostname_matches(hostname, host) for host in ("open.spotify.com", "spotify.link"))
+
+
+class _OpenGraphParser(HTMLParser):
+    """Collect public Open Graph metadata without depending on BeautifulSoup."""
+
+    def __init__(self):
+        super().__init__()
+        self.values: dict[str, str] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]):
+        if tag.lower() != "meta":
+            return
+        values = {str(key).lower(): value for key, value in attrs if value is not None}
+        name = values.get("property") or values.get("name")
+        content = values.get("content")
+        if name and content:
+            self.values[name.lower()] = content.strip()
+
+
+def _spotify_track_metadata(html_text: str) -> tuple[str, str] | None:
+    """Extract a track title and artist from Spotify's public share page."""
+    parser = _OpenGraphParser()
+    try:
+        parser.feed(html_text or "")
+    except Exception:
+        return None
+
+    title = parser.values.get("og:title", "").strip()
+    description = parser.values.get("og:description", "").strip()
+    if not title:
+        return None
+
+    # Spotify descriptions normally start with ``Artist · Track · ...``.
+    # Do not use the track itself as the artist if the page layout changes.
+    parts = [part.strip() for part in re.split(r"\s*[·•]\s*", description) if part.strip()]
+    artist = parts[0] if parts and parts[0].casefold() != title.casefold() else ""
+    return title, artist
 
 def _hostname_matches(hostname: str, domain: str) -> bool:
     domain = domain.lower().strip().strip("/")
@@ -175,6 +213,16 @@ def _safe_requests_get(
             continue
         return resp
     raise ValueError("Too many redirects")
+
+
+def _safe_requests_post(requests_module, url: str, *, timeout: int, json_data: dict,
+                        headers: dict | None = None):
+    """POST JSON only to a validated public endpoint (no implicit redirects)."""
+    if not _is_safe_http_url(url):
+        raise ValueError(f"Unsafe URL blocked: {url}")
+    return requests_module.post(
+        url, timeout=timeout, json=json_data, headers=headers, allow_redirects=False
+    )
 
 
 def _response_too_large(resp, max_bytes: int) -> bool:
@@ -624,7 +672,7 @@ class VideoDownloaderMod(loader.Module):
         "caption_playlist":   "<b>📋 {title} ({idx}/{total})</b>",
         "transcript_header":  "<b>📝 Транскрипт: {title}</b>\n\n",
         "help_text": (
-            "<b>🎬 VideoDownloader v6.3.0</b>\n\n"
+            "<b>🎬 VideoDownloader v6.5.0</b>\n\n"
             "<b>Основні команди:</b>\n"
             "• <code>.vdl</code> — увімк/вимк авто-завантаження\n"
             "• <code>.vdldl [URL]</code> — ручне завантаження\n"
@@ -684,6 +732,9 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("ffmpeg_path",       "", "Шлях до ffmpeg або директорії з ffmpeg (порожньо = auto)"),
             loader.ConfigValue("yt_browser_cookies", "firefox", "YouTube cookies-from-browser для yt-dlp: firefox/chrome або browser:profile"),
             loader.ConfigValue("yt_cookies_mode",   "auto", "YouTube cookies: auto/always/never. auto = спочатку без cookies, потім fallback"),
+            loader.ConfigValue("songlink_enabled",  True, "Шукати альтернативні музичні платформи через song.link"),
+            loader.ConfigValue("cobalt_api_url", "", "Cobalt API fallback для YouTube (URL власного/доступного інстансу)"),
+            loader.ConfigValue("cobalt_api_key", "", "Необов'язковий API key для Cobalt"),
         )
         self._stats = {
             "total": 0, "ok": 0, "err": 0, "retried": 0,
@@ -2164,9 +2215,168 @@ class VideoDownloaderMod(loader.Module):
         max_items = max(1, int(self.config.get("playlist_max", 10)))
         return sorted(files)[:max_items] or None
 
+    def _spotify_public_metadata_sync(self, url: str) -> tuple[str, str] | None:
+        """Read only the title/artist exposed by Spotify's public share page."""
+        try:
+            import requests
+
+            response = _safe_requests_get(
+                requests,
+                url,
+                timeout=20,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+                    ),
+                    "Accept-Language": "uk,en;q=0.8",
+                },
+            )
+            response.raise_for_status()
+            return _spotify_track_metadata(response.text)
+        except Exception as e:
+            logger.warning("Could not read public Spotify metadata: %s", e)
+            return None
+
+    def _songlink_urls_sync(self, url: str) -> list[str]:
+        """Return legal storefront/source links discovered by song.link.
+
+        song.link is a resolver, not a file host.  Prefer platforms whose
+        public pages yt-dlp can read without relying on YouTube.
+        """
+        if not self.config.get("songlink_enabled", True):
+            return []
+        try:
+            import requests
+
+            endpoint = "https://api.song.link/v1-alpha.1/links?" + urlencode({"url": url})
+            response = _safe_requests_get(requests, endpoint, timeout=20)
+            response.raise_for_status()
+            links = response.json().get("linksByPlatform") or {}
+            preferred = (
+                "soundcloud", "bandcamp", "audiomack", "audius",
+                "youtubeMusic", "youtube",
+            )
+            result = []
+            for platform in preferred:
+                candidate = (links.get(platform) or {}).get("url")
+                if candidate and _is_safe_http_url(candidate) and candidate not in result:
+                    result.append(candidate)
+            return result
+        except Exception as e:
+            logger.warning("song.link lookup failed: %s", e)
+            return []
+
+    def _run_songlink_music_sync(self, url: str, base_name: str):
+        for index, candidate in enumerate(self._songlink_urls_sync(url)):
+            logger.info("Trying song.link music source: %s", urlsplit(candidate).hostname)
+            result = self._run_ytdlp_cli_sync(
+                candidate, f"{base_name}_songlink_{index}", True
+            )
+            if result and result not in ("AUTH_REQUIRED", "TOO_LARGE"):
+                return result
+            if result == "TOO_LARGE":
+                return result
+        return None
+
+    def _run_spotify_track_search_sync(
+        self, url: str, base_name: str
+    ) -> list[str] | str | None:
+        """Resolve Spotify metadata and download the closest public audio result.
+
+        Spotify audio is never requested or decrypted.  The share page supplies
+        only a search phrase, which yt-dlp resolves through its normal supported
+        public sources (YouTube search by default).
+        """
+        metadata = self._spotify_public_metadata_sync(url)
+        if not metadata:
+            return None
+        title, artist = metadata
+        search_terms = " - ".join(part for part in (artist, title) if part)
+        if not search_terms:
+            return None
+        query = f"ytsearch1:{search_terms} audio"
+        logger.info("Spotify metadata resolved; searching public source for %r", search_terms)
+        return self._run_ytdlp_cli_sync(query, f"{base_name}_spotify_search", True)
+
     async def _dl_spotify(self, url: str, base_name: str, status_msg):
         await status_msg.edit(self.strings("loading_music"))
+        # First ask song.link for the same release on SoundCloud/Bandcamp/etc.
+        # This keeps Spotify as metadata only and avoids depending on YouTube.
+        result = await utils.run_sync(self._run_songlink_music_sync, url, base_name)
+        if result:
+            return result
+
+        path = urlsplit(url).path.lower()
+        # A single track is more reliable when Spotify is used only as a
+        # metadata catalogue and yt-dlp performs the public-source search.
+        if "/track/" in path:
+            result = await utils.run_sync(
+                self._run_spotify_track_search_sync, url, base_name
+            )
+            if result and result != "AUTH_REQUIRED":
+                return result
+
+        # spotDL remains useful for albums/playlists and as a compatibility
+        # fallback when Spotify changes its public page metadata.
         return await utils.run_sync(self._run_spotdl_sync, url, base_name)
+
+    def _run_cobalt_sync(self, url: str, base_name: str, audio: bool):
+        """Use a Cobalt-compatible API as the final YouTube transport fallback."""
+        endpoint = str(self.config.get("cobalt_api_url", "") or "").strip()
+        if not endpoint:
+            return None
+        endpoint = endpoint.rstrip("/") + "/"
+        try:
+            import requests
+
+            quality = str(self.config.get("quality", "720")).replace("best", "1080")
+            payload = {
+                "url": url,
+                "downloadMode": "audio" if audio else "auto",
+                "videoQuality": quality,
+                "audioFormat": str(self.config.get("audio_format", "mp3")),
+                "filenameStyle": "basic",
+            }
+            headers = {"Accept": "application/json", "Content-Type": "application/json"}
+            api_key = str(self.config.get("cobalt_api_key", "") or "").strip()
+            if api_key:
+                headers["Authorization"] = f"Api-Key {api_key}"
+            response = _safe_requests_post(
+                requests, endpoint, timeout=30, json_data=payload,
+                headers=headers,
+            )
+            response.raise_for_status()
+            data = response.json()
+            media_url = data.get("url")
+            if data.get("status") not in {"tunnel", "redirect"} or not media_url:
+                logger.warning("Cobalt did not return a media URL: %s", data.get("status"))
+                return None
+
+            media = _safe_requests_get(requests, media_url, timeout=180, stream=True)
+            media.raise_for_status()
+            filename = _sanitize_filename(data.get("filename") or "youtube_media")
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in AUDIO_EXTS | VIDEO_EXTS:
+                ext = ".mp3" if audio else ".mp4"
+            path = f"{base_name}_cobalt{ext}"
+            max_bytes = int(self.config.get("max_size", 0) or 0) * 1024 * 1024
+            if _response_too_large(media, max_bytes):
+                media.close()
+                return "TOO_LARGE"
+            _write_response_limited(media, path, max_bytes)
+            media.close()
+            return [path]
+        except ValueError as e:
+            if "max_size" in str(e):
+                return "TOO_LARGE"
+            logger.warning("Cobalt response rejected: %s", e)
+        except Exception as e:
+            logger.warning("Cobalt fallback failed: %s", e)
+        return None
+
+    async def _dl_cobalt(self, url: str, base_name: str, audio: bool):
+        return await utils.run_sync(self._run_cobalt_sync, url, base_name, audio)
 
     async def _download(
         self, url: str, base_name: str, status_msg, audio: bool
@@ -2207,6 +2417,7 @@ class VideoDownloaderMod(loader.Module):
 
         if "youtube.com" in u or "youtu.be" in u:
             cli_result = await self._dl_ytdlp_cli(url, base_name, audio)
+            youtube_auth_failed = cli_result == "AUTH_REQUIRED"
             if cli_result and cli_result not in ("AUTH_REQUIRED", "TOO_LARGE"):
                 return cli_result if isinstance(cli_result, list) else [cli_result]
             if cli_result == "TOO_LARGE":
@@ -2235,8 +2446,8 @@ class VideoDownloaderMod(loader.Module):
                         continue
                     return "TOO_LARGE"
                 if result == "AUTH_REQUIRED":
-                    await status_msg.edit(self.strings("err_youtube_auth"))
-                    return None
+                    youtube_auth_failed = True
+                    break
                 if result:
                     return [result]
 
@@ -2244,6 +2455,14 @@ class VideoDownloaderMod(loader.Module):
             if cli_result and cli_result != "AUTH_REQUIRED":
                 return cli_result if isinstance(cli_result, list) else [cli_result]
             if cli_result == "AUTH_REQUIRED":
+                youtube_auth_failed = True
+
+            # Independent transport: useful when every local yt-dlp client is
+            # rejected by YouTube's bot/PO-token checks.
+            cobalt_result = await self._dl_cobalt(url, base_name, audio)
+            if cobalt_result:
+                return cobalt_result
+            if youtube_auth_failed:
                 await status_msg.edit(self.strings("err_youtube_auth"))
             return None
 
