@@ -1,4 +1,4 @@
-__version__ = (6, 8, 0)
+__version__ = (6, 8, 1)
 
 import os
 import re
@@ -268,7 +268,14 @@ def _parse_music_channels(value) -> list[str | int]:
         item = str(raw or "").strip()
         if not item:
             continue
-        item = re.sub(r"^https?://t\.me/", "", item, flags=re.I).strip("/")
+        item = re.sub(r"^https?://(?:www\.)?t\.me/", "", item, flags=re.I).strip("/")
+        item = re.sub(r"^s/", "", item, flags=re.I)
+        private_link = re.fullmatch(r"c/(\d+)(?:/\d+)?", item, flags=re.I)
+        if private_link:
+            # Telegram's private-channel links omit the ``-100`` peer prefix.
+            # Treating ``t.me/c/...`` as a username used to resolve it as
+            # ``@c`` and consequently produced an empty index.
+            item = f"-100{private_link.group(1)}"
         # A copied post URL points to the channel, not to a separate source.
         item = item.split("/", 1)[0]
         if re.fullmatch(r"-100\d+", item):
@@ -732,7 +739,7 @@ class VideoDownloaderMod(loader.Module):
         "caption_playlist":   "<b>📋 {title} ({idx}/{total})</b>",
         "transcript_header":  "<b>📝 Транскрипт: {title}</b>\n\n",
         "help_text": (
-            "<b>🎬 VideoDownloader v6.8.0</b>\n\n"
+            "<b>🎬 VideoDownloader v6.8.1</b>\n\n"
             "<b>Основні команди:</b>\n"
             "• <code>.vdl</code> — увімк/вимк авто-завантаження\n"
             "• <code>.vdldl [URL]</code> — ручне завантаження\n"
@@ -2770,23 +2777,24 @@ class VideoDownloaderMod(loader.Module):
             return None
 
         mime = str(getattr(document, "mime_type", "") or "").lower()
-        title = artist = ""
+        title = artist = filename = ""
+        has_audio_attribute = False
         for attribute in getattr(document, "attributes", []) or []:
             if hasattr(attribute, "title") or hasattr(attribute, "performer"):
+                has_audio_attribute = True
                 title = str(getattr(attribute, "title", "") or "").strip()
                 artist = str(getattr(attribute, "performer", "") or "").strip()
-                if title or artist:
-                    break
-        if not mime.startswith("audio/") and not (title or artist):
+            attribute_filename = str(getattr(attribute, "file_name", "") or "").strip()
+            if attribute_filename:
+                filename = attribute_filename
+
+        extension = os.path.splitext(filename)[1].lower()
+        if not (mime.startswith("audio/") or has_audio_attribute or extension in AUDIO_EXTS):
             return None
 
         # Telegram files without ID3 tags often still have a useful filename.
-        if not title:
-            for attribute in getattr(document, "attributes", []) or []:
-                filename = str(getattr(attribute, "file_name", "") or "").strip()
-                if filename:
-                    title = os.path.splitext(filename)[0]
-                    break
+        if not title and filename:
+            title = os.path.splitext(filename)[0]
         return (title or "Без назви", artist or "Невідомий виконавець")
 
     @staticmethod
@@ -2820,9 +2828,12 @@ class VideoDownloaderMod(loader.Module):
                     ]
                 try:
                     entity = await self._client.get_entity(source)
-                    async for candidate in self._client.iter_messages(
-                        entity, filter=InputMessagesFilterMusic
-                    ):
+                    # Do not rely on InputMessagesFilterMusic here. Telegram's
+                    # UI can count an audio file while the search API omits it
+                    # (notably files with a generic MIME type or missing ID3
+                    # attributes). Walking channel history and inspecting each
+                    # document locally makes the index agree with the channel.
+                    async for candidate in self._client.iter_messages(entity):
                         metadata = self._telegram_audio_metadata(candidate)
                         if not metadata:
                             continue
