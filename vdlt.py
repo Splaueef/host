@@ -1,4 +1,4 @@
-__version__ = (6, 8, 1)
+__version__ = (6, 8, 2)
 
 import os
 import re
@@ -19,6 +19,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 from collections import defaultdict
 
 from telethon.tl.types import InputMessagesFilterMusic
+from telethon.tl.functions.messages import CheckChatInviteRequest
 
 from .. import loader, utils
 
@@ -276,10 +277,22 @@ def _parse_music_channels(value) -> list[str | int]:
             # Treating ``t.me/c/...`` as a username used to resolve it as
             # ``@c`` and consequently produced an empty index.
             item = f"-100{private_link.group(1)}"
+        # People commonly copy the visible channel ID in several forms.  An
+        # ``@`` does not turn a numeric ID into a username; canonicalize all
+        # of these to Telethon's marked channel ID.
+        numeric = re.fullmatch(r"@?(-?)(?:100)?(\d+)", item)
+        if numeric:
+            item = f"-100{numeric.group(2)}"
+        # Invite links are not usernames either. Keep the hash in a form our
+        # resolver can recognize instead of passing the invalid ``@+hash``.
+        if re.fullmatch(r"@?\+[A-Za-z0-9_-]+", item):
+            item = "+" + item.lstrip("@+")
         # A copied post URL points to the channel, not to a separate source.
         item = item.split("/", 1)[0]
         if re.fullmatch(r"-100\d+", item):
             source: str | int = int(item)
+        elif item.startswith("+"):
+            source = f"https://t.me/{item}"
         else:
             source = "@" + item.lstrip("@")
         if source not in result:
@@ -739,7 +752,7 @@ class VideoDownloaderMod(loader.Module):
         "caption_playlist":   "<b>📋 {title} ({idx}/{total})</b>",
         "transcript_header":  "<b>📝 Транскрипт: {title}</b>\n\n",
         "help_text": (
-            "<b>🎬 VideoDownloader v6.8.1</b>\n\n"
+            "<b>🎬 VideoDownloader v6.8.2</b>\n\n"
             "<b>Основні команди:</b>\n"
             "• <code>.vdl</code> — увімк/вимк авто-завантаження\n"
             "• <code>.vdldl [URL]</code> — ручне завантаження\n"
@@ -2806,6 +2819,34 @@ class VideoDownloaderMod(loader.Module):
         channel_id = str(getattr(entity, "id", "") or "")
         return f"https://t.me/c/{channel_id}/{message_id}" if channel_id else str(source)
 
+    async def _resolve_music_channel(self, source):
+        """Resolve marked/bare IDs and invite links, even without entity cache."""
+        source_text = str(source)
+        invite = re.fullmatch(
+            r"(?:https?://(?:www\.)?t\.me/)?\+([A-Za-z0-9_-]+)", source_text, re.I
+        )
+        if invite:
+            result = await self._client(CheckChatInviteRequest(invite.group(1)))
+            chat = getattr(result, "chat", None)
+            if chat is None:
+                raise ValueError("the account has not joined this invite-link channel")
+            return chat
+
+        try:
+            return await self._client.get_entity(source)
+        except (ValueError, TypeError):
+            # ``get_entity(-100...)`` needs an access hash from Telethon's
+            # session cache. Dialog iteration refreshes that cache and also
+            # lets us match private channels by their unmarked ``entity.id``.
+            if not isinstance(source, int):
+                raise
+            wanted = int(str(abs(source)).removeprefix("100"))
+            async for dialog in self._client.iter_dialogs():
+                entity = getattr(dialog, "entity", None)
+                if int(getattr(entity, "id", 0) or 0) == wanted:
+                    return entity
+            raise
+
     async def _index_music_channels(self, sources=None) -> int:
         """Index Telegram audio metadata; media bytes never leave Telegram."""
         sources = sources or _parse_music_channels(self.config.get("music_channels", []))
@@ -2827,7 +2868,7 @@ class VideoDownloaderMod(loader.Module):
                         if str(loc.get("source")) != source_key
                     ]
                 try:
-                    entity = await self._client.get_entity(source)
+                    entity = await self._resolve_music_channel(source)
                     # Do not rely on InputMessagesFilterMusic here. Telegram's
                     # UI can count an audio file while the search API omits it
                     # (notably files with a generic MIME type or missing ID3
@@ -2895,7 +2936,7 @@ class VideoDownloaderMod(loader.Module):
         """Send Telegram media as a new message, without a forward attribution."""
         for location in track.get("locations", []):
             try:
-                entity = await self._client.get_entity(location["source"])
+                entity = await self._resolve_music_channel(location["source"])
                 candidate = await self._client.get_messages(
                     entity, ids=int(location["message_id"])
                 )
@@ -2942,7 +2983,7 @@ class VideoDownloaderMod(loader.Module):
         limit = max(1, min(100, int(self.config.get("music_search_limit", 25) or 25)))
         for source in sources:
             try:
-                entity = await self._client.get_entity(source)
+                entity = await self._resolve_music_channel(source)
                 seen = set()
                 for search_query in _music_search_queries(query):
                     async for candidate in self._client.iter_messages(
