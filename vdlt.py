@@ -1,4 +1,4 @@
-__version__ = (6, 7, 0)
+__version__ = (6, 8, 0)
 
 import os
 import re
@@ -657,6 +657,11 @@ class VideoDownloaderMod(loader.Module):
         "music_channels_removed":"<b>🗑 Видалено каналів: {removed}.</b> Залишилось: <code>{total}</code>.",
         "music_channels_empty":"<b>📋 Канали для пошуку не налаштовані.</b>",
         "music_channels_usage":"<b>ℹ️ Використання:</b> <code>.vdlchannels add @channel1 @channel2</code>\n<code>.vdlchannels rm @channel</code> · <code>.vdlchannels clear</code>",
+        "music_indexing":     "<b>🎵 Індексую аудіо в каналах...</b>",
+        "music_indexed":      "<b>✅ Індексацію завершено.</b> Треків у каталозі: <code>{total}</code>.",
+        "music_index_failed": "<b>⚠️ Канали збережено, але індексацію не вдалося завершити.</b>",
+        "music_choose":       "<b>🎤 Знайдені треки виконавця {artist}:</b>\nОберіть потрібний трек:",
+        "music_choose_match": "<b>🎵 Знайдено кілька треків:</b>\nОберіть потрібний:",
         "err_file":           "<b>❌ Не вдалося отримати файл.</b>",
         "err_youtube_auth":   "<b>❌ YouTube просить підтвердити, що це не бот. Якщо відео приватне/18+, онови cookies: <code>.vdlcookies</code>. Для публічних відео модуль спершу пробує режим без cookies, щоб YouTube рідше ротував сесію.</b>",
         "err_size":           "<b>❌ Файл завеликий ({} МБ). Знижую якість...</b>",
@@ -727,7 +732,7 @@ class VideoDownloaderMod(loader.Module):
         "caption_playlist":   "<b>📋 {title} ({idx}/{total})</b>",
         "transcript_header":  "<b>📝 Транскрипт: {title}</b>\n\n",
         "help_text": (
-            "<b>🎬 VideoDownloader v6.7.0</b>\n\n"
+            "<b>🎬 VideoDownloader v6.8.0</b>\n\n"
             "<b>Основні команди:</b>\n"
             "• <code>.vdl</code> — увімк/вимк авто-завантаження\n"
             "• <code>.vdldl [URL]</code> — ручне завантаження\n"
@@ -806,6 +811,8 @@ class VideoDownloaderMod(loader.Module):
         self._worker_task = None
         self._worker_tasks: list[asyncio.Task] = []
         self._client = None
+        self._music_index_lock = asyncio.Lock()
+        self._music_index_task = None
         self._js_runtime: str | None = _preferred_js_runtime_arg()
         if self._js_runtime:
             logger.info("VideoDownloader: JS runtime detected: %s", self._js_runtime)
@@ -823,8 +830,12 @@ class VideoDownloaderMod(loader.Module):
             asyncio.ensure_future(self._ensure_runtime_dependencies())
         elif self.config.get("auto_update_ytdlp", True):
             asyncio.ensure_future(self._auto_update_ytdlp())
+        if _parse_music_channels(self.config.get("music_channels", [])):
+            self._music_index_task = asyncio.ensure_future(self._index_music_channels())
 
     async def on_unload(self):
+        if self._music_index_task:
+            self._music_index_task.cancel()
         for task in self._worker_tasks:
             task.cancel()
         for task in self._worker_tasks:
@@ -2778,8 +2789,137 @@ class VideoDownloaderMod(loader.Module):
                     break
         return (title or "Без назви", artist or "Невідомий виконавець")
 
+    @staticmethod
+    def _music_message_link(source, entity, message_id: int) -> str:
+        """Build a stable post link without resolving or downloading the file."""
+        username = str(getattr(entity, "username", "") or "").strip("@")
+        if username:
+            return f"https://t.me/{username}/{message_id}"
+        channel_id = str(getattr(entity, "id", "") or "")
+        return f"https://t.me/c/{channel_id}/{message_id}" if channel_id else str(source)
+
+    async def _index_music_channels(self, sources=None) -> int:
+        """Index Telegram audio metadata; media bytes never leave Telegram."""
+        sources = sources or _parse_music_channels(self.config.get("music_channels", []))
+        if not self._client:
+            return 0
+        async with self._music_index_lock:
+            existing = self.get("music_index", []) or []
+            by_title = {
+                item.get("key"): item for item in existing
+                if isinstance(item, dict) and item.get("key")
+            }
+            for source in sources:
+                source_key = str(source)
+                # Re-indexing a channel replaces its stale locations while
+                # preserving copies of the same title found in other channels.
+                for track in by_title.values():
+                    track["locations"] = [
+                        loc for loc in track.get("locations", [])
+                        if str(loc.get("source")) != source_key
+                    ]
+                try:
+                    entity = await self._client.get_entity(source)
+                    async for candidate in self._client.iter_messages(
+                        entity, filter=InputMessagesFilterMusic
+                    ):
+                        metadata = self._telegram_audio_metadata(candidate)
+                        if not metadata:
+                            continue
+                        title, artist = metadata
+                        key = _normalize_music_text(title)
+                        if not key:
+                            continue
+                        track = by_title.setdefault(key, {
+                            "key": key, "title": title, "artist": artist,
+                            "locations": [],
+                        })
+                        if track.get("artist") == "Невідомий виконавець" and artist:
+                            track["artist"] = artist
+                        location = {
+                            "source": source_key,
+                            "message_id": int(candidate.id),
+                            "link": self._music_message_link(source, entity, candidate.id),
+                        }
+                        if not any(
+                            loc.get("message_id") == location["message_id"]
+                            and str(loc.get("source")) == source_key
+                            for loc in track["locations"]
+                        ):
+                            track["locations"].append(location)
+                except Exception as e:
+                    logger.warning("Music indexing failed in %s: %s", source, e)
+            index = [track for track in by_title.values() if track.get("locations")]
+            index.sort(key=lambda item: _normalize_music_text(item.get("title", "")))
+            self.set("music_index", index)
+            return len(index)
+
+    def _search_music_index(self, query: str) -> list[dict]:
+        normalized = _normalize_music_text(query)
+        message_id = int(query) if str(query).strip().isdigit() else None
+        ranked = []
+        for track in self.get("music_index", []) or []:
+            title = _normalize_music_text(track.get("title", ""))
+            artist = _normalize_music_text(track.get("artist", ""))
+            id_match = message_id is not None and any(
+                loc.get("message_id") == message_id for loc in track.get("locations", [])
+            )
+            if id_match:
+                score = 100
+            elif normalized and normalized == artist:
+                score = 80
+            elif normalized and normalized == title:
+                score = 70
+            elif normalized and (normalized in title or normalized in artist):
+                score = 50
+            else:
+                words = normalized.split()
+                score = sum(word in f"{title} {artist}" for word in words) * 10
+                if not score:
+                    continue
+            ranked.append((score, track))
+        return [track for _, track in sorted(ranked, key=lambda item: -item[0])]
+
+    async def _send_indexed_music(self, target, track: dict):
+        """Send Telegram media as a new message, without a forward attribution."""
+        for location in track.get("locations", []):
+            try:
+                entity = await self._client.get_entity(location["source"])
+                candidate = await self._client.get_messages(
+                    entity, ids=int(location["message_id"])
+                )
+                if candidate and candidate.media:
+                    await self._client.send_file(target, candidate.media)
+                    self._stats["total"] += 1
+                    self._stats["ok"] += 1
+                    self._stats["audio"] += 1
+                    self._stats["today"] += 1
+                    self._stats["platforms"]["Telegram"] += 1
+                    return True
+            except Exception as e:
+                logger.warning("Indexed music location is unavailable: %s", e)
+        return False
+
+    async def _music_button_callback(self, call, track_key: str):
+        track = next((item for item in self.get("music_index", []) or []
+                      if item.get("key") == track_key), None)
+        if not track:
+            return await call.answer("Трек більше недоступний", show_alert=True)
+        target = call.form.get("chat")
+        if not await self._send_indexed_music(target, track):
+            return await call.answer("Файл більше недоступний", show_alert=True)
+        await call.answer("Надіслано")
+
+    def _music_buttons(self, tracks: list[dict]) -> list:
+        buttons = [{
+            "text": f"{item.get('artist', '—')} — {item.get('title', '—')}"[:64],
+            "callback": self._music_button_callback,
+            "args": (item["key"],),
+        } for item in tracks]
+        return utils.chunks(buttons, 2)
+
     async def _find_music_in_channels(self, query: str):
-        """Find and locally rank audio returned by several Telegram searches."""
+        """Compatibility fallback for catalogues created by older versions."""
         sources = _parse_music_channels(self.config.get("music_channels", []))
         if not sources or not self._client:
             return None
@@ -3216,6 +3356,23 @@ class VideoDownloaderMod(loader.Module):
                 return await utils.answer(message, self.strings("music_no_query"))
             if not _parse_music_channels(self.config.get("music_channels", [])):
                 return await utils.answer(message, self.strings("music_no_channels"))
+            matches = self._search_music_index(args)
+            if matches:
+                normalized = _normalize_music_text(args)
+                artist_matches = [item for item in matches if
+                                  _normalize_music_text(item.get("artist", "")) == normalized]
+                choices = artist_matches or matches
+                if len(choices) > 1:
+                    heading = self.strings("music_choose").format(
+                        artist=utils.escape_html(choices[0].get("artist", args))
+                    ) if artist_matches else self.strings("music_choose_match")
+                    await self.inline.form(
+                        heading, message, reply_markup=self._music_buttons(choices)
+                    )
+                    return
+                if await self._send_indexed_music(message.chat_id, choices[0]):
+                    await message.delete()
+                    return
             status = await utils.answer(message, self.strings("searching_music"))
             try:
                 if not await self._send_channel_music(message, status, args):
@@ -3249,6 +3406,7 @@ class VideoDownloaderMod(loader.Module):
             return await utils.answer(message, self.strings("music_channels_list").format(items))
         if action == "clear":
             self.config["music_channels"] = []
+            self.set("music_index", [])
             return await utils.answer(
                 message, self.strings("music_channels_removed").format(
                     removed=len(current), total=0
@@ -3272,7 +3430,23 @@ class VideoDownloaderMod(loader.Module):
             text = self.strings("music_channels_removed").format(
                 removed=changed, total=len(updated)
             )
-        await utils.answer(message, text)
+            removed = {str(item) for item in requested}
+            index = []
+            for track in self.get("music_index", []) or []:
+                track["locations"] = [loc for loc in track.get("locations", [])
+                                      if str(loc.get("source")) not in removed]
+                if track["locations"]:
+                    index.append(track)
+            self.set("music_index", index)
+        status = await utils.answer(message, text)
+        if action == "add" and requested:
+            await status.edit(self.strings("music_indexing"))
+            try:
+                total = await self._index_music_channels(requested)
+                await status.edit(self.strings("music_indexed").format(total=total))
+            except Exception:
+                logger.exception("Could not update music index")
+                await status.edit(self.strings("music_index_failed"))
 
     @loader.command()
     async def vdlaudio(self, message):
