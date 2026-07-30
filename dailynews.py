@@ -1,6 +1,6 @@
 # meta developer: @Codex
-# meta version: 2.0.0
-# meta description: Щоденний AI-дайджест у форматі Telegram Rich Text через Mistral Agent.
+# meta version: 2.1.1
+# meta description: Два AI-дайджести на день без повторів у форматі Telegram Rich Text.
 
 import asyncio
 import datetime
@@ -46,18 +46,21 @@ def _content_to_text(value):
 
 @loader.tds
 class DailyNewsMod(loader.Module):
-    """Збирає дописи каналів і раз на день публікує дайджест"""
+    """Збирає дописи каналів і двічі на день публікує дайджест без повторів"""
 
     strings = {
         "name": "DailyNews",
         "cfg_sources": "Юзернейми/посилання каналів через кому (наприклад @channel1,@channel2)",
         "cfg_target": "Юзернейм або ID каналу, куди публікувати дайджест",
-        "cfg_time": "Щоденний час публікації у форматі HH:MM",
+        "cfg_time": "Час першої щоденної публікації у форматі HH:MM",
+        "cfg_time_2": "Час другої щоденної публікації у форматі HH:MM",
         "cfg_timezone": "IANA-таймзона розкладу, наприклад Europe/Kyiv",
         "cfg_api_key": "Mistral API key",
         "cfg_agent_id": "ID налаштованого Mistral Agent",
         "cfg_bot_token": "Токен Telegram-бота, який є адміністратором каналу призначення",
-        "cfg_hours": "За скільки останніх годин читати новини",
+        "cfg_hours": (
+            "За скільки останніх годин читати новини; 24 означає від 00:00 сьогодні"
+        ),
         "cfg_limit": "Максимум дописів з одного каналу",
         "cfg_prompt": "Додаткова інструкція для редактора дайджесту",
         "cfg_timeout": "Таймаут Mistral API у секундах",
@@ -78,7 +81,7 @@ class DailyNewsMod(loader.Module):
         "status": (
             "📰 <b>DailyNews</b>\n\n"
             "Джерела: <b>{sources}</b>\n"
-            "Час: <code>{time}</code> (<code>{timezone}</code>)\n"
+            "Час: <code>{times}</code> (<code>{timezone}</code>)\n"
             "Канал: <code>{target}</code>\n"
             "Останній запуск: <code>{last_run}</code>\n"
             "Зараз виконується: <b>{running}</b>"
@@ -90,6 +93,7 @@ class DailyNewsMod(loader.Module):
             loader.ConfigValue("sources", "", lambda: self.strings("cfg_sources")),
             loader.ConfigValue("target", "", lambda: self.strings("cfg_target")),
             loader.ConfigValue("publish_time", "20:00", lambda: self.strings("cfg_time")),
+            loader.ConfigValue("publish_time_2", "08:00", lambda: self.strings("cfg_time_2")),
             loader.ConfigValue("timezone", "Europe/Kyiv", lambda: self.strings("cfg_timezone")),
             loader.ConfigValue(
                 "api_key", "", lambda: self.strings("cfg_api_key"),
@@ -153,8 +157,36 @@ class DailyNewsMod(loader.Module):
     def _timezone(self):
         return ZoneInfo(str(self.config["timezone"]).strip())
 
-    def _publish_time(self):
-        return datetime.datetime.strptime(str(self.config["publish_time"]).strip(), "%H:%M").time()
+    def _publish_times(self):
+        """Return the two unique publication slots in chronological order."""
+        times = {
+            datetime.datetime.strptime(str(self.config[key]).strip(), "%H:%M").time()
+            for key in ("publish_time", "publish_time_2")
+        }
+        if len(times) != 2:
+            raise ValueError("часи публікації мають відрізнятися")
+        return sorted(times)
+
+    def _slot_window(self, now, slot):
+        """Return calendar-day boundaries for a scheduled edition.
+
+        The first edition starts at local midnight. Every subsequent edition
+        starts at the preceding configured slot, so a 12:00/23:00 schedule reads
+        00:00—12:00 and 12:00—23:00 instead of rolling 24-hour windows.
+        """
+        slots = self._publish_times()
+        slot_index = slots.index(slot)
+        if slot_index == 0:
+            since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            previous = slots[slot_index - 1]
+            since = now.replace(
+                hour=previous.hour,
+                minute=previous.minute,
+                second=0,
+                microsecond=0,
+            )
+        return since.astimezone(datetime.timezone.utc), now.astimezone(datetime.timezone.utc)
 
     def _missing_config(self):
         missing = []
@@ -166,9 +198,9 @@ class DailyNewsMod(loader.Module):
         except ZoneInfoNotFoundError:
             missing.append("timezone")
         try:
-            self._publish_time()
+            self._publish_times()
         except ValueError:
-            missing.append("publish_time (HH:MM)")
+            missing.append("publish_time/publish_time_2 (різні HH:MM)")
         return missing
 
     @loader.loop(interval=30, autostart=True)
@@ -176,10 +208,26 @@ class DailyNewsMod(loader.Module):
         if not self._client or self._running or self._missing_config():
             return
         now = datetime.datetime.now(self._timezone())
-        if now.time() < self._publish_time() or self.get("last_run") == now.date().isoformat():
+        run_date = now.date().isoformat()
+        completed = set(self.get("completed_slots", {}).get(run_date, []))
+        due = [slot for slot in self._publish_times() if slot <= now.time()]
+        if not due:
+            return
+        # On a late start, publish only the most recent edition rather than firing
+        # both missed editions back-to-back. During normal operation the morning
+        # slot is already completed when the evening slot becomes due.
+        slot = due[-1]
+        slot_name = slot.strftime("%H:%M")
+        if slot_name in completed:
             return
         try:
-            await self._run_digest(now.date().isoformat())
+            since, until = self._slot_window(now, slot)
+            await self._run_digest(
+                run_date,
+                since=since,
+                until=until,
+                slot_name=slot_name,
+            )
         except (aiohttp.ClientError, asyncio.TimeoutError, RPCError, RuntimeError, ValueError):
             # loader.loop must survive temporary Telegram/Mistral failures. A failed
             # edition is intentionally not marked as sent, so the next tick retries.
@@ -195,7 +243,12 @@ class DailyNewsMod(loader.Module):
 
     async def _collect_news(self, since=None, until=None):
         until = until or datetime.datetime.now(datetime.timezone.utc)
-        since = since or until - datetime.timedelta(hours=int(self.config["lookback_hours"]))
+        if since is None and int(self.config["lookback_hours"]) == 24:
+            local_until = until.astimezone(self._timezone())
+            since = local_until.replace(hour=0, minute=0, second=0, microsecond=0)
+            since = since.astimezone(datetime.timezone.utc)
+        else:
+            since = since or until - datetime.timedelta(hours=int(self.config["lookback_hours"]))
         items = []
         for source in self._sources():
             try:
@@ -227,6 +280,30 @@ class DailyNewsMod(loader.Module):
                 logger.warning("DailyNews: cannot read %s: %s", source, error)
         items.sort(key=lambda item: item["published_at"])
         return items
+
+    @staticmethod
+    def _news_key(item):
+        """Build a stable Telegram post identity for cross-edition deduplication."""
+        source = item.get("source_channel_id") or item.get("source_ref")
+        return f"{source}:{item.get('message_id')}"
+
+    def _seen_news(self, run_date):
+        return set(self.get("published_news", {}).get(run_date, []))
+
+    def _remember_edition(self, run_date, slot_name, items):
+        """Persist a successful slot and all posts supplied to its digest."""
+        published = dict(self.get("published_news", {}))
+        published[run_date] = sorted(
+            self._seen_news(run_date) | {self._news_key(item) for item in items}
+        )
+        completed = dict(self.get("completed_slots", {}))
+        completed[run_date] = sorted(set(completed.get(run_date, [])) | {slot_name})
+
+        # Only today's identities are relevant: the same post may legitimately be
+        # considered again on another calendar day if it remains in the 24h window.
+        self.set("published_news", {run_date: published[run_date]})
+        self.set("completed_slots", {run_date: completed[run_date]})
+        self.set("last_run", f"{run_date} {slot_name}")
 
     def _build_prompt(self, items):
         edition_date = datetime.datetime.now(self._timezone()).strftime("%d.%m.%Y")
@@ -339,7 +416,9 @@ class DailyNewsMod(loader.Module):
                 description = str(data.get("description") if isinstance(data, dict) else body)[:500]
                 raise RuntimeError(f"Telegram Rich Text: {description}")
 
-    async def _run_digest(self, run_date=None, since=None, until=None, mark_run=True):
+    async def _run_digest(
+        self, run_date=None, since=None, until=None, mark_run=True, slot_name=None
+    ):
         if self._running:
             raise RuntimeError("дайджест уже створюється")
         missing = self._missing_config()
@@ -348,17 +427,25 @@ class DailyNewsMod(loader.Module):
         self._running = True
         try:
             items = await self._collect_news(since=since, until=until)
+            if run_date and slot_name:
+                seen = self._seen_news(run_date)
+                items = [item for item in items if self._news_key(item) not in seen]
             if not items:
-                if run_date and mark_run:
+                if run_date and mark_run and slot_name:
+                    self._remember_edition(run_date, slot_name, [])
+                elif run_date and mark_run:
                     self.set("last_run", run_date)
                 return 0
             digest = await self._ask_agent(self._build_prompt(items))
             await self._send_digest(digest)
             if mark_run:
-                self.set(
-                    "last_run",
-                    run_date or datetime.datetime.now(self._timezone()).date().isoformat(),
-                )
+                if run_date and slot_name:
+                    self._remember_edition(run_date, slot_name, items)
+                else:
+                    self.set(
+                        "last_run",
+                        run_date or datetime.datetime.now(self._timezone()).date().isoformat(),
+                    )
             return len(items)
         finally:
             self._running = False
@@ -388,7 +475,9 @@ class DailyNewsMod(loader.Module):
             message,
             self.strings("status", message).format(
                 sources=len(self._sources()),
-                time=html.escape(str(self.config["publish_time"])),
+                times=html.escape(
+                    ", ".join(slot.strftime("%H:%M") for slot in self._publish_times())
+                ),
                 timezone=html.escape(str(self.config["timezone"])),
                 target=html.escape(str(self.config["target"]) or "—"),
                 last_run=html.escape(str(self.get("last_run", "—"))),
@@ -523,6 +612,8 @@ class DailyNewsMod(loader.Module):
         )
 
     async def newsresetcmd(self, message):
-        """Скинути дату останнього автозапуску"""
+        """Скинути стан автозапусків і повторів за поточний день"""
         self.set("last_run", None)
-        await utils.answer(message, "✅ <b>Дату останнього запуску скинуто.</b>")
+        self.set("completed_slots", {})
+        self.set("published_news", {})
+        await utils.answer(message, "✅ <b>Стан запусків і повторів скинуто.</b>")
