@@ -1,4 +1,4 @@
-__version__ = (6, 6, 0)
+__version__ = (6, 7, 0)
 
 import os
 import re
@@ -17,6 +17,8 @@ import json
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 from collections import defaultdict
+
+from telethon.tl.types import InputMessagesFilterMusic
 
 from .. import loader, utils
 
@@ -276,6 +278,25 @@ def _parse_music_channels(value) -> list[str | int]:
         if source not in result:
             result.append(source)
     return result
+
+
+def _normalize_music_text(value: str) -> str:
+    """Normalize titles, performers and captions for reliable comparisons."""
+    value = unicodedata.normalize("NFKD", str(value or "").casefold())
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    return " ".join(re.findall(r"\w+", value, flags=re.UNICODE))
+
+
+def _music_search_queries(query: str) -> list[str]:
+    """Build Telegram search fallbacks for titles separated by punctuation."""
+    normalized = _normalize_music_text(query)
+    words = normalized.split()
+    queries = [query.strip(), normalized]
+    # Telegram's full-text search may not match ID3 metadata or a caption when
+    # the user enters both performer and title. Searching meaningful words one
+    # by one gives us candidates that are then ranked locally.
+    queries.extend(word for word in words if len(word) > 1)
+    return list(dict.fromkeys(item for item in queries if item))
 
 
 def _ig_shortcode(url: str) -> str | None:
@@ -631,6 +652,11 @@ class VideoDownloaderMod(loader.Module):
         "music_no_channels":  "<b>❌ Додай канали для пошуку в <code>music_channels</code> (юзернейм або <code>-100ID</code>).</b>",
         "music_not_found":    "<b>❌ У налаштованих каналах нічого не знайдено.</b>",
         "music_found":        "<b>🎵 {title}</b>\n<b>Виконавець:</b> {artist}",
+        "music_channels_list":"<b>🎵 Канали для пошуку:</b>\n{}",
+        "music_channels_added":"<b>✅ Додано каналів: {added}.</b> Всього: <code>{total}</code>.",
+        "music_channels_removed":"<b>🗑 Видалено каналів: {removed}.</b> Залишилось: <code>{total}</code>.",
+        "music_channels_empty":"<b>📋 Канали для пошуку не налаштовані.</b>",
+        "music_channels_usage":"<b>ℹ️ Використання:</b> <code>.vdlchannels add @channel1 @channel2</code>\n<code>.vdlchannels rm @channel</code> · <code>.vdlchannels clear</code>",
         "err_file":           "<b>❌ Не вдалося отримати файл.</b>",
         "err_youtube_auth":   "<b>❌ YouTube просить підтвердити, що це не бот. Якщо відео приватне/18+, онови cookies: <code>.vdlcookies</code>. Для публічних відео модуль спершу пробує режим без cookies, щоб YouTube рідше ротував сесію.</b>",
         "err_size":           "<b>❌ Файл завеликий ({} МБ). Знижую якість...</b>",
@@ -701,11 +727,12 @@ class VideoDownloaderMod(loader.Module):
         "caption_playlist":   "<b>📋 {title} ({idx}/{total})</b>",
         "transcript_header":  "<b>📝 Транскрипт: {title}</b>\n\n",
         "help_text": (
-            "<b>🎬 VideoDownloader v6.6.0</b>\n\n"
+            "<b>🎬 VideoDownloader v6.7.0</b>\n\n"
             "<b>Основні команди:</b>\n"
             "• <code>.vdl</code> — увімк/вимк авто-завантаження\n"
             "• <code>.vdldl [URL]</code> — ручне завантаження\n"
             "• <code>.vdlmusic [назва / автор / URL]</code> — знайти музику в каналах або сервісах\n"
+            "• <code>.vdlchannels add @one @two ...</code> — додати одразу кілька каналів\n"
             "• <code>.vdlaudio</code> — перемкнути MP3/відео\n"
             "• <code>.vdlq [360/480/720/1080/best]</code> — якість\n"
             "• <code>.vdlcookies</code> — статус cookies\n"
@@ -2752,32 +2779,47 @@ class VideoDownloaderMod(loader.Module):
         return (title or "Без назви", artist or "Невідомий виконавець")
 
     async def _find_music_in_channels(self, query: str):
-        """Find the best tagged audio message in the configured channels."""
+        """Find and locally rank audio returned by several Telegram searches."""
         sources = _parse_music_channels(self.config.get("music_channels", []))
         if not sources or not self._client:
             return None
 
-        query_words = set(re.findall(r"\w+", query.casefold(), flags=re.UNICODE))
+        normalized_query = _normalize_music_text(query)
+        query_words = set(normalized_query.split())
         best = None
-        best_score = -1
+        best_score = 0
         limit = max(1, min(100, int(self.config.get("music_search_limit", 25) or 25)))
         for source in sources:
             try:
                 entity = await self._client.get_entity(source)
-                async for candidate in self._client.iter_messages(
-                    entity, search=query, limit=limit
-                ):
-                    metadata = self._telegram_audio_metadata(candidate)
-                    if not metadata:
-                        continue
-                    title, artist = metadata
-                    searchable = f"{title} {artist} {getattr(candidate, 'raw_text', '')}".casefold()
-                    score = sum(1 for word in query_words if word in searchable)
-                    if score > best_score:
-                        best = (candidate, title, artist)
-                        best_score = score
-                    if query_words and score == len(query_words):
-                        return best
+                seen = set()
+                for search_query in _music_search_queries(query):
+                    async for candidate in self._client.iter_messages(
+                        entity, search=search_query, filter=InputMessagesFilterMusic,
+                        limit=limit,
+                    ):
+                        candidate_id = getattr(candidate, "id", None)
+                        if candidate_id in seen:
+                            continue
+                        seen.add(candidate_id)
+                        metadata = self._telegram_audio_metadata(candidate)
+                        if not metadata:
+                            continue
+                        title, artist = metadata
+                        searchable = _normalize_music_text(
+                            f"{title} {artist} {getattr(candidate, 'raw_text', '')}"
+                        )
+                        matched = sum(word in searchable for word in query_words)
+                        if not matched:
+                            continue
+                        score = matched * 10
+                        if normalized_query and normalized_query in searchable:
+                            score += 5
+                        if score > best_score:
+                            best = (candidate, title, artist)
+                            best_score = score
+                        if query_words and matched == len(query_words):
+                            return best
             except Exception as e:
                 logger.warning("Music search failed in %s: %s", source, e)
         return best
@@ -3191,6 +3233,46 @@ class VideoDownloaderMod(loader.Module):
             )
         status = await utils.answer(message, self.strings("loading_music"))
         await self._queue.put(self._process(url, message, status, audio_override=True))
+
+    @loader.command()
+    async def vdlchannels(self, message):
+        """Керувати каналами: .vdlchannels add/rm/clear [@channel ...]"""
+        raw = utils.get_args_raw(message).strip()
+        action, _, value = raw.partition(" ")
+        action = action.casefold()
+        current = _parse_music_channels(self.config.get("music_channels", []))
+
+        if not raw or action in {"list", "ls"}:
+            if not current:
+                return await utils.answer(message, self.strings("music_channels_empty"))
+            items = "\n".join(f"• <code>{utils.escape_html(str(item))}</code>" for item in current)
+            return await utils.answer(message, self.strings("music_channels_list").format(items))
+        if action == "clear":
+            self.config["music_channels"] = []
+            return await utils.answer(
+                message, self.strings("music_channels_removed").format(
+                    removed=len(current), total=0
+                )
+            )
+        if action not in {"add", "rm", "remove", "del"} or not value.strip():
+            return await utils.answer(message, self.strings("music_channels_usage"))
+
+        requested = _parse_music_channels(value)
+        if action == "add":
+            updated = current + [item for item in requested if item not in current]
+            changed = len(updated) - len(current)
+            self.config["music_channels"] = updated
+            text = self.strings("music_channels_added").format(
+                added=changed, total=len(updated)
+            )
+        else:
+            updated = [item for item in current if item not in requested]
+            changed = len(current) - len(updated)
+            self.config["music_channels"] = updated
+            text = self.strings("music_channels_removed").format(
+                removed=changed, total=len(updated)
+            )
+        await utils.answer(message, text)
 
     @loader.command()
     async def vdlaudio(self, message):
