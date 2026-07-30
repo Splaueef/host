@@ -1,4 +1,4 @@
-__version__ = (6, 2, 1)
+__version__ = (6, 3, 0)
 
 import os
 import re
@@ -32,6 +32,7 @@ PIP_DEPENDENCIES = {
     "gallery-dl": "gallery_dl",
     "instaloader": "instaloader",
     "requests": "requests",
+    "spotdl": "spotdl",
 }
 
 SUPPORTED_HOSTS = [
@@ -44,7 +45,30 @@ SUPPORTED_HOSTS = [
     "twitch.tv/", "dailymotion.com/",
     "bilibili.com/", "b23.tv/", "facebook.com/", "fb.watch/",
     "soundcloud.com/", "snapchat.com/", "likee.video/", "kwai.com/",
+    "open.spotify.com/", "spotify.link/",
+    "bandcamp.com/", "audiomack.com/", "mixcloud.com/",
 ]
+
+MUSIC_HOSTS = (
+    "open.spotify.com", "spotify.link", "soundcloud.com", "music.youtube.com",
+    "bandcamp.com", "audiomack.com", "mixcloud.com",
+)
+
+
+def _is_music_url(url: str) -> bool:
+    try:
+        hostname = (urlsplit(url).hostname or "").lower().lstrip("www.")
+    except Exception:
+        return False
+    return any(_hostname_matches(hostname, host) for host in MUSIC_HOSTS)
+
+
+def _is_spotify_url(url: str) -> bool:
+    try:
+        hostname = (urlsplit(url).hostname or "").lower().lstrip("www.")
+    except Exception:
+        return False
+    return any(_hostname_matches(hostname, host) for host in ("open.spotify.com", "spotify.link"))
 
 def _hostname_matches(hostname: str, domain: str) -> bool:
     domain = domain.lower().strip().strip("/")
@@ -323,7 +347,7 @@ def _cleanup(base_name: str):
         try:
             if os.path.isfile(p):
                 os.remove(p)
-            elif os.path.isdir(p) and p.endswith(("_gallery", "_ig")):
+            elif os.path.isdir(p) and p.endswith(("_gallery", "_ig", "_spotify")):
                 shutil.rmtree(p, ignore_errors=True)
         except Exception:
             pass
@@ -331,14 +355,20 @@ def _cleanup(base_name: str):
 
 def _file_type(path: str) -> str:
     ext = os.path.splitext(path)[1].lower()
-    if ext in VIDEO_EXTS: return "video"
-    if ext in AUDIO_EXTS: return "audio"
-    if ext in IMAGE_EXTS: return "image"
+    if ext in VIDEO_EXTS:
+        return "video"
+    if ext in AUDIO_EXTS:
+        return "audio"
+    if ext in IMAGE_EXTS:
+        return "image"
     mime, _ = mimetypes.guess_type(path)
     if mime:
-        if mime.startswith("video"): return "video"
-        if mime.startswith("audio"): return "audio"
-        if mime.startswith("image"): return "image"
+        if mime.startswith("video"):
+            return "video"
+        if mime.startswith("audio"):
+            return "audio"
+        if mime.startswith("image"):
+            return "image"
     return "other"
 
 
@@ -512,7 +542,7 @@ def _js_runtime_opts(runtime: str | None) -> dict:
 
 @loader.tds
 class VideoDownloaderMod(loader.Module):
-    """Автоматичне завантаження медіа з YouTube, TikTok, Instagram та ін. Фото відправляє альбомом."""
+    """Завантаження відео й музики зі Spotify, YouTube, TikTok та інших платформ."""
 
     strings = {
         "name": "VideoDownloader",
@@ -523,6 +553,7 @@ class VideoDownloaderMod(loader.Module):
         "loading_photo":      "<b>🖼 Завантажую медіа...</b>",
         "loading_fix":        "<b>🔧 Виправляю орієнтацію відео...</b>",
         "loading_transcript": "<b>📝 Витягую транскрипт...</b>",
+        "loading_music":      "<b>🎵 Шукаю та завантажую музику...</b>",
         "err_file":           "<b>❌ Не вдалося отримати файл.</b>",
         "err_youtube_auth":   "<b>❌ YouTube просить підтвердити, що це не бот. Якщо відео приватне/18+, онови cookies: <code>.vdlcookies</code>. Для публічних відео модуль спершу пробує режим без cookies, щоб YouTube рідше ротував сесію.</b>",
         "err_size":           "<b>❌ Файл завеликий ({} МБ). Знижую якість...</b>",
@@ -593,10 +624,11 @@ class VideoDownloaderMod(loader.Module):
         "caption_playlist":   "<b>📋 {title} ({idx}/{total})</b>",
         "transcript_header":  "<b>📝 Транскрипт: {title}</b>\n\n",
         "help_text": (
-            "<b>🎬 VideoDownloader v6.0.0</b>\n\n"
+            "<b>🎬 VideoDownloader v6.3.0</b>\n\n"
             "<b>Основні команди:</b>\n"
             "• <code>.vdl</code> — увімк/вимк авто-завантаження\n"
             "• <code>.vdldl [URL]</code> — ручне завантаження\n"
+            "• <code>.vdlmusic [URL]</code> — музика зі Spotify та інших сервісів\n"
             "• <code>.vdlaudio</code> — перемкнути MP3/відео\n"
             "• <code>.vdlq [360/480/720/1080/best]</code> — якість\n"
             "• <code>.vdlcookies</code> — статус cookies\n"
@@ -616,7 +648,7 @@ class VideoDownloaderMod(loader.Module):
         ),
     }
 
-    requires = ["yt-dlp", "requests", "instaloader", "gallery-dl"]
+    requires = ["yt-dlp", "requests", "instaloader", "gallery-dl", "spotdl"]
 
     def __init__(self):
         self.config = loader.ModuleConfig(
@@ -777,6 +809,9 @@ class VideoDownloaderMod(loader.Module):
     def _platform(self, url: str) -> str:
         u = url.lower()
         for host, name in [
+            ("spotify.com", "Spotify"), ("spotify.link", "Spotify"),
+            ("soundcloud.com", "SoundCloud"), ("bandcamp.com", "Bandcamp"),
+            ("audiomack.com", "Audiomack"), ("mixcloud.com", "Mixcloud"),
             ("tiktok.com", "TikTok"), ("youtu", "YouTube"),
             ("instagram.com", "Instagram"), ("instagr.am", "Instagram"),
             ("x.com", "X/Twitter"), ("twitter.com", "X/Twitter"),
@@ -1019,7 +1054,8 @@ class VideoDownloaderMod(loader.Module):
             return path
 
         def _check_and_fix():
-            import subprocess, json
+            import json
+            import subprocess
             try:
                 r = subprocess.run(
                     ["ffprobe", "-v", "quiet", "-print_format", "json",
@@ -1031,7 +1067,6 @@ class VideoDownloaderMod(loader.Module):
                 streams = json.loads(r.stdout).get("streams", [])
                 if not streams:
                     return path, None
-                s = streams[0]
                 return path, _rotation_filter_from_stream(streams[0])
             except Exception as e:
                 logger.warning("_check_and_fix error: %s", e)
@@ -1218,8 +1253,6 @@ class VideoDownloaderMod(loader.Module):
                 ]
             )
             postprocessors = self._audio_postprocessor() if audio else []
-            audio_fmt = self.config["audio_format"]
-
             for fmt in fmt_chain:
                 opts = {
                     "format": fmt,
@@ -1397,7 +1430,8 @@ class VideoDownloaderMod(loader.Module):
     # ── Twitter/X ─────────────────────────────────────────────────────────────
 
     async def _dl_twitter_photos(self, url: str, base_name: str) -> list | None:
-        import yt_dlp, requests
+        import requests
+        import yt_dlp
 
         cookies = _get_cookies(url)
 
@@ -2085,10 +2119,62 @@ class VideoDownloaderMod(loader.Module):
 
     # ── download dispatcher ───────────────────────────────────────────────────
 
+    def _run_spotdl_sync(self, url: str, base_name: str) -> list[str] | str | None:
+        """Download Spotify metadata matches as audio via spotDL.
+
+        Spotify streams are DRM protected, so spotDL resolves the track metadata
+        and obtains a matching audio source instead of attempting to bypass DRM.
+        """
+        out_dir = f"{base_name}_spotify"
+        os.makedirs(out_dir, exist_ok=True)
+        audio_format = str(self.config.get("audio_format", "mp3")).lower()
+        if audio_format not in {"mp3", "m4a", "wav", "opus", "flac", "ogg"}:
+            audio_format = "mp3"
+        output = os.path.join(out_dir, "{artists} - {title}.{output-ext}")
+        cmd = [
+            sys.executable, "-m", "spotdl", "download", url,
+            "--format", audio_format, "--output", output,
+            "--threads", "2",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                timeout=int(self.config.get("task_timeout", _TASK_TIMEOUT)),
+                env=_subprocess_env_for_cookie_owner(),
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("spotDL timed out for %s", url)
+            return None
+        except Exception as e:
+            logger.warning("spotDL failed to start: %s", e)
+            return None
+        if proc.returncode != 0:
+            logger.warning("spotDL failed: %s", (proc.stdout or "")[-700:])
+            return None
+
+        files = []
+        max_bytes = int(self.config.get("max_size", 0) or 0) * 1024 * 1024
+        for root, _, names in os.walk(out_dir):
+            for name in names:
+                path = os.path.join(root, name)
+                if (_file_type(path) == "audio" and os.path.getsize(path) > 0):
+                    if max_bytes and os.path.getsize(path) > max_bytes:
+                        continue
+                    files.append(path)
+        max_items = max(1, int(self.config.get("playlist_max", 10)))
+        return sorted(files)[:max_items] or None
+
+    async def _dl_spotify(self, url: str, base_name: str, status_msg):
+        await status_msg.edit(self.strings("loading_music"))
+        return await utils.run_sync(self._run_spotdl_sync, url, base_name)
+
     async def _download(
         self, url: str, base_name: str, status_msg, audio: bool
     ) -> list | str | None:
         u = url.lower()
+
+        if _is_spotify_url(url):
+            return await self._dl_spotify(url, base_name, status_msg)
 
         if "tiktok.com" in u:
             return await self._dl_tiktok(url, base_name, audio)
@@ -2499,8 +2585,10 @@ class VideoDownloaderMod(loader.Module):
 
     # ── main process ──────────────────────────────────────────────────────────
 
-    async def _process(self, url: str, message, status_msg):
-        audio    = self.config["audio_mode"]
+    async def _process(self, url: str, message, status_msg, audio_override: bool = False):
+        # Music links always produce an audio file; users need not toggle the
+        # module-wide video/audio mode before sharing a Spotify/SoundCloud URL.
+        audio    = bool(audio_override or _is_music_url(url) or self.config["audio_mode"])
         platform = self._platform(url)
         self._stats["total"] += 1
         self._last_dl = time.time()
@@ -2515,6 +2603,18 @@ class VideoDownloaderMod(loader.Module):
                     pass
                 return
             await self._dl_playlist(url, status_msg, message, audio)
+            return
+
+        spotify_collection = _is_spotify_url(url) and re.search(
+            r"/(?:playlist|album|artist|show)/", urlsplit(url).path, re.I
+        )
+        if spotify_collection and not self.config["playlist_enabled"]:
+            await status_msg.edit(self.strings("err_playlist_off"))
+            await asyncio.sleep(5)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
             return
 
         base = f"media_{os.urandom(3).hex()}"
@@ -2725,6 +2825,27 @@ class VideoDownloaderMod(loader.Module):
             self.strings("dl_started").format(url=url)
         )
         await self._queue.put(self._process(url, message, status))
+
+    @loader.command()
+    async def vdlmusic(self, message):
+        """Завантажити музику: .vdlmusic [Spotify/YouTube Music/SoundCloud URL]"""
+        args = utils.get_args_raw(message).strip()
+        url = self._extract_url(args) if args else None
+        if not url:
+            reply = await message.get_reply_message()
+            if reply and reply.raw_text:
+                url = self._extract_url(reply.raw_text)
+        if not url:
+            return await utils.answer(message, self.strings("dl_no_url"))
+        url = self._normalize(url)
+        if self._queue is None:
+            return
+        if self._queue.qsize() >= self.config["queue_max"]:
+            return await utils.answer(
+                message, self.strings("err_queue_full").format(self.config["queue_max"])
+            )
+        status = await utils.answer(message, self.strings("loading_music"))
+        await self._queue.put(self._process(url, message, status, audio_override=True))
 
     @loader.command()
     async def vdlaudio(self, message):
