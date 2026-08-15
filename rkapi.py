@@ -1,13 +1,17 @@
 # meta developer: @Huai_Baike
 # meta syntax: .я | .ти | .чат | .топ | .зв | .профіль | .нік | .переказ | .пет | .друзі | .графік
 
-__version__ = (7, 0, 0)
+__version__ = (8, 0, 0)
 
 import asyncio
+import html
+import io
 import json as _json
 import logging
+import math
 import re
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import aiohttp
 from .. import loader, utils
@@ -19,36 +23,38 @@ _DOMAIN = "https://werwolf.pp.ua"
 
 # ── HTML helpers ──────────────────────────────────────────────────────────────
 
-_SAFE_TAGS = re.compile(
-    r"<(/?)(b|i|u|s|code|pre|a|tg-emoji)(\s[^>]*)?>", re.IGNORECASE
-)
-
 def _esc(v) -> str:
-    text = str(v)
-    parts, last = [], 0
-    for m in _SAFE_TAGS.finditer(text):
-        chunk = text[last:m.start()]
-        parts.append(chunk.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
-        parts.append(m.group(0))
-        last = m.end()
-    parts.append(text[last:].replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
-    return "".join(parts)
+    """Escape untrusted API/Telegram values for Telegram's HTML parser."""
+    return html.escape(str(v if v is not None else ""), quote=True)
+
+
+def _href(url) -> str:
+    """Allow only links Telegram can safely render."""
+    value = str(url or "").strip()
+    if not re.match(r"^https?://", value, re.IGNORECASE):
+        return ""
+    return _esc(value)
 
 def _bar(value: int, max_val: int, width: int = 8) -> str:
-    if not max_val: return "░" * width
-    f = round(value / max_val * width)
+    width = max(1, _n(width, 8))
+    if max_val <= 0: return "░" * width
+    f = max(0, min(width, round(value / max_val * width)))
     return "█" * f + "░" * (width - f)
 
 def _n(v, d=0) -> int:
-    try: return int(v or d)
-    except: return d
+    try:
+        value = float(v if v is not None and v != "" else d)
+        return int(value) if math.isfinite(value) else d
+    except (TypeError, ValueError, OverflowError): return d
 
 def _f(v, d=0.0) -> float:
-    try: return float(v or d)
-    except: return d
+    try:
+        value = float(v if v is not None and v != "" else d)
+        return value if math.isfinite(value) else d
+    except (TypeError, ValueError, OverflowError): return d
 
 def _vip(level: int) -> str:
-    return ["", "⭐", "🌟", "💎", "👑"][min(level, 4)]
+    return ["", "⭐", "🌟", "💎", "👑"][max(0, min(_n(level), 4))]
 
 def _sep() -> str: return "—" * 16
 
@@ -59,7 +65,8 @@ def _ts(ts) -> str:
         return "?"
 
 def _cur_icon(currency: str) -> str:
-    return {"coins": "⭐", "gold": "🥇"}.get(str(currency).lower(), currency)
+    value = str(currency).lower()
+    return {"coins": "⭐", "gold": "🥇"}.get(value, _esc(value))
 
 
 # ── Formatters ────────────────────────────────────────────────────────────────
@@ -75,8 +82,14 @@ def _fmt_user(data: dict) -> str:
     mar    = ov.get("marriage", {})
 
     # Беремо дані з storage_user якщо є (точніші), інакше з user
-    uid      = u.get("id") or su.get("id", "?")
-    name     = _esc(u.get("display_name") or u.get("name") or su.get("name") or "?")
+    uid      = u.get("id") or su.get("id") or data.get("_tg_id", "?")
+    name = _esc(
+        u.get("display_name")
+        or u.get("name")
+        or su.get("name")
+        or data.get("_tg_name")
+        or "?"
+    )
     username = u.get("username") or su.get("username")
     nickname = _esc(u.get("nickname") or su.get("nickname") or "")
     vip      = _n(u.get("vip_level") or su.get("vip_level"))
@@ -148,7 +161,7 @@ def _fmt_user(data: dict) -> str:
         L += ["", "<b>🏆 Топ чати</b>", _sep()]
         for c in chats[:5]:
             raw_title = c.get("title", "")
-            link      = c.get("link", "")
+            link      = _href(c.get("link"))
             cm        = _n(c.get("messages"))
             if not link or raw_title.startswith("Chat -"):
                 t_str = f"🔒 <i>приватний</i>"
@@ -340,7 +353,7 @@ def _fmt_transfer_resp(data: dict, currency: str) -> str:
 def _fmt_group(data: dict) -> str:
     title   = _esc(data.get("title") or "Без назви")
     chat_id = data.get("chat_id", "?")
-    link    = data.get("link", "")
+    link    = _href(data.get("link"))
     members = _n(data.get("members"))
     lang    = _esc(data.get("language", "") or "")
     owner   = data.get("owner", {})
@@ -445,16 +458,24 @@ def _fmt_rel_user(data: dict, label: str) -> str:
 # ── Chart generator ───────────────────────────────────────────────────────────
 
 async def _make_chart(daily: list, title: str) -> bytes | None:
+    valid = []
+    for item in daily or []:
+        try:
+            valid.append(
+                (datetime.strptime(str(item.get("day")), "%Y-%m-%d"), _n(item.get("count")))
+            )
+        except (TypeError, ValueError, AttributeError):
+            continue
+    if not valid:
+        return None
     try:
-        import io
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
         from matplotlib.ticker import MaxNLocator
 
-        dates  = [datetime.strptime(d["day"], "%Y-%m-%d") for d in daily]
-        counts = [_n(d.get("count")) for d in daily]
+        dates, counts = map(list, zip(*valid))
 
         fig, ax = plt.subplots(figsize=(10, 3.5), facecolor="#111111")
         ax.set_facecolor("#111111")
@@ -506,12 +527,26 @@ class WerwolfStatsMod(loader.Module):
         "no_chat": "❌ Тільки в групах.",
         "no_key":  "❌ API-ключ не вказано.\nОтримай через <code>/api</code> у боті → <code>.wwkey YOUR_KEY</code>",
         "err":     "❌ <b>Помилка:</b> <code>{e}</code>",
+        "help":    (
+            "<b>🐺 Werwolf API · команди</b>\n\n"
+            "<b>Статистика</b>\n"
+            "<code>.я</code> · <code>.ти</code> · <code>.чат</code> · "
+            "<code>.топ</code> · <code>.зв</code> · <code>.графік</code>\n\n"
+            "<b>Акаунт</b>\n"
+            "<code>.профіль</code> · <code>.пет</code> · <code>.друзі</code> · "
+            "<code>.нік</code> · <code>.переказ</code>\n\n"
+            "<b>Сервіс</b>\n"
+            "<code>.wwkey</code> · <code>.wwtest</code> · <code>.wwdebug</code>"
+        ),
     }
 
     def __init__(self):
         self.config = loader.ModuleConfig(
             loader.ConfigValue("domain", _DOMAIN, "Домен сервісу"),
-            loader.ConfigValue("timeout", 20, "Таймаут (секунди)"),
+            loader.ConfigValue(
+                "timeout", 20, "Таймаут (секунди)",
+                validator=loader.validators.Integer(minimum=3, maximum=120),
+            ),
             loader.ConfigValue(
                 "api_key", "",
                 "Особистий API-ключ (/api у боті → .wwkey YOUR_KEY)",
@@ -523,11 +558,13 @@ class WerwolfStatsMod(loader.Module):
 
     async def client_ready(self, client, db):
         self._me      = await client.get_me()
-        self._session = aiohttp.ClientSession()
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
 
     async def on_unload(self):
-        if self._session:
+        if self._session and not self._session.closed:
             await self._session.close()
+        self._session = None
 
     # ── HTTP ──────────────────────────────────────────────────────────────
 
@@ -538,10 +575,16 @@ class WerwolfStatsMod(loader.Module):
     def _url(self, path: str) -> str:
         return f"{str(self.config['domain']).rstrip('/')}/{path.lstrip('/')}"
 
+    @staticmethod
+    def _path(value) -> str:
+        return quote(str(value), safe="@-_")
+
     async def _request(self, method: str, path: str, **kwargs):
         url = self._url(path)
         logger.debug("Werwolf %s %s", method, url)
         try:
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession()
             timeout = aiohttp.ClientTimeout(total=self.config["timeout"])
             async with self._session.request(
                 method, url, headers=self._headers(), timeout=timeout, **kwargs
@@ -553,7 +596,7 @@ class WerwolfStatsMod(loader.Module):
                 if resp.status == 403:
                     raise RuntimeError("доступ заборонено (403)")
                 if resp.status == 404:
-                    raise RuntimeError(f"не знайдено (404)\n<code>{url}</code>")
+                    raise RuntimeError(f"не знайдено (404): {url}")
                 if resp.status >= 500:
                     raise RuntimeError(f"помилка сервера ({resp.status})")
                 if resp.status >= 400:
@@ -562,17 +605,22 @@ class WerwolfStatsMod(loader.Module):
                         err = msg.get("error") or msg.get("message") or body[:200]
                     except Exception:
                         err = body[:200]
-                    raise RuntimeError(f"HTTP {resp.status}: {_esc(str(err))}")
+                    raise RuntimeError(f"HTTP {resp.status}: {err}")
+                if resp.status == 204 or not body.strip():
+                    return {}
                 try:
-                    return _json.loads(body)
-                except Exception:
+                    payload = _json.loads(body)
+                    if not isinstance(payload, (dict, list)):
+                        raise ValueError("top-level JSON is not an object or list")
+                    return payload
+                except (ValueError, _json.JSONDecodeError):
                     raise RuntimeError(f"невалідний JSON: {body[:100]}")
         except asyncio.TimeoutError:
             raise RuntimeError(f"таймаут ({self.config['timeout']}с)")
         except RuntimeError:
             raise
-        except Exception as e:
-            raise RuntimeError(str(e))
+        except aiohttp.ClientError as e:
+            raise RuntimeError(f"помилка мережі: {e}")
 
     async def _get(self, path):    return await self._request("GET", path)
     async def _post(self, path, json): return await self._request("POST", path, json=json)
@@ -626,9 +674,14 @@ class WerwolfStatsMod(loader.Module):
         return None, None
 
     async def _err(self, msg, e):
-        await utils.answer(msg, self.strings["err"].format(e=e))
+        await utils.answer(msg, self.strings["err"].format(e=_esc(e)))
 
     # ── Service ───────────────────────────────────────────────────────────
+
+    @loader.command()
+    async def wwhelp(self, message):
+        """Показати довідку та список команд"""
+        await utils.answer(message, self.strings["help"])
 
     @loader.command()
     async def wwkey(self, message):
@@ -642,7 +695,7 @@ class WerwolfStatsMod(loader.Module):
                 await utils.answer(message, "❌ Ключ не встановлено.\n<code>.wwkey YOUR_API_KEY</code>")
             return
         self.config["api_key"] = key
-        masked = f"{key[:6]}***{key[-4:]}"
+        masked = f"{key[:6]}***{key[-4:]}" if len(key) > 10 else "***"
         msg = await utils.answer(message, f"✅ Ключ збережено: <code>{masked}</code>")
         await asyncio.sleep(5)
         try:
@@ -670,7 +723,10 @@ class WerwolfStatsMod(loader.Module):
                 label = f"⭐{_f(data['balance'].get('coins')):.0f}  🥇{_f(data['balance'].get('gold')):.1f}"
             elif "title" in data:
                 label = _esc(data["title"])
-            await utils.answer(msg, f"✅ <b>API працює</b>\n<code>{self._url(path)}</code>\n{label}")
+            await utils.answer(
+                msg,
+                f"✅ <b>API працює</b>\n<code>{_esc(self._url(path))}</code>\n{label}",
+            )
         except RuntimeError as e:
             await self._err(msg, e)
 
@@ -692,7 +748,7 @@ class WerwolfStatsMod(loader.Module):
             raw = args[1]
             # API підтримує @username напряму
             if raw.startswith("@"):
-                path = f"api/public/users/{raw}"
+                path = f"api/public/users/{self._path(raw)}"
             else:
                 uid = await self._resolve_to_ww_id(message, raw)
                 if uid is None:
@@ -705,7 +761,10 @@ class WerwolfStatsMod(loader.Module):
             data    = await self._get(path)
             raw     = _json.dumps(data, ensure_ascii=False, indent=2)
             preview = raw[:3500] + "\n…" if len(raw) > 3500 else raw
-            await utils.answer(msg, f"<code>{self._url(path)}</code>\n\n<pre>{_esc(preview)}</pre>")
+            await utils.answer(
+                msg,
+                f"<code>{_esc(self._url(path))}</code>\n\n<pre>{_esc(preview)}</pre>",
+            )
         except RuntimeError as e:
             await self._err(msg, e)
 
@@ -779,11 +838,13 @@ class WerwolfStatsMod(loader.Module):
             if not daily:
                 await utils.answer(msg, "❌ Немає даних для графіка."); return
 
-            png = await _make_chart(daily, _esc(title))
+            png = await _make_chart(daily, str(title))
             if not png:
                 await utils.answer(msg, "⚠️ Потрібен matplotlib: <code>pip install matplotlib</code>"); return
 
-            await message.client.send_file(message.chat_id, png,
+            image = io.BytesIO(png)
+            image.name = "werwolf-activity.png"
+            await message.client.send_file(message.chat_id, image,
                 caption=f"📈 {_esc(title)}", force_document=False)
             await (msg[0] if isinstance(msg, list) else msg).delete()
         except RuntimeError as e:
@@ -839,13 +900,12 @@ class WerwolfStatsMod(loader.Module):
             if not args:
                 data = await self._get("api/profile")
                 # Нікнейм можна дістати з профілю через нік-команду
-                resp2 = await self._get("api/profile/nickname") if False else None
                 # Беремо з profile напряму (display_name показує поточний нік)
                 nick = _esc(data.get("user", {}).get("nickname") or "")
                 await utils.answer(msg,
                     f"🏷 Нікнейм: <i>{nick}</i>" if nick else "🏷 Нікнейм не встановлено.")
             elif args == "-":
-                resp = await self._delete("api/profile/nickname")
+                await self._delete("api/profile/nickname")
                 await utils.answer(msg, "✅ Нікнейм очищено.")
             else:
                 resp = await self._put("api/profile/nickname", {"nickname": args})
@@ -868,16 +928,20 @@ class WerwolfStatsMod(loader.Module):
         if len(args) < 2:
             await utils.answer(message, f"❌ {usage}"); return
 
-        short_id   = args[0].upper()
+        short_id   = args[0]
         amount_str = args[1]
         currency   = args[2].lower() if len(args) >= 3 else "coins"
 
         if currency not in ("coins", "gold"):
             await utils.answer(message, f"❌ Валюта: <code>coins</code> або <code>gold</code>"); return
         try:
-            amount = float(amount_str)
+            amount = float(amount_str.replace(",", "."))
         except ValueError:
             await utils.answer(message, "❌ Сума має бути числом."); return
+        if not math.isfinite(amount) or amount <= 0:
+            await utils.answer(message, "❌ Сума має бути додатним скінченним числом."); return
+        if amount > 1_000_000_000:
+            await utils.answer(message, "❌ Сума перевищує дозволений ліміт."); return
 
         msg = await utils.answer(message, self.strings["loading"])
         try:
@@ -896,7 +960,7 @@ class WerwolfStatsMod(loader.Module):
         msg = await utils.answer(message, self.strings["loading"])
         try:
             # API підтримує числовий ID напряму
-            data = await self._get(f"api/public/users/{uid}")
+            data = await self._get(f"api/public/users/{self._path(uid)}")
             # Якщо нема user-блоку — інжектуємо ім'я з Telegram
             if not data.get("user") and tg_name:
                 data["_tg_name"] = tg_name
