@@ -1,7 +1,7 @@
 # meta developer: @Huai_Baike
-# meta syntax: .я | .ти | .чат | .топ | .зв | .профіль | .нік | .переказ | .пет | .друзі | .графік
+# meta syntax: .wwhelp | .я | .ти | .чат | .топ | .зв | .профіль | .нік | .переказ | .пет | .друзі | .графік
 
-__version__ = (8, 0, 0)
+__version__ = (9, 0, 0)
 
 import asyncio
 import html
@@ -10,6 +10,7 @@ import json as _json
 import logging
 import math
 import re
+import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -67,6 +68,32 @@ def _ts(ts) -> str:
 def _cur_icon(currency: str) -> str:
     value = str(currency).lower()
     return {"coins": "⭐", "gold": "🥇"}.get(value, _esc(value))
+
+
+_SECRET_FIELDS = {"token", "api_key", "initdata", "init_data", "password", "secret"}
+
+
+def _redact(value):
+    """Return a JSON-safe copy with credentials removed from debug output."""
+    if isinstance(value, dict):
+        return {
+            key: "***" if str(key).lower() in _SECRET_FIELDS else _redact(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact(item) for item in value]
+    return value
+
+
+def _json_object(raw: str) -> dict:
+    """Parse a command argument as an object, never as an arbitrary JSON value."""
+    try:
+        value = _json.loads(raw)
+    except _json.JSONDecodeError as exc:
+        raise ValueError(f"невалідний JSON: {exc.msg}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("JSON body має бути об'єктом")
+    return value
 
 
 # ── Formatters ────────────────────────────────────────────────────────────────
@@ -535,8 +562,12 @@ class WerwolfStatsMod(loader.Module):
             "<b>Акаунт</b>\n"
             "<code>.профіль</code> · <code>.пет</code> · <code>.друзі</code> · "
             "<code>.нік</code> · <code>.переказ</code>\n\n"
+            "<b>Нові API</b>\n"
+            "<code>.курс</code> · <code>.чати</code> · <code>.рейтинг</code> · "
+            "<code>.чатнік</code> · <code>.петдія</code> · <code>.друг</code>\n\n"
             "<b>Сервіс</b>\n"
-            "<code>.wwkey</code> · <code>.wwtest</code> · <code>.wwdebug</code>"
+            "<code>.wwkey</code> · <code>.wwtest</code> · <code>.wwdebug</code> · "
+            "<code>.wwapi</code>"
         ),
     }
 
@@ -570,7 +601,10 @@ class WerwolfStatsMod(loader.Module):
 
     def _headers(self) -> dict:
         key = str(self.config["api_key"]).strip()
-        return {"X-API-Key": key} if key else {}
+        headers = {"Accept": "application/json"}
+        if key:
+            headers["X-API-Key"] = key
+        return headers
 
     def _url(self, path: str) -> str:
         return f"{str(self.config['domain']).rstrip('/')}/{path.lstrip('/')}"
@@ -580,21 +614,30 @@ class WerwolfStatsMod(loader.Module):
         return quote(str(value), safe="@-_")
 
     async def _request(self, method: str, path: str, **kwargs):
+        path = str(path).lstrip("/")
+        route = path.split("?", 1)[0]
+        segments = route.replace("\\", "/").split("/")
+        if not path.startswith("api/") or any(part in {".", ".."} for part in segments):
+            raise RuntimeError("дозволені лише маршрути /api/*")
         url = self._url(path)
         logger.debug("Werwolf %s %s", method, url)
         try:
             if self._session is None or self._session.closed:
                 self._session = aiohttp.ClientSession()
             timeout = aiohttp.ClientTimeout(total=self.config["timeout"])
-            async with self._session.request(
-                method, url, headers=self._headers(), timeout=timeout, **kwargs
-            ) as resp:
+            headers = self._headers()
+            headers.update(kwargs.pop("headers", {}) or {})
+            async with self._session.request(method, url, headers=headers, timeout=timeout, **kwargs) as resp:
                 body = await resp.text()
                 logger.debug("Werwolf ← %s %.200s", resp.status, body)
                 if resp.status == 401:
                     raise RuntimeError("невірний API-ключ (401)")
                 if resp.status == 403:
-                    raise RuntimeError("доступ заборонено (403)")
+                    try:
+                        reason = (_json.loads(body).get("error") or "доступ заборонено")
+                    except Exception:
+                        reason = "доступ заборонено"
+                    raise RuntimeError(f"{reason} (403)")
                 if resp.status == 404:
                     raise RuntimeError(f"не знайдено (404): {url}")
                 if resp.status >= 500:
@@ -759,7 +802,7 @@ class WerwolfStatsMod(loader.Module):
 
         try:
             data    = await self._get(path)
-            raw     = _json.dumps(data, ensure_ascii=False, indent=2)
+            raw     = _json.dumps(_redact(data), ensure_ascii=False, indent=2)
             preview = raw[:3500] + "\n…" if len(raw) > 3500 else raw
             await utils.answer(
                 msg,
@@ -767,6 +810,39 @@ class WerwolfStatsMod(loader.Module):
             )
         except RuntimeError as e:
             await self._err(msg, e)
+
+    @loader.command()
+    async def wwapi(self, message):
+        """Універсальний JSON API: .wwapi GET public/users?limit=5 | .wwapi POST pets/create {"name":"Луна"}"""
+        if not await self._guard(message): return
+        raw = utils.get_args_raw(message).strip()
+        parts = raw.split(maxsplit=2)
+        if len(parts) < 2 or parts[0].upper() not in {"GET", "POST", "PUT", "DELETE"}:
+            await utils.answer(message, "❌ <code>.wwapi METHOD api/path [JSON_OBJECT]</code>")
+            return
+        method, path = parts[0].upper(), parts[1].lstrip("/")
+        if not path.startswith("api/"):
+            path = "api/" + path
+        body = None
+        if len(parts) == 3:
+            try:
+                body = _json_object(parts[2])
+            except ValueError as exc:
+                await self._err(message, exc); return
+        if method in {"POST", "PUT"} and body is None:
+            body = {}
+        msg = await utils.answer(message, self.strings["loading"])
+        try:
+            headers = {}
+            if method == "POST" and path.startswith("api/developer/"):
+                headers["Idempotency-Key"] = str(uuid.uuid4())
+            data = await self._request(method, path, json=body, headers=headers) if body is not None else await self._request(method, path, headers=headers)
+            rendered = _json.dumps(_redact(data), ensure_ascii=False, indent=2)
+            if len(rendered) > 3500:
+                rendered = rendered[:3500] + "\n…"
+            await utils.answer(msg, f"✅ <code>{_esc(method)} {_esc(path)}</code>\n<pre>{_esc(rendered)}</pre>")
+        except RuntimeError as exc:
+            await self._err(msg, exc)
 
     # ── Stats ─────────────────────────────────────────────────────────────
 
@@ -898,10 +974,8 @@ class WerwolfStatsMod(loader.Module):
         msg  = await utils.answer(message, self.strings["loading"])
         try:
             if not args:
-                data = await self._get("api/profile")
-                # Нікнейм можна дістати з профілю через нік-команду
-                # Беремо з profile напряму (display_name показує поточний нік)
-                nick = _esc(data.get("user", {}).get("nickname") or "")
+                data = await self._get("api/profile/nickname")
+                nick = _esc(data.get("nickname") or "")
                 await utils.answer(msg,
                     f"🏷 Нікнейм: <i>{nick}</i>" if nick else "🏷 Нікнейм не встановлено.")
             elif args == "-":
@@ -953,6 +1027,129 @@ class WerwolfStatsMod(loader.Module):
             await utils.answer(msg, _fmt_transfer_resp(data or {}, currency))
         except RuntimeError as e:
             await self._err(msg, e)
+
+    @loader.command()
+    async def курс(self, message):
+        """Поточні курси валют RotKranz (API key не обов'язковий)"""
+        msg = await utils.answer(message, self.strings["loading"])
+        try:
+            data = await self._get("api/rates")
+            def rate(name):
+                value = data.get(name)
+                return "н/д" if value is None else f"{_f(value):g}"
+            await utils.answer(msg, "\n".join((
+                "<b>💱 Курси RotKranz</b>", _sep(),
+                f"1 🥇 = <b>{rate('coin_per_gold')}</b> ⭐",
+                f"🥇 / USD: <b>{rate('gold_usd')}</b>",
+                f"USD / UAH: <b>{rate('usd_uah')}</b>",
+                f"USD / EUR: <b>{rate('usd_eur')}</b>",
+            )))
+        except RuntimeError as exc:
+            await self._err(msg, exc)
+
+    @loader.command()
+    async def чати(self, message):
+        """Список доступних чатів поточного користувача"""
+        if not await self._guard(message): return
+        msg = await utils.answer(message, self.strings["loading"])
+        try:
+            data = await self._get("api/chats")
+            items = data if isinstance(data, list) else data.get("chats", [])
+            lines = ["<b>💬 Мої чати</b>", _sep()]
+            for item in items[:20]:
+                title = _esc(item.get("title") or item.get("name") or "Без назви")
+                cid = item.get("chat_id", item.get("id", "?"))
+                count = _n(item.get("messages") or item.get("message_count"))
+                lines.append(f"· <b>{title}</b> — {count:,}\n  <code>{cid}</code>")
+            if not items: lines.append("Чатів немає.")
+            await utils.answer(msg, "\n".join(lines))
+        except RuntimeError as exc:
+            await self._err(msg, exc)
+
+    @loader.command()
+    async def рейтинг(self, message):
+        """Рейтинг груп: .рейтинг [current|day|month|all]"""
+        if not await self._guard(message): return
+        period = utils.get_args_raw(message).strip().lower() or "current"
+        if period not in {"current", "day", "month", "all"}:
+            await utils.answer(message, "❌ Період: <code>current | day | month | all</code>"); return
+        msg = await utils.answer(message, self.strings["loading"])
+        try:
+            data = await self._get(f"api/rating?period={period}")
+            items = data if isinstance(data, list) else data.get("rating") or data.get("groups") or []
+            lines = [f"<b>🏆 Рейтинг · {_esc(period)}</b>", _sep()]
+            for index, item in enumerate(items[:15], 1):
+                title = _esc(item.get("title") or item.get("name") or item.get("chat_id") or "?")
+                score = _n(item.get("messages") or item.get("count") or item.get("score"))
+                lines.append(f"{index}. <b>{score:,}</b> · {title}")
+            if not items: lines.append("Даних немає.")
+            await utils.answer(msg, "\n".join(lines))
+        except RuntimeError as exc:
+            await self._err(msg, exc)
+
+    @loader.command()
+    async def чатнік(self, message):
+        """Нік у поточному чаті: .чатнік [новий нік|-]"""
+        if not await self._guard(message): return
+        if message.is_private:
+            await utils.answer(message, self.strings["no_chat"]); return
+        value = utils.get_args_raw(message).strip()
+        path = f"api/profile/chats/{message.chat_id}/nickname"
+        msg = await utils.answer(message, self.strings["loading"])
+        try:
+            if value == "-":
+                await self._delete(path); text = "✅ Нік чату очищено."
+            elif value:
+                data = await self._put(path, {"nickname": value})
+                text = f"✅ Нік чату: <i>{_esc(data.get('nickname') or value)}</i>"
+            else:
+                data = await self._get(path)
+                nick = data.get("nickname")
+                text = f"🏷 Нік чату: <i>{_esc(nick)}</i>" if nick else "🏷 Нік чату не встановлено."
+            await utils.answer(msg, text)
+        except RuntimeError as exc:
+            await self._err(msg, exc)
+
+    @loader.command()
+    async def петдія(self, message):
+        """Дія з петом: .петдія PET_ID ACTION [duration_hours]"""
+        if not await self._guard(message): return
+        args = utils.get_args_raw(message).split()
+        if len(args) < 2 or not args[0].isdigit():
+            await utils.answer(message, "❌ <code>.петдія PET_ID ACTION [duration_hours]</code>"); return
+        body = {"action": args[1]}
+        if len(args) > 2:
+            hours = _f(args[2], -1)
+            if hours <= 0:
+                await utils.answer(message, "❌ duration_hours має бути додатним числом."); return
+            body["duration_hours"] = hours
+        msg = await utils.answer(message, self.strings["loading"])
+        try:
+            data = await self._post(f"api/pets/{args[0]}/action", body)
+            await utils.answer(msg, "✅ Дію виконано.\n\n" + _fmt_pets(data if "pets" in data else {"pets": [data.get("pet", data)]}))
+        except RuntimeError as exc:
+            await self._err(msg, exc)
+
+    @loader.command()
+    async def друг(self, message):
+        """Друзі: .друг додати SHORT_ID | прийняти/відхилити/видалити USER_ID"""
+        if not await self._guard(message): return
+        args = utils.get_args_raw(message).split()
+        actions = {"додати": ("request", "short_id"), "прийняти": ("respond", "user_id"),
+                   "відхилити": ("respond", "user_id"), "видалити": ("remove", "user_id")}
+        if len(args) != 2 or args[0].lower() not in actions:
+            await utils.answer(message, "❌ <code>.друг додати SHORT_ID | прийняти/відхилити/видалити USER_ID</code>"); return
+        verb = args[0].lower(); endpoint, field = actions[verb]
+        if field == "user_id" and not args[1].isdigit():
+            await utils.answer(message, "❌ USER_ID має бути числом."); return
+        body = {field: int(args[1]) if field == "user_id" else args[1]}
+        if endpoint == "respond": body["action"] = "accept" if verb == "прийняти" else "decline"
+        msg = await utils.answer(message, self.strings["loading"])
+        try:
+            await self._post(f"api/friends/{endpoint}", body)
+            await utils.answer(msg, "✅ Виконано.")
+        except RuntimeError as exc:
+            await self._err(msg, exc)
 
     # ── Internals ─────────────────────────────────────────────────────────
 
