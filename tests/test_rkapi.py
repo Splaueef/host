@@ -76,6 +76,21 @@ class HelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rkapi._n("nan", 7), 7)
         self.assertEqual(rkapi._f("inf", 2.5), 2.5)
 
+    def test_json_object_rejects_arrays_and_invalid_json(self):
+        self.assertEqual(rkapi._json_object('{"name": "Луна"}'), {"name": "Луна"})
+        with self.assertRaises(ValueError):
+            rkapi._json_object("[]")
+        with self.assertRaises(ValueError):
+            rkapi._json_object("not json")
+
+    def test_redact_recurses_without_mutating_payload(self):
+        payload = {"token": "secret", "user": {"password": "pw", "id": 1}, "items": [{"api_key": "key"}]}
+        redacted = rkapi._redact(payload)
+        self.assertEqual(redacted["token"], "***")
+        self.assertEqual(redacted["user"]["password"], "***")
+        self.assertEqual(redacted["items"][0]["api_key"], "***")
+        self.assertEqual(payload["token"], "secret")
+
     def test_user_formatter_uses_telegram_fallback(self):
         rendered = rkapi._fmt_user({"_tg_id": 42, "_tg_name": "Test <User>"})
         self.assertIn("Test &lt;User&gt;", rendered)
@@ -88,6 +103,13 @@ class HelperTests(unittest.IsolatedAsyncioTestCase):
     async def test_chart_rejects_empty_or_malformed_data(self):
         self.assertIsNone(await rkapi._make_chart([], "empty"))
         self.assertIsNone(await rkapi._make_chart([{"day": "not-a-date"}], "bad"))
+
+    async def test_request_rejects_non_api_and_traversal_paths(self):
+        module = rkapi.WerwolfStatsMod()
+        with self.assertRaisesRegex(RuntimeError, "лише маршрути"):
+            await module._request("GET", "admin/login")
+        with self.assertRaisesRegex(RuntimeError, "лише маршрути"):
+            await module._request("GET", "api/../admin/login")
 
 
 if __name__ == "__main__":
