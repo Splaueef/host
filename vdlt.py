@@ -1,4 +1,5 @@
 __version__ = (6, 9, 0)
+VERSION = ".".join(map(str, __version__))
 
 import os
 import re
@@ -15,6 +16,8 @@ import ipaddress
 import socket
 import json
 import signal
+import getpass
+import sqlite3
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 from collections import defaultdict
@@ -383,12 +386,74 @@ def _get_cookies(url: str) -> str | None:
         matched = [domains for domains in COOKIE_DOMAINS.values() if any(d in hostname for d in domains)]
         if not matched or _cookie_file_has_domain(COOKIES_DEFAULT, matched[0]):
             return COOKIES_DEFAULT
-        logger.info("cookies.txt exists but has no cookies for %s; using shared file anyway", hostname)
-        return COOKIES_DEFAULT
+        logger.info("cookies.txt has no cookies for %s; skipping it", hostname)
+        return None
     for host, path in PLATFORM_COOKIES.items():
         if host in hostname and os.path.isfile(path) and os.path.getsize(path) > 0:
             return path
     return None
+
+
+class CookieManager:
+    """Resolve and validate file/browser cookies without leaking browser details.
+
+    Paths and the browser account are supplied by module configuration, so the
+    downloader is no longer tied to one deployment user.
+    """
+
+    def __init__(self, cookies_file: str, firefox_profile: str, browser_user: str = ""):
+        self.cookies_file = os.path.expanduser(cookies_file or "")
+        self.firefox_profile = os.path.expanduser(firefox_profile or "")
+        self.browser_user = (browser_user or getpass.getuser()).strip()
+
+    @staticmethod
+    def domains_for_url(url: str) -> tuple[str, ...]:
+        hostname = (urlsplit(url).hostname or "").lower().lstrip("www.")
+        for domains in COOKIE_DOMAINS.values():
+            if any(_hostname_matches(hostname, domain) for domain in domains):
+                return domains
+        return (hostname,) if hostname else ()
+
+    def file_for(self, url: str) -> str | None:
+        domains = self.domains_for_url(url)
+        if not domains or not os.path.isfile(self.cookies_file):
+            return None
+        if os.path.getsize(self.cookies_file) <= 0:
+            return None
+        if _cookie_file_has_domain(self.cookies_file, domains):
+            return self.cookies_file
+        logger.info("Cookie file %s has no cookies for %s", self.cookies_file, domains[0])
+        return None
+
+    @property
+    def cookie_db(self) -> str:
+        return os.path.join(self.firefox_profile, "cookies.sqlite")
+
+    def firefox_profile_valid(self) -> bool:
+        return bool(
+            self.firefox_profile
+            and os.path.isdir(self.firefox_profile)
+            and os.access(self.firefox_profile, os.R_OK | os.W_OK)
+            and os.path.isfile(self.cookie_db)
+        )
+
+    def firefox_has_url(self, url: str) -> bool:
+        if not self.firefox_profile_valid():
+            return False
+        domains = self.domains_for_url(url)
+        try:
+            connection = sqlite3.connect(f"file:{self.cookie_db}?mode=ro", uri=True, timeout=2)
+            try:
+                hosts = (row[0] for row in connection.execute("SELECT host FROM moz_cookies"))
+                return any(
+                    any(_hostname_matches(str(host).lstrip("."), domain) for domain in domains)
+                    for host in hosts
+                )
+            finally:
+                connection.close()
+        except (OSError, sqlite3.Error) as error:
+            logger.warning("Could not inspect Firefox cookies: %s", error)
+            return False
 
 
 
@@ -756,7 +821,7 @@ class VideoDownloaderMod(loader.Module):
         "caption_playlist":   "<b>📋 {title} ({idx}/{total})</b>",
         "transcript_header":  "<b>📝 Транскрипт: {title}</b>\n\n",
         "help_text": (
-            "<b>🎬 VideoDownloader v6.8.2</b>\n\n"
+            f"<b>🎬 VideoDownloader v{VERSION}</b>\n\n"
             "<b>Основні команди:</b>\n"
             "• <code>.vdl</code> — увімк/вимк авто-завантаження\n"
             "• <code>.vdldl [URL]</code> — ручне завантаження\n"
@@ -768,6 +833,7 @@ class VideoDownloaderMod(loader.Module):
             "• <code>.vdlupdate</code> — оновити yt-dlp\n"
             "• <code>.vdlqueue</code> — черга\n"
             "• <code>.vdlruntime</code> — статус JS runtime\n\n"
+            "• <code>.vdldiag</code> — повна діагностика\n\n"
             "<b>Транскрипт:</b>\n"
             "• <code>.vdlt [URL]</code> — транскрипт YouTube/Bilibili\n\n"
             "<b>Групи:</b> .vdladd / .vdlrm / .vdllist\n"
@@ -816,6 +882,9 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("yt_dlp_path",       "", "Шлях до yt-dlp binary (порожньо = auto/python -m yt_dlp)"),
             loader.ConfigValue("ffmpeg_path",       "", "Шлях до ffmpeg або директорії з ffmpeg (порожньо = auto)"),
             loader.ConfigValue("yt_browser_cookies", f"firefox:{FIREFOX_PROFILE}", "Browser cookies fallback для yt-dlp: browser:profile"),
+            loader.ConfigValue("cookies_file", COOKIES_DEFAULT, "Спільний cookies.txt"),
+            loader.ConfigValue("firefox_profile", FIREFOX_PROFILE, "Firefox profile для оновлення cookies"),
+            loader.ConfigValue("browser_user", "", "Користувач Firefox (порожньо = поточний)"),
             loader.ConfigValue("yt_cookies_mode",   "auto", "Cookies: auto/always/never. auto = файл cookies, потім Firefox fallback"),
             loader.ConfigValue("songlink_enabled",  True, "Шукати альтернативні музичні платформи через song.link"),
             loader.ConfigValue("music_channels", [], "Канали для пошуку музики: @username або -100ID"),
@@ -842,6 +911,16 @@ class VideoDownloaderMod(loader.Module):
             logger.info("VideoDownloader: JS runtime detected: %s", self._js_runtime)
         else:
             logger.warning("VideoDownloader: No JS runtime found! YouTube may fail.")
+
+    def _cookie_manager(self) -> CookieManager:
+        return CookieManager(
+            str(self.config.get("cookies_file", COOKIES_DEFAULT) or COOKIES_DEFAULT),
+            str(self.config.get("firefox_profile", FIREFOX_PROFILE) or FIREFOX_PROFILE),
+            str(self.config.get("browser_user", "") or ""),
+        )
+
+    def _cookies_for(self, url: str) -> str | None:
+        return self._cookie_manager().file_for(url)
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
@@ -1111,6 +1190,7 @@ class VideoDownloaderMod(loader.Module):
 
     def _progress_hook(self, status_msg, loop):
         last = [-1]
+        last_update = [0.0]
 
         def hook(d):
             if d.get("status") != "downloading":
@@ -1122,7 +1202,11 @@ class VideoDownloaderMod(loader.Module):
             pct = int(dl / total * 100)
             if pct - last[0] < 5:
                 return
+            now = time.monotonic()
+            if pct < 100 and now - last_update[0] < 2:
+                return
             last[0] = pct
+            last_update[0] = now
             asyncio.run_coroutine_threadsafe(
                 status_msg.edit(self.strings("loading_progress").format(pct)), loop
             )
@@ -1384,7 +1468,7 @@ class VideoDownloaderMod(loader.Module):
     async def _dl_instagram_ytdlp(self, url: str, base_name: str, audio: bool) -> list | None:
         import yt_dlp
 
-        cookies = _get_cookies(url)
+        cookies = self._cookies_for(url)
         is_vertical = _is_vertical_url(url)
 
         def _dl():
@@ -1577,7 +1661,7 @@ class VideoDownloaderMod(loader.Module):
         import requests
         import yt_dlp
 
-        cookies = _get_cookies(url)
+        cookies = self._cookies_for(url)
 
         def _dl():
             opts = {"quiet": True, "no_warnings": True,
@@ -1631,13 +1715,14 @@ class VideoDownloaderMod(loader.Module):
         return mode if mode in {"auto", "always", "never"} else "auto"
 
     def _yt_browser_cookies_value(self) -> str:
-        return str(
-            self.config.get("yt_browser_cookies", f"firefox:{FIREFOX_PROFILE}")
-            or f"firefox:{FIREFOX_PROFILE}"
-        ).strip()
+        configured = str(self.config.get("yt_browser_cookies", "") or "").strip()
+        profile = self._cookie_manager().firefox_profile
+        if not configured or configured == f"firefox:{FIREFOX_PROFILE}":
+            return f"firefox:{profile}" if profile else "firefox"
+        return configured
 
     def _youtube_cookie_candidates(self, url: str) -> list[tuple[str | None, bool, str]]:
-        cookies = _get_cookies(url)
+        cookies = self._cookies_for(url)
         if not _is_youtube_url(url):
             return [(cookies, False, "cookies" if cookies else "anon")]
         mode = self._yt_cookies_mode()
@@ -1934,7 +2019,7 @@ class VideoDownloaderMod(loader.Module):
         audio: bool, quality: str, vertical: bool = False
     ) -> str | None:
         loop = asyncio.get_event_loop()
-        cookies = _get_cookies(url)
+        cookies = self._cookies_for(url)
         chain = (
             ["bestaudio/best", "bestaudio", "best"]
             if audio
@@ -2168,19 +2253,26 @@ class VideoDownloaderMod(loader.Module):
 
     def _refresh_firefox_cookies_sync(self, url: str) -> bool:
         """Open the failed site's origin in Firefox and persist its profile cookies."""
+        manager = self._cookie_manager()
         firefox = self._find_executable("", ["firefox-esr", "firefox"])
-        sudo = self._find_executable("", ["sudo"])
-        if not firefox or not sudo:
-            logger.warning("Firefox cookie refresh unavailable: sudo/firefox-esr not found")
+        if not firefox:
+            logger.warning("Firefox cookie refresh unavailable: Firefox not found")
+            return False
+        if not manager.firefox_profile_valid():
+            logger.warning("Firefox profile is not readable/writable or has no cookies.sqlite: %s", manager.firefox_profile)
             return False
 
         parts = urlsplit(url)
         site_url = urlunsplit((parts.scheme, parts.netloc, "/", "", ""))
-        command = [
-            sudo, "-u", FIREFOX_USER, firefox, "--headless", "--no-remote",
-            "--profile", FIREFOX_PROFILE, site_url,
-        ]
+        command = [firefox, "--headless", "--no-remote", "--profile", manager.firefox_profile, site_url]
+        if manager.browser_user != getpass.getuser():
+            sudo = self._find_executable("", ["sudo"])
+            if not sudo:
+                logger.warning("Firefox refresh needs sudo to run as %s", manager.browser_user)
+                return False
+            command = [sudo, "-u", manager.browser_user, *command]
         process = None
+        started = False
         try:
             process = subprocess.Popen(
                 command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -2191,7 +2283,7 @@ class VideoDownloaderMod(loader.Module):
             if process.poll() is not None and process.returncode != 0:
                 logger.warning("Firefox cookie refresh exited with code %s", process.returncode)
                 return False
-            return True
+            started = True
         except Exception as e:
             logger.warning("Could not refresh browser cookies for %s: %s", site_url, e)
             return False
@@ -2203,6 +2295,7 @@ class VideoDownloaderMod(loader.Module):
                 except subprocess.TimeoutExpired:
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait(timeout=5)
+        return started and manager.firefox_has_url(url)
 
     async def _dl_with_refreshed_browser(
         self, url: str, base_name: str, audio: bool
@@ -2270,7 +2363,7 @@ class VideoDownloaderMod(loader.Module):
     async def _dl_gallery_dl(self, url: str, base_name: str) -> list | None:
         if not self.config.get("use_gallery_dl", True):
             return None
-        cookies = _get_cookies(url)
+        cookies = self._cookies_for(url)
 
         def _run():
             try:
@@ -2614,6 +2707,7 @@ class VideoDownloaderMod(loader.Module):
                 return cobalt_result
             if youtube_auth_failed:
                 await status_msg.edit(self.strings("err_youtube_auth"))
+                return "AUTH_REQUIRED"
             return None
 
         if (not self.config.get("allow_any_url", False)
@@ -2664,7 +2758,7 @@ class VideoDownloaderMod(loader.Module):
         import yt_dlp
         import requests
 
-        cookies = _get_cookies(url)
+        cookies = self._cookies_for(url)
         lang = self.config.get("transcript_lang", "uk")
 
         def _lang_candidates() -> list[str]:
@@ -3115,7 +3209,7 @@ class VideoDownloaderMod(loader.Module):
     async def _dl_playlist(self, url: str, status_msg, message, audio: bool):
         import yt_dlp
 
-        cookies = _get_cookies(url)
+        cookies = self._cookies_for(url)
         max_v = self.config["playlist_max"]
 
         def _info():
@@ -3257,9 +3351,9 @@ class VideoDownloaderMod(loader.Module):
                 if direct:
                     result = [direct]
 
-            # Last download attempt: let the failed origin update the dedicated
-            # Firefox profile, stop the browser, and ask yt-dlp to read it.
-            if result is None:
+            # Firefox is a session refresh service, not a generic downloader.
+            # Start it only after yt-dlp explicitly classified an auth failure.
+            if result == "AUTH_REQUIRED":
                 browser_result = await self._dl_with_refreshed_browser(
                     url, f"{base}_browser", audio
                 )
@@ -3270,6 +3364,8 @@ class VideoDownloaderMod(loader.Module):
                         browser_result if isinstance(browser_result, list)
                         else [browser_result]
                     )
+                else:
+                    result = None
 
             if result == "TOO_LARGE":
                 self._stats["err"] += 1
@@ -3667,7 +3763,21 @@ class VideoDownloaderMod(loader.Module):
             self._start_queue_workers()
             val = self.config[cfg_key]
         if key == "queue_max" and self._queue is not None:
-            self._queue = asyncio.Queue(maxsize=val)
+            if val < 1:
+                return await utils.answer(message, "<b>❌ queue_max має бути не менше 1.</b>")
+            pending = self._queue.qsize()
+            if val < pending:
+                self.config[cfg_key] = self._queue.maxsize
+                return await utils.answer(
+                    message,
+                    f"<b>❌ У черзі вже <code>{pending}</code> завдань; queue_max не може бути меншим.</b>",
+                )
+            old_queue = self._queue
+            new_queue = asyncio.Queue(maxsize=val)
+            while not old_queue.empty():
+                new_queue.put_nowait(old_queue.get_nowait())
+                old_queue.task_done()
+            self._queue = new_queue
             self._start_queue_workers()
         if cast is bool:
             await utils.answer(message, f"<b>{key}: {'✅ ON' if val else '❌ OFF'}</b>")
@@ -3772,6 +3882,55 @@ class VideoDownloaderMod(loader.Module):
             )
         else:
             await utils.answer(message, self.strings("js_runtime_missing"))
+
+    @loader.command()
+    async def vdldiag(self, message):
+        """Діагностика downloader, runtime, cookies і fallback-ів."""
+        import importlib.util
+        import platform
+
+        def executable(name: str, configured: str = "") -> str | None:
+            path = self._find_executable(configured, [name])
+            return path if path and os.access(path, os.X_OK) else None
+
+        def mark(value) -> str:
+            return "✅" if value else "❌"
+
+        manager = self._cookie_manager()
+        runtime = _detect_js_runtime()
+        cookie_domains = _cookie_domains_status(manager.cookies_file)
+        firefox = executable("firefox-esr") or executable("firefox")
+        ytdlp_cli = self._find_ytdlp_command()
+        fallbacks = {
+            "gallery-dl": importlib.util.find_spec("gallery_dl") is not None,
+            "instaloader": importlib.util.find_spec("instaloader") is not None,
+            "spotdl": importlib.util.find_spec("spotdl") is not None,
+            "Cobalt": bool(self.config.get("cobalt_api_url", "")),
+        }
+        domain_lines = "\n".join(
+            f"│  ├ {name}: {mark(ok)}" for name, ok in cookie_domains.items()
+        )
+        fallback_lines = "\n".join(
+            f"├ {name}: {mark(ok)}" for name, ok in fallbacks.items()
+        )
+        text = (
+            "<b>🔧 VideoDownloader diagnostics</b>\n\n"
+            f"<b>Core</b>\n├ Version: <code>{VERSION}</code>\n"
+            f"├ Python: <code>{platform.python_version()}</code>\n"
+            f"└ User: <code>{utils.escape_html(getpass.getuser())}</code>\n\n"
+            f"<b>yt-dlp</b>\n├ Python API: {mark(importlib.util.find_spec('yt_dlp'))}\n"
+            f"└ CLI: {mark(ytdlp_cli)} <code>{utils.escape_html(' '.join(ytdlp_cli or []))}</code>\n\n"
+            f"<b>Runtime</b>\n├ JS: {mark(runtime)} <code>{utils.escape_html(':'.join(runtime) if runtime else 'not found')}</code>\n"
+            f"├ FFmpeg: {mark(executable('ffmpeg', self.config.get('ffmpeg_path', '')))}\n"
+            f"└ ffprobe: {mark(executable('ffprobe'))}\n\n"
+            f"<b>Cookies</b>\n├ File: {mark(os.path.isfile(manager.cookies_file))} <code>{utils.escape_html(manager.cookies_file)}</code>\n"
+            f"{domain_lines}\n└ Firefox DB: {mark(manager.firefox_profile_valid())}\n\n"
+            f"<b>Firefox</b>\n├ Binary: {mark(firefox)} <code>{utils.escape_html(firefox or 'not found')}</code>\n"
+            f"├ Profile: <code>{utils.escape_html(manager.firefox_profile or 'not configured')}</code>\n"
+            f"└ User: <code>{utils.escape_html(manager.browser_user)}</code>\n\n"
+            f"<b>Fallbacks</b>\n{fallback_lines}"
+        )
+        await utils.answer(message, text)
 
     @loader.command()
     async def vdladd(self, message):
