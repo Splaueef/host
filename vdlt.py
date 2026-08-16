@@ -1,4 +1,4 @@
-__version__ = (6, 8, 2)
+__version__ = (6, 9, 0)
 
 import os
 import re
@@ -14,6 +14,7 @@ import unicodedata
 import ipaddress
 import socket
 import json
+import signal
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 from collections import defaultdict
@@ -30,6 +31,9 @@ COOKIES_DEFAULT = os.path.join(COOKIES_DIR, "cookies.txt")
 COOKIES_YOUTUBE = os.path.join(COOKIES_DIR, "cookies-youtube-com.txt")
 PREFERRED_DENO_PATH = "/usr/local/bin/deno"
 PREFERRED_JS_RUNTIME = f"deno:{PREFERRED_DENO_PATH}"
+FIREFOX_PROFILE = "/home/rkbot/URKbot/firefox-profile"
+FIREFOX_USER = "rkbot"
+FIREFOX_WARMUP_SECONDS = 15
 
 PIP_DEPENDENCIES = {
     "yt-dlp": "yt_dlp",
@@ -740,7 +744,7 @@ class VideoDownloaderMod(loader.Module):
             "├ Шлях: <code>/home/rkbot/URKbot/cookies.txt</code>\n"
             "├ Режим YouTube: <code>{mode}</code>\n"
             "├ Browser cookies: <code>{browser}</code>\n"
-            "├ Порада: режим <code>auto</code> бере YouTube cookies лише як fallback, щоб їх рідше ротувало.\n"
+            "├ Порядок: файл cookies → оновлення Firefox → browser cookies.\n"
             "└ Домени в cookies.txt:\n{domains}"
         ),
         "js_runtime_status":  "<b>🟢 JS Runtime: <code>{rt}</code></b>",
@@ -811,8 +815,8 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("allow_any_url",     False, "Автозавантажувати будь-які URL, які підтримує yt-dlp"),
             loader.ConfigValue("yt_dlp_path",       "", "Шлях до yt-dlp binary (порожньо = auto/python -m yt_dlp)"),
             loader.ConfigValue("ffmpeg_path",       "", "Шлях до ffmpeg або директорії з ffmpeg (порожньо = auto)"),
-            loader.ConfigValue("yt_browser_cookies", "firefox", "YouTube cookies-from-browser для yt-dlp: firefox/chrome або browser:profile"),
-            loader.ConfigValue("yt_cookies_mode",   "auto", "YouTube cookies: auto/always/never. auto = спочатку без cookies, потім fallback"),
+            loader.ConfigValue("yt_browser_cookies", f"firefox:{FIREFOX_PROFILE}", "Browser cookies fallback для yt-dlp: browser:profile"),
+            loader.ConfigValue("yt_cookies_mode",   "auto", "Cookies: auto/always/never. auto = файл cookies, потім Firefox fallback"),
             loader.ConfigValue("songlink_enabled",  True, "Шукати альтернативні музичні платформи через song.link"),
             loader.ConfigValue("music_channels", [], "Канали для пошуку музики: @username або -100ID"),
             loader.ConfigValue("music_search_limit", 25, "Скільки повідомлень перевіряти в кожному музичному каналі"),
@@ -1627,30 +1631,26 @@ class VideoDownloaderMod(loader.Module):
         return mode if mode in {"auto", "always", "never"} else "auto"
 
     def _yt_browser_cookies_value(self) -> str:
-        return str(self.config.get("yt_browser_cookies", "firefox") or "firefox").strip()
+        return str(
+            self.config.get("yt_browser_cookies", f"firefox:{FIREFOX_PROFILE}")
+            or f"firefox:{FIREFOX_PROFILE}"
+        ).strip()
 
     def _youtube_cookie_candidates(self, url: str) -> list[tuple[str | None, bool, str]]:
         cookies = _get_cookies(url)
-        browser = self._yt_browser_cookies_value()
-        use_browser = bool(browser)
         if not _is_youtube_url(url):
             return [(cookies, False, "cookies" if cookies else "anon")]
         mode = self._yt_cookies_mode()
         if mode == "never":
             return [(None, False, "anon")]
 
-        cookie_candidate = (cookies, use_browser, "cookies" if cookies else "browser")
+        cookie_candidate = (cookies, False, "cookies" if cookies else "anon")
         if mode == "always":
-            return [cookie_candidate] if cookies or use_browser else [(None, False, "anon")]
+            return [cookie_candidate]
 
-        # YouTube often rotates/invalidates account cookies after repeated bot
-        # challenges from server IPs.  In auto mode, public videos are attempted
-        # anonymously first and the account/browser cookies are used only as a
-        # fallback for age/private/login-gated videos.
-        candidates: list[tuple[str | None, bool, str]] = [(None, False, "anon")]
-        if cookies or use_browser:
-            candidates.append(cookie_candidate)
-        return candidates
+        # The normal pass always uses the cookie file first. Browser cookies
+        # are deliberately reserved for the explicit Firefox refresh fallback.
+        return [cookie_candidate]
 
     def _apply_browser_cookies(self, opts: dict, url: str, allow: bool = True) -> None:
         if not allow or not _is_youtube_url(url):
@@ -2060,10 +2060,22 @@ class VideoDownloaderMod(loader.Module):
             return f"{fmt_id}+bestaudio/best", ext
         return "best[ext=mp4]/bestvideo*+bestaudio/best", "mp4"
 
-    def _run_ytdlp_cli_sync(self, url: str, base_name: str, audio: bool) -> list[str] | str | None:
+    def _run_ytdlp_cli_sync(
+        self, url: str, base_name: str, audio: bool, browser_retry: bool = False
+    ) -> list[str] | str | None:
         cmd = self._ytdlp_cli_prefix()
         browser_cookies = self._yt_browser_cookies_value()
-        cookie_candidates = self._youtube_cookie_candidates(url)
+        if browser_retry:
+            sudo = self._find_executable("", ["sudo"])
+            if not sudo:
+                logger.warning("Browser-cookie retry unavailable: sudo not found")
+                return None
+            cmd = [sudo, "-u", FIREFOX_USER, *cmd]
+        cookie_candidates = (
+            [(None, True, "browser")]
+            if browser_retry
+            else self._youtube_cookie_candidates(url)
+        )
         saw_auth_required = False
 
         for cookies, use_browser_cookies, _cookie_suffix in cookie_candidates:
@@ -2072,7 +2084,7 @@ class VideoDownloaderMod(loader.Module):
                 common.append("--force-ipv4")
             if cookies:
                 common += ["--cookies", cookies]
-            if _is_youtube_url(url) and browser_cookies and use_browser_cookies:
+            if browser_cookies and use_browser_cookies:
                 common += ["--cookies-from-browser", browser_cookies]
             runtime = self._js_runtime or _preferred_js_runtime_arg()
             if runtime:
@@ -2153,6 +2165,55 @@ class VideoDownloaderMod(loader.Module):
         if not self.config.get("use_cli_ytdlp", True):
             return None
         return await utils.run_sync(self._run_ytdlp_cli_sync, url, base_name, audio)
+
+    def _refresh_firefox_cookies_sync(self, url: str) -> bool:
+        """Open the failed site's origin in Firefox and persist its profile cookies."""
+        firefox = self._find_executable("", ["firefox-esr", "firefox"])
+        sudo = self._find_executable("", ["sudo"])
+        if not firefox or not sudo:
+            logger.warning("Firefox cookie refresh unavailable: sudo/firefox-esr not found")
+            return False
+
+        parts = urlsplit(url)
+        site_url = urlunsplit((parts.scheme, parts.netloc, "/", "", ""))
+        command = [
+            sudo, "-u", FIREFOX_USER, firefox, "--headless", "--no-remote",
+            "--profile", FIREFOX_PROFILE, site_url,
+        ]
+        process = None
+        try:
+            process = subprocess.Popen(
+                command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                text=True, env=_subprocess_env_for_cookie_owner(),
+                start_new_session=True,
+            )
+            time.sleep(FIREFOX_WARMUP_SECONDS)
+            if process.poll() is not None and process.returncode != 0:
+                logger.warning("Firefox cookie refresh exited with code %s", process.returncode)
+                return False
+            return True
+        except Exception as e:
+            logger.warning("Could not refresh browser cookies for %s: %s", site_url, e)
+            return False
+        finally:
+            if process is not None and process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+
+    async def _dl_with_refreshed_browser(
+        self, url: str, base_name: str, audio: bool
+    ) -> list[str] | str | None:
+        """Refresh Firefox state, then make the one final browser-cookie attempt."""
+        refreshed = await utils.run_sync(self._refresh_firefox_cookies_sync, url)
+        if not refreshed:
+            return None
+        return await utils.run_sync(
+            self._run_ytdlp_cli_sync, url, base_name, audio, True
+        )
 
 
     def _pip_install_sync(self, packages: list[str], upgrade: bool = False) -> tuple[bool, str]:
@@ -3196,6 +3257,20 @@ class VideoDownloaderMod(loader.Module):
                 if direct:
                     result = [direct]
 
+            # Last download attempt: let the failed origin update the dedicated
+            # Firefox profile, stop the browser, and ask yt-dlp to read it.
+            if result is None:
+                browser_result = await self._dl_with_refreshed_browser(
+                    url, f"{base}_browser", audio
+                )
+                if browser_result == "TOO_LARGE":
+                    result = "TOO_LARGE"
+                elif browser_result and browser_result != "AUTH_REQUIRED":
+                    result = (
+                        browser_result if isinstance(browser_result, list)
+                        else [browser_result]
+                    )
+
             if result == "TOO_LARGE":
                 self._stats["err"] += 1
                 await status_msg.edit(self.strings("err_size_final"))
@@ -3275,6 +3350,7 @@ class VideoDownloaderMod(loader.Module):
                 + [f"{base}_{c}"   for c in yt_clients]
                 + [f"{base}_tk"]
                 + [f"{base}_cli"]
+                + [f"{base}_browser_cli"]
             )
             for b in all_bases:
                 _cleanup(b)
