@@ -1,7 +1,7 @@
 # meta developer: @RotKranz 
 # meta syntax: .mistral | .mistralimg | .mistralagent | .mistralagentadd
 
-__version__ = (4, 4, 0)
+__version__ = (4, 5, 0)
 
 import asyncio
 import base64
@@ -72,12 +72,6 @@ TOOL_WEB_SEARCH  = {"type": "web_search"}
 TOOL_CODE_INTERP = {"type": "code_interpreter"}
 TOOL_IMAGE_GEN   = {"type": "image_generation"}
 TOOL_WEB_PREMIUM = {"type": "web_search_premium"}
-
-_TRIGGER_WORDS = {
-    "uk": ["гей бот", "@rotkranzbot"],
-    "ru": ["@rotkranzbot"],
-    "en": ["@rotkranzbot"],
-}
 
 _STREAM_UPDATE_INTERVAL = 0.8
 _IMAGE_AGENT_INSTRUCTIONS = (
@@ -208,15 +202,28 @@ def _detect_lang(text: str) -> str:
         return "uk"
 
 
-def _is_addressed_to_bot(text: str, bot_name: str = "") -> bool:
-    tl = text.lower()
-    if bot_name and bot_name.lower() in tl:
+def _has_bot_mention(text: str, username: str = "") -> bool:
+    """Return whether *text* contains an explicit Telegram @mention."""
+    username = username.strip().lstrip("@").lower()
+    if not username:
+        return False
+    return bool(re.search(rf"(?<![\w@])@{re.escape(username)}(?!\w)", text.lower()))
+
+
+def _group_mode_matches(
+    mode: str,
+    text: str,
+    *,
+    username: str = "",
+    is_reply_to_us: bool = False,
+) -> bool:
+    """Apply one of the three documented auto-agent group modes."""
+    if mode == "all":
         return True
-    for words in _TRIGGER_WORDS.values():
-        for w in words:
-            if tl.startswith(w) or f" {w}" in tl or f"@{w}" in tl:
-                return True
-    return False
+    if mode == "mention":
+        return _has_bot_mention(text, username)
+    # ``addressed`` responds both to an explicit @username and to a reply.
+    return is_reply_to_us or _has_bot_mention(text, username)
 
 
 def _cosine_similarity(a: list, b: list) -> float:
@@ -576,6 +583,13 @@ class MistralModule(loader.Module):
         "autoagent_off":        "😴 <b>Авто-агент вимкнено</b> у чаті <code>{chat}</code>",
         "autoagent_list_empty": "<b>🤖 Авто-агент ніде не активний.</b>",
         "autoagent_list":       "<b>🤖 Активні авто-агент чати:</b>\n{chats}",
+        "group_mode": (
+            "<b>👥 Режим авто-агента в групах:</b> <code>{mode}</code>\n{description}"
+        ),
+        "group_mode_invalid": (
+            "<b>❌ Невідомий режим.</b> Використай <code>all</code>, "
+            "<code>addressed</code> або <code>mention</code>."
+        ),
         "agent_thoughts_unavailable": (
             "<b>❌ Інсайт доступний тільки коли у цьому чаті увімкнено авто-агент "
             "і підключено Mistral-агента.</b>"
@@ -658,8 +672,8 @@ class MistralModule(loader.Module):
             ),
             loader.ConfigValue(
                 "agent_group_mode", "addressed",
-                "Режим відповіді в групах: 'all' / 'addressed' / 'reply'",
-                validator=loader.validators.Choice(["all", "addressed", "reply"]),
+                "Групи: all=усі повідомлення; addressed=@згадка або відповідь; mention=тільки @згадка",
+                validator=loader.validators.Choice(["all", "addressed", "mention"]),
             ),
             loader.ConfigValue(
                 "agent_auto_lang", True,
@@ -774,7 +788,8 @@ class MistralModule(loader.Module):
         self._session = aiohttp.ClientSession()
         me = await client.get_me()
         self._me = me
-        self._bot_name = (me.first_name or me.username or "").lower()
+        # Group mentions use the Telegram username, not the display name.
+        self._bot_name = (me.username or "").lower()
         saved = self.db.get("MistralAI", "auto_chats", [])
         self._auto_chats = {int(c): True for c in saved}
         self._active_agent_id   = self.db.get("MistralAI", "active_agent_id",   "") or None
@@ -1626,24 +1641,22 @@ class MistralModule(loader.Module):
         # ── Фільтрація в групах ───────────────────────────────────────────
         if is_group:
             mode = self.config["agent_group_mode"]
-            if mode == "reply":
-                if not message.is_reply:
-                    return
-                rep = await message.get_reply_message()
-                if not rep or (self._me and rep.sender_id != self._me.id):
-                    return
-            elif mode == "addressed":
-                is_reply_to_us = False
-                if message.is_reply:
-                    try:
-                        rep = await message.get_reply_message()
-                        if rep and self._me and rep.sender_id == self._me.id:
-                            is_reply_to_us = True
-                    except Exception:
-                        pass
-                if not is_reply_to_us and not _is_addressed_to_bot(text, self._bot_name):
-                    return
-            # mode == "all": відповідаємо на все
+            is_reply_to_us = False
+            if message.is_reply:
+                try:
+                    rep = await message.get_reply_message()
+                    is_reply_to_us = bool(
+                        rep and self._me and rep.sender_id == self._me.id
+                    )
+                except Exception:
+                    pass
+            if not _group_mode_matches(
+                mode,
+                text,
+                username=self._bot_name,
+                is_reply_to_us=is_reply_to_us,
+            ):
+                return
 
         # ── Ім'я відправника ──────────────────────────────────────────────
         sender_id = message.sender_id
@@ -2156,6 +2169,29 @@ class MistralModule(loader.Module):
             self.strings["autoagent_list"].format(chats="\n".join(lines)),
         )
 
+    @loader.command(ru_doc="[all|addressed|mention] — Режим відповідей авто-агента в групах")
+    async def mistralmode(self, message):
+        """[all|addressed|mention] — Налаштувати відповіді авто-агента в групах"""
+        descriptions = {
+            "all": "Відповідає на кожне текстове повідомлення.",
+            "addressed": "Відповідає на @згадку або на відповідь на своє повідомлення.",
+            "mention": "Відповідає тільки на повідомлення з його @username.",
+        }
+        mode = utils.get_args_raw(message).strip().lower()
+        if mode:
+            if mode not in descriptions:
+                return await utils.answer(message, self.strings["group_mode_invalid"])
+            self.config["agent_group_mode"] = mode
+        else:
+            mode = self.config["agent_group_mode"]
+        await utils.answer(
+            message,
+            self.strings["group_mode"].format(
+                mode=mode,
+                description=descriptions[mode],
+            ),
+        )
+
     @loader.command(ru_doc="— Очистити пам'ять авто-агента у поточному чаті")
     async def mistralclear(self, message):
         """— Очистити пам'ять авто-агента"""
@@ -2427,7 +2463,7 @@ class MistralModule(loader.Module):
         )
         await utils.answer(
             message,
-            f"<b>🤖 MistralAI v4.3 — команди:</b>{active}{deps}\n\n"
+            f"<b>🤖 MistralAI v{'.'.join(map(str, __version__))} — команди:</b>{active}{deps}\n\n"
             "<b>💬 Чат</b>\n"
             "<code>.mistral &lt;питання&gt;</code> — Чат\n"
             "<code>.mistralask [питання]</code> — Чат з контекстом реплаю\n"
@@ -2446,6 +2482,7 @@ class MistralModule(loader.Module):
             "<b>👻 Авто-агент</b>\n"
             "<code>.mistralauto</code> — Увімк/вимк у чаті\n"
             "<code>.mistralautolist</code> — Активні чати\n"
+            "<code>.mistralmode [all|addressed|mention]</code> — Режим відповідей у групах\n"
             "<code>.mistralclear</code> — Очистити пам'ять\n"
             "<code>.mistralthoughts</code> — Думка агента + коротка історія\n"
             "<i>Ліміти авто-відповідей: 10/день і 80/місяць на групу або OP-користувача; винятки у .config</i>\n\n"
