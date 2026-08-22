@@ -1,4 +1,4 @@
-__version__ = (6, 9, 0)
+__version__ = (6, 9, 1)
 VERSION = ".".join(map(str, __version__))
 
 import os
@@ -22,7 +22,7 @@ from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 from collections import defaultdict
 
-from telethon.tl.types import InputMessagesFilterMusic
+from telethon.tl.types import DocumentAttributeVideo, InputMessagesFilterMusic
 from telethon.tl.functions.messages import CheckChatInviteRequest
 
 from .. import loader, utils
@@ -605,27 +605,91 @@ def _rotation_filter_from_stream(stream: dict) -> str | None:
         270: "transpose=cclock",
     }.get(rotation)
 
+
+def _telegram_video_attribute(path: str):
+    """Probe the downloaded file and describe its displayed frame to Telegram.
+
+    Telegram cannot always infer dimensions without the optional hachoir
+    package and then presents portrait/square files as a generic landscape
+    player.  ffprobe is already required by the video normalization pipeline,
+    so use the final file (not extractor metadata) as the source of truth.
+    """
+    if _file_type(path) != "video" or not shutil.which("ffprobe"):
+        return None
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_streams", "-show_format",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=20,
+        )
+        if probe.returncode != 0:
+            return None
+        data = json.loads(probe.stdout)
+        stream = next(
+            (item for item in data.get("streams", [])
+             if item.get("codec_type") == "video"),
+            None,
+        )
+        if not stream:
+            return None
+        width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
+        if not width or not height:
+            return None
+        # If orientation fixing is disabled, Telegram still needs the displayed
+        # dimensions rather than the encoded (pre-rotation) canvas dimensions.
+        if _rotation_filter_from_stream(stream) in {"transpose=clock", "transpose=cclock"}:
+            width, height = height, width
+        duration = float(
+            stream.get("duration") or data.get("format", {}).get("duration") or 0
+        )
+        return DocumentAttributeVideo(
+            duration=max(0, int(round(duration))),
+            w=width,
+            h=height,
+            supports_streaming=True,
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        logger.warning("Could not determine final video dimensions for %s: %s", path, error)
+        return None
+
 def _media_dimensions_from_info(info: dict | None) -> tuple[int | None, int | None]:
     """Return the most reliable width/height pair available in yt-dlp info."""
     if not info:
         return None, None
-    width = info.get("width")
-    height = info.get("height")
-    if width and height:
-        return int(width), int(height)
-
-    formats = [
-        f for f in (info.get("requested_formats") or info.get("formats") or [])
+    requested = [
+        f for f in (info.get("requested_formats") or [])
         if f and f.get("vcodec") not in (None, "none", "")
     ]
-    if not formats:
-        return None, None
-    # Prefer the selected/requested format; otherwise the biggest available
-    # video format gives a stable orientation signal for short-form platforms.
-    formats.sort(key=lambda f: (int(f.get("height") or 0), int(f.get("width") or 0)))
-    width = formats[-1].get("width")
-    height = formats[-1].get("height")
+    # After format selection, requested_formats describes the pixels that were
+    # actually downloaded.  Top-level dimensions may still describe the source
+    # post and can therefore hide a wrongly selected landscape rendition.
+    source = requested[0] if requested else info
+    width, height = source.get("width"), source.get("height")
+    if not (width and height):
+        formats = [
+            f for f in (info.get("formats") or [])
+            if f and f.get("vcodec") not in (None, "none", "")
+            and f.get("ext") not in ("mhtml", "images")
+        ]
+        if not formats:
+            return None, None
+        formats.sort(key=lambda f: int(f.get("width") or 0) * int(f.get("height") or 0))
+        width, height = formats[-1].get("width"), formats[-1].get("height")
     return (int(width), int(height)) if width and height else (None, None)
+
+
+def _media_shape(width: int | None, height: int | None) -> str | None:
+    """Classify media without treating square video as landscape.
+
+    A small tolerance accommodates encoders that pad a nominally square frame
+    by a few pixels for macroblock alignment.
+    """
+    if not width or not height:
+        return None
+    ratio = float(width) / float(height)
+    if 0.95 <= ratio <= 1.05:
+        return "square"
+    return "portrait" if ratio < 1 else "landscape"
 
 
 def _info_is_vertical(info: dict | None, fallback: bool = False) -> bool:
@@ -2094,7 +2158,15 @@ class VideoDownloaderMod(loader.Module):
         if audio:
             return "bestaudio/best", None
         formats = info.get("formats") or []
-        want_vertical = _info_is_vertical(info, _is_vertical_url(info.get("webpage_url") or info.get("original_url") or ""))
+        source_width, source_height = _media_dimensions_from_info(info)
+        source_shape = _media_shape(source_width, source_height)
+        if source_shape is None and _is_vertical_url(info.get("webpage_url") or info.get("original_url") or ""):
+            source_shape = "portrait"
+        source_ratio = (
+            float(source_width) / float(source_height)
+            if source_width and source_height else None
+        )
+        want_vertical = source_shape == "portrait"
 
         def _is_real_video(fmt: dict) -> bool:
             return (
@@ -2108,7 +2180,7 @@ class VideoDownloaderMod(loader.Module):
             width, height = fmt.get("width"), fmt.get("height")
             if not width or not height:
                 return True
-            return (height > width) if want_vertical else (width >= height)
+            return source_shape is None or _media_shape(int(width), int(height)) == source_shape
 
         video_formats = [fmt for fmt in formats if _is_real_video(fmt) and _orientation_matches(fmt)]
         if not video_formats:
@@ -2125,7 +2197,14 @@ class VideoDownloaderMod(loader.Module):
         def _rank(fmt: dict) -> tuple:
             codec = str(fmt.get("vcodec") or "")
             ios_codec = codec.startswith(("avc1", "h264"))
-            return (ios_codec, int(fmt.get("height") or 0), float(fmt.get("tbr") or 0))
+            width, height = int(fmt.get("width") or 0), int(fmt.get("height") or 0)
+            # Keep the native aspect ratio ahead of codec preference.  In
+            # particular, a square post must not lose to an H.264 16:9 preview.
+            aspect_score = (
+                -abs((float(width) / height) - source_ratio)
+                if source_ratio is not None and width and height else -10.0
+            )
+            return (aspect_score, ios_codec, height, float(fmt.get("tbr") or 0))
 
         video_formats.sort(key=_rank)
 
@@ -2837,11 +2916,13 @@ class VideoDownloaderMod(loader.Module):
     # ── send ──────────────────────────────────────────────────────────────────
 
     async def _send(self, message, path: str, caption: str, force_document: bool = False):
+        video_attribute = await utils.run_sync(_telegram_video_attribute, path)
         sent = await message.client.send_file(
             message.chat_id, path,
             reply_to=message.id, caption=caption,
             parse_mode="html",
             force_document=force_document,
+            attributes=[video_attribute] if video_attribute else None,
             part_size_kb=512,
         )
         ad = self.config["auto_delete"]
