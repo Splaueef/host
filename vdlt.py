@@ -1,4 +1,4 @@
-__version__ = (6, 9, 1)
+__version__ = (6, 10, 0)
 VERSION = ".".join(map(str, __version__))
 
 import os
@@ -907,7 +907,7 @@ class VideoDownloaderMod(loader.Module):
             "<b>.vdlset [параметр] [значення]:</b>\n"
             "cooldown, limit, size, auto_delete,\n"
             "retries, queue_max, notify_dm,\n"
-            "playlist, playlist_max, audio_format, workers, cli, any_url, ipv4"
+            "playlist, playlist_max, audio_format, workers, fragments, cli, any_url, ipv4"
         ),
     }
 
@@ -926,6 +926,7 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("retries",          3,     "Спроб зі зниженням якості"),
             loader.ConfigValue("queue_max",        5,     "Макс. черга"),
             loader.ConfigValue("queue_workers",    2,     "Паралельних завантажень (1-4)"),
+            loader.ConfigValue("fragment_workers", 8,     "Паралельних фрагментів одного відео (1-16)"),
             loader.ConfigValue("notify_dm",        False, "Сповіщення в ЛС?"),
             loader.ConfigValue("fix_orientation",  True,  "Авто-виправлення орієнтації відео?"),
             loader.ConfigValue("playlist_enabled", False, "Дозволити плейлисти?"),
@@ -1146,8 +1147,9 @@ class VideoDownloaderMod(loader.Module):
         return [{"key": "FFmpegExtractAudio", "preferredcodec": fmt, "preferredquality": quality}]
 
     def _fast_ytdlp_opts(self) -> dict:
+        fragments = self._fragment_workers_count()
         return {
-            "concurrent_fragment_downloads": 8,
+            "concurrent_fragment_downloads": fragments,
             "buffersize": 4 * 1024 * 1024,
             "http_chunk_size": 10 * 1024 * 1024,
             "socket_timeout": 20,
@@ -1155,6 +1157,13 @@ class VideoDownloaderMod(loader.Module):
             "fragment_retries": 5,
             "file_access_retries": 3,
         }
+
+    def _fragment_workers_count(self) -> int:
+        """Return a safe fragment concurrency shared by API and CLI downloads."""
+        try:
+            return max(1, min(16, int(self.config.get("fragment_workers", 8))))
+        except (TypeError, ValueError):
+            return 8
 
     def _format_chain(self, quality: str, vertical: bool = False) -> list[str]:
         q = quality.lower().replace("p", "")
@@ -2257,6 +2266,15 @@ class VideoDownloaderMod(loader.Module):
             if ffmpeg_location:
                 common += ["--ffmpeg-location", ffmpeg_location]
 
+            # These options also speed up the CLI path.  Previously only the
+            # in-process yt-dlp fallback downloaded HLS/DASH fragments in
+            # parallel, although CLI is the primary path for YouTube.
+            common += [
+                "--concurrent-fragments", str(self._fragment_workers_count()),
+                "--buffer-size", "4M",
+                "--http-chunk-size", "10M",
+            ]
+
             info_cmd = cmd + common + ["--no-playlist", "--dump-json", "--format-sort=resolution,ext,tbr", url]
             try:
                 info_proc = subprocess.run(info_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90, env=_subprocess_env_for_cookie_owner())
@@ -2286,10 +2304,12 @@ class VideoDownloaderMod(loader.Module):
             if audio:
                 dl_cmd += ["--format", self._tuitube_format_value(info, True)[0], "--extract-audio", "--audio-format", self.config.get("audio_format", "mp3")]
             else:
-                fmt, recode = self._tuitube_format_value(info, False)
+                fmt, _container = self._tuitube_format_value(info, False)
                 dl_cmd += ["--format", fmt]
-                if recode:
-                    dl_cmd += ["--recode-video", recode]
+                # Remux split streams instead of transcoding every non-MP4
+                # selection.  The final compatibility pass already probes the
+                # actual codecs and transcodes only when it is really needed.
+                dl_cmd += ["--merge-output-format", "mp4"]
             max_size = int(self.config.get("max_size", 0) or 0)
             if max_size > 0:
                 dl_cmd += ["--max-filesize", f"{max_size}M"]
@@ -2772,12 +2792,6 @@ class VideoDownloaderMod(loader.Module):
                     break
                 if result:
                     return [result]
-
-            cli_result = await self._dl_ytdlp_cli(url, base_name, audio)
-            if cli_result and cli_result != "AUTH_REQUIRED":
-                return cli_result if isinstance(cli_result, list) else [cli_result]
-            if cli_result == "AUTH_REQUIRED":
-                youtube_auth_failed = True
 
             # Independent transport: useful when every local yt-dlp client is
             # rejected by YouTube's bot/PO-token checks.
@@ -3785,6 +3799,7 @@ class VideoDownloaderMod(loader.Module):
                 "<b>Параметри:</b>\ncooldown, limit, size, auto_delete,\n"
                 "retries, queue_max, notify_dm,\n"
                 "workers (1-4 паралельних завантажень),\n"
+                "fragments (1-16 фрагментів одного відео),\n"
                 "fix_orientation, playlist, playlist_max,\n"
                 "audio_format (mp3/m4a/wav/opus/flac),\n"
                 "timeout (сек, таймаут завдання),\n"
@@ -3800,6 +3815,7 @@ class VideoDownloaderMod(loader.Module):
             "retries":         ("retries",           int,  "спроб"),
             "queue_max":       ("queue_max",         int,  "завдань"),
             "workers":         ("queue_workers",     int,  "воркерів"),
+            "fragments":       ("fragment_workers",  int,  "фрагментів"),
             "notify_dm":       ("notify_dm",         bool, ""),
             "fix_orientation": ("fix_orientation",   bool, ""),
             "playlist":        ("playlist_enabled",  bool, ""),
@@ -3841,7 +3857,10 @@ class VideoDownloaderMod(loader.Module):
         self.config[cfg_key] = val
         if key == "workers":
             self.config[cfg_key] = max(1, min(4, val))
+            val = self.config[cfg_key]
             self._start_queue_workers()
+        elif key == "fragments":
+            self.config[cfg_key] = max(1, min(16, val))
             val = self.config[cfg_key]
         if key == "queue_max" and self._queue is not None:
             if val < 1:

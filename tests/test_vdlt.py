@@ -94,6 +94,60 @@ class CookieManagerTests(unittest.TestCase):
 
 
 class VideoFormatTests(unittest.TestCase):
+    def test_fast_options_use_bounded_configured_fragment_concurrency(self):
+        module = object.__new__(vdlt.VideoDownloaderMod)
+        module.config = {"fragment_workers": 12}
+        self.assertEqual(module._fast_ytdlp_opts()["concurrent_fragment_downloads"], 12)
+        module.config["fragment_workers"] = 100
+        self.assertEqual(module._fast_ytdlp_opts()["concurrent_fragment_downloads"], 16)
+        module.config["fragment_workers"] = "invalid"
+        self.assertEqual(module._fast_ytdlp_opts()["concurrent_fragment_downloads"], 8)
+
+    def test_cli_parallelizes_fragments_without_forced_transcode(self):
+        module = object.__new__(vdlt.VideoDownloaderMod)
+        module.config = {
+            "fragment_workers": 6, "quality": "720", "max_size": 500,
+            "task_timeout": 60, "audio_format": "mp3", "force_ipv4": False,
+            "yt_browser_cookies": "", "cookies_file": "",
+            "ffmpeg_path": "", "yt_dlp_path": "",
+        }
+        module._js_runtime = None
+        module._ytdlp_cli_prefix = lambda: ["yt-dlp"]
+        module._youtube_cookie_candidates = lambda url: [(None, False, "none")]
+        module._ffmpeg_location = lambda: None
+        module._yt_browser_cookies_value = lambda: ""
+        info = {
+            "id": "clip", "width": 1280, "height": 720,
+            "formats": [{
+                "format_id": "v1", "width": 1280, "height": 720,
+                "vcodec": "avc1", "acodec": "aac", "ext": "mp4",
+            }],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "clip.mp4")
+            pathlib.Path(output).write_bytes(b"video")
+            calls = []
+
+            def fake_run(command, **kwargs):
+                calls.append(command)
+                if "--dump-json" in command:
+                    return types.SimpleNamespace(returncode=0, stdout=__import__("json").dumps(info), stderr="")
+                return types.SimpleNamespace(returncode=0, stdout=output + "\n", stderr="")
+
+            original_run = vdlt.subprocess.run
+            try:
+                vdlt.subprocess.run = fake_run
+                result = module._run_ytdlp_cli_sync("https://youtube.com/watch?v=clip", os.path.join(directory, "base"), False)
+            finally:
+                vdlt.subprocess.run = original_run
+
+        self.assertEqual(result, [output])
+        download_command = calls[1]
+        self.assertIn("--concurrent-fragments", download_command)
+        self.assertEqual(download_command[download_command.index("--concurrent-fragments") + 1], "6")
+        self.assertIn("--merge-output-format", download_command)
+        self.assertNotIn("--recode-video", download_command)
+
     def test_media_shape_keeps_square_separate_from_landscape(self):
         self.assertEqual(vdlt._media_shape(1080, 1080), "square")
         self.assertEqual(vdlt._media_shape(1080, 1920), "portrait")
