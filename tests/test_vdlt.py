@@ -33,6 +33,13 @@ def _load_module():
     telethon_types = types.ModuleType("telethon.tl.types")
     telethon_messages = types.ModuleType("telethon.tl.functions.messages")
     telethon_types.InputMessagesFilterMusic = object
+    class DocumentAttributeVideo:
+        def __init__(self, duration, w, h, supports_streaming=False):
+            self.duration = duration
+            self.w = w
+            self.h = h
+            self.supports_streaming = supports_streaming
+    telethon_types.DocumentAttributeVideo = DocumentAttributeVideo
     telethon_messages.CheckChatInviteRequest = object
     sys.modules.update({
         "testhost": package,
@@ -84,6 +91,69 @@ class CookieManagerTests(unittest.TestCase):
     def test_help_version_has_single_source_of_truth(self):
         self.assertEqual(vdlt.VERSION, ".".join(map(str, vdlt.__version__)))
         self.assertIn(f"VideoDownloader v{vdlt.VERSION}", vdlt.VideoDownloaderMod.strings["help_text"])
+
+
+class VideoFormatTests(unittest.TestCase):
+    def test_media_shape_keeps_square_separate_from_landscape(self):
+        self.assertEqual(vdlt._media_shape(1080, 1080), "square")
+        self.assertEqual(vdlt._media_shape(1080, 1920), "portrait")
+        self.assertEqual(vdlt._media_shape(1920, 1080), "landscape")
+        self.assertEqual(vdlt._media_shape(1088, 1080), "square")
+
+    def test_cli_selector_preserves_square_source_aspect(self):
+        module = object.__new__(vdlt.VideoDownloaderMod)
+        module.config = {"quality": "best"}
+        info = {
+            "width": 1080,
+            "height": 1080,
+            "formats": [
+                {"format_id": "landscape", "width": 1920, "height": 1080,
+                 "vcodec": "avc1", "acodec": "aac", "ext": "mp4", "tbr": 5000},
+                {"format_id": "square", "width": 1080, "height": 1080,
+                 "vcodec": "vp9", "acodec": "opus", "ext": "webm", "tbr": 2500},
+            ],
+        }
+        selected, _ = module._tuitube_format_value(info, False)
+        self.assertEqual(selected, "square")
+
+    def test_actual_requested_dimensions_take_priority(self):
+        info = {
+            "width": 1080,
+            "height": 1080,
+            "requested_formats": [
+                {"width": 1920, "height": 1080, "vcodec": "avc1"},
+                {"vcodec": "none", "acodec": "aac"},
+            ],
+        }
+        self.assertEqual(vdlt._media_dimensions_from_info(info), (1920, 1080))
+
+    def test_final_file_dimensions_are_used_for_telegram(self):
+        stream = {
+            "codec_type": "video", "width": 1920, "height": 1080,
+            "duration": "4.6",
+            "side_data_list": [
+                {"side_data_type": "Display Matrix", "rotation": -90},
+            ],
+        }
+        completed = types.SimpleNamespace(
+            returncode=0,
+            stdout=__import__("json").dumps({"streams": [stream], "format": {}}),
+        )
+        original_which = vdlt.shutil.which
+        original_run = vdlt.subprocess.run
+        original_file_type = vdlt._file_type
+        try:
+            vdlt.shutil.which = lambda executable: "/usr/bin/ffprobe"
+            vdlt.subprocess.run = lambda *args, **kwargs: completed
+            vdlt._file_type = lambda path: "video"
+            attribute = vdlt._telegram_video_attribute("downloaded.mp4")
+        finally:
+            vdlt.shutil.which = original_which
+            vdlt.subprocess.run = original_run
+            vdlt._file_type = original_file_type
+        self.assertEqual((attribute.w, attribute.h), (1080, 1920))
+        self.assertEqual(attribute.duration, 5)
+        self.assertTrue(attribute.supports_streaming)
 
 
 if __name__ == "__main__":
