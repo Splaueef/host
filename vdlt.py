@@ -4000,7 +4000,7 @@ class VideoDownloaderMod(loader.Module):
         runtime = _detect_js_runtime()
         cookie_domains = _cookie_domains_status(manager.cookies_file)
         firefox = executable("firefox-esr") or executable("firefox")
-        ytdlp_cli = self._find_ytdlp_command()
+        ytdlp_cli = self._ytdlp_cli_prefix()
         fallbacks = {
             "gallery-dl": importlib.util.find_spec("gallery_dl") is not None,
             "instaloader": importlib.util.find_spec("instaloader") is not None,

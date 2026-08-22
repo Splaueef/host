@@ -9,6 +9,7 @@ import sys
 _REPO = pathlib.Path(__file__).parents[1]
 sys.path[:] = [entry for entry in sys.path if entry not in ("", str(_REPO))]
 
+import asyncio
 import tempfile
 import types
 import unittest
@@ -94,6 +95,41 @@ class CookieManagerTests(unittest.TestCase):
 
 
 class VideoFormatTests(unittest.TestCase):
+    def test_diagnostics_use_the_supported_ytdlp_cli_prefix(self):
+        module = object.__new__(vdlt.VideoDownloaderMod)
+        module.config = {"cobalt_api_url": "", "ffmpeg_path": ""}
+        module._ytdlp_cli_prefix = lambda: ["python", "-m", "yt_dlp"]
+        module._find_executable = lambda configured, names: None
+        manager = types.SimpleNamespace(
+            cookies_file="/missing/cookies.txt",
+            firefox_profile="",
+            browser_user="",
+            firefox_profile_valid=lambda: False,
+        )
+        module._cookie_manager = lambda: manager
+        answers = []
+        original_answer = getattr(vdlt.utils, "answer", None)
+        original_escape_html = getattr(vdlt.utils, "escape_html", None)
+
+        async def answer(message, text):
+            answers.append(text)
+
+        try:
+            vdlt.utils.answer = answer
+            vdlt.utils.escape_html = lambda value: value
+            asyncio.run(module.vdldiag(types.SimpleNamespace()))
+        finally:
+            if original_answer is None:
+                del vdlt.utils.answer
+            else:
+                vdlt.utils.answer = original_answer
+            if original_escape_html is None:
+                del vdlt.utils.escape_html
+            else:
+                vdlt.utils.escape_html = original_escape_html
+
+        self.assertIn("CLI: ✅ <code>python -m yt_dlp</code>", answers[0])
+
     def test_fast_options_use_bounded_configured_fragment_concurrency(self):
         module = object.__new__(vdlt.VideoDownloaderMod)
         module.config = {"fragment_workers": 12}
