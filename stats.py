@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 1.1.2
+# meta version: 1.1.3
 # meta description: 📊 Статистика вашої активності в Telegram — повідомлення, чати, піки по годинах.
 
 import datetime
@@ -338,9 +338,17 @@ class DailyStatMod(loader.Module):
             user_id = getattr(entity, "id", None)
             if user_id is None:
                 continue
+            # ``entity`` can be a partially populated ``User`` (for example for
+            # deleted accounts) whose username/access hash is ``None``.  Asking
+            # Telethon to resolve such an entity again can eventually call
+            # ``.encode()`` on that missing value.  Dialogs already expose the
+            # ready-to-use input peer, so prefer it for history requests.
+            history_peer = getattr(dialog, "input_entity", None) or entity
             messages = []
             has_outgoing = False
-            async for item in self._client.iter_messages(entity, offset_date=now):
+            async for item in self._client.iter_messages(
+                history_peer, offset_date=now
+            ):
                 stamp = item.date
                 if stamp.tzinfo is None:
                     stamp = stamp.replace(tzinfo=datetime.timezone.utc)

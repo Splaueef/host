@@ -188,6 +188,29 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(day["users"]["1"]["received_hours"][10], 1)
         self.assertNotIn("2", day["users"])
 
+    async def test_scan_uses_dialog_input_entity_for_history(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        partial_user = types.SimpleNamespace(id=1, first_name=None, username=None)
+        input_peer = types.SimpleNamespace(id=1, access_hash=123)
+        dialog = types.SimpleNamespace(
+            is_user=True, entity=partial_user, input_entity=input_peer
+        )
+        outgoing = _Message(outgoing=True, date=now.replace(hour=9))
+
+        class InputPeerOnlyClient(_HistoryClient):
+            def iter_messages(client_self, entity, **kwargs):
+                if entity is not input_peer:
+                    raise AttributeError("'NoneType' object has no attribute 'encode'")
+                return _aiter([outgoing])
+
+        self.module._client = InputPeerOnlyClient([dialog], {})
+
+        day, scanned = await self.module._scan_today()
+
+        self.assertEqual(scanned, 1)
+        self.assertEqual(day["sent"], 1)
+        self.assertEqual(day["chats"]["1"]["name"], "Unknown")
+
     def test_individual_and_all_user_peak_formats(self):
         day = self.module._get_day(self.module._today_key())
         self.module._add_sent(day, 7, "<Alice>", False, 8)
