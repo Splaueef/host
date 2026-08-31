@@ -18,11 +18,13 @@ class DailyStatMod(loader.Module):
         "stat_header": "📊 <b>DailyStat</b> — {period}\n\n",
         "stat_body": (
             "✉️ Надіслано: <b>{sent}</b>\n"
+            "📥 Отримано в особистих: <b>{received}</b>\n"
             "📎 Медіа: <b>{media}</b>\n"
             "💬 Активних чатів: <b>{chats}</b>\n"
             "⏰ Пік активності: <b>{peak}</b>\n"
         ),
         "top_header": "\n🏆 <b>Топ чати:</b>\n",
+        "inbox_header": "\n👤 <b>Хто писав мені:</b>\n",
         "peak_header": "\n📈 <b>Активність по годинах:</b>\n",
     }
 
@@ -54,15 +56,16 @@ class DailyStatMod(loader.Module):
 
     def _get_day(self, key: str) -> dict:
         stats = self.get("stats", {})
-        return stats.get(
-            key,
-            {
-                "sent": 0,
-                "media": 0,
-                "chats": {},
-                "hours": [0] * 24,
-            },
-        )
+        day = stats.get(key, {})
+
+        # setdefault keeps data written by older DailyStat versions compatible.
+        day.setdefault("sent", 0)
+        day.setdefault("received", 0)
+        day.setdefault("media", 0)
+        day.setdefault("chats", {})
+        day.setdefault("senders", {})
+        day.setdefault("hours", [0] * 24)
+        return day
 
     def _save_day(self, key: str, data: dict):
         stats = self.get("stats", {})
@@ -88,6 +91,20 @@ class DailyStatMod(loader.Module):
 
         self._save_day(key, day)
 
+    def _record_received(self, sender_id: int, sender_name: str):
+        """Record an incoming private message and its human/bot sender."""
+        key = self._today_key()
+        day = self._get_day(key)
+        sender_key = str(sender_id)
+
+        day["received"] += 1
+        if sender_key not in day["senders"]:
+            day["senders"][sender_key] = {"name": sender_name, "count": 0}
+        day["senders"][sender_key]["name"] = sender_name
+        day["senders"][sender_key]["count"] += 1
+
+        self._save_day(key, day)
+
     # ── Event listeners ───────────────────────────────────────────────────
 
     async def watcher(self, message):
@@ -95,8 +112,26 @@ class DailyStatMod(loader.Module):
         if not hasattr(message, "out") or not hasattr(message, "chat_id"):
             return
 
-        # Рахуємо ТІЛЬКИ надіслані тобою повідомлення
+        # Вхідні рахуємо лише в особистих діалогах. Таким чином повідомлення
+        # каналів і груп не потрапляють до статистики, а користувачі й боти — так.
         if not message.out:
+            if not getattr(message, "is_private", False):
+                return
+
+            try:
+                sender = await message.get_sender()
+                sender_id = getattr(sender, "id", None)
+                if sender_id is None:
+                    return
+                sender_name = (
+                    getattr(sender, "first_name", None)
+                    or getattr(sender, "title", None)
+                    or "Unknown"
+                )
+            except Exception:
+                return
+
+            self._record_received(sender_id, sender_name)
             return
 
         # Ігноруємо команди юзербота
@@ -123,12 +158,13 @@ class DailyStatMod(loader.Module):
 
     def _merge_days(self, keys: list) -> dict:
         merged = {
-            "sent": 0, "media": 0,
-            "chats": {}, "hours": [0] * 24,
+            "sent": 0, "received": 0, "media": 0,
+            "chats": {}, "senders": {}, "hours": [0] * 24,
         }
         for key in keys:
             day = self._get_day(key)
             merged["sent"] += day["sent"]
+            merged["received"] += day["received"]
             merged["media"] += day["media"]
             for h in range(24):
                 merged["hours"][h] += day["hours"][h]
@@ -136,6 +172,11 @@ class DailyStatMod(loader.Module):
                 if cid not in merged["chats"]:
                     merged["chats"][cid] = {"name": info["name"], "count": 0}
                 merged["chats"][cid]["count"] += info["count"]
+            for sender_id, info in day["senders"].items():
+                if sender_id not in merged["senders"]:
+                    merged["senders"][sender_id] = {"name": info["name"], "count": 0}
+                merged["senders"][sender_id]["name"] = info["name"]
+                merged["senders"][sender_id]["count"] += info["count"]
         return merged
 
     def _peak_hour(self, hours: list) -> str:
@@ -158,10 +199,26 @@ class DailyStatMod(loader.Module):
         text = self.strings["stat_header"].format(period=period)
         text += self.strings["stat_body"].format(
             sent=data["sent"],
+            received=data["received"],
             media=data["media"],
             chats=total_chats,
             peak=peak,
         )
+        return text
+
+    def _format_senders(self, data: dict, n: int) -> str:
+        top = sorted(
+            data["senders"].values(), key=lambda item: item["count"], reverse=True
+        )[:n]
+        if not top:
+            return ""
+
+        max_count = top[0]["count"]
+        text = self.strings["inbox_header"]
+        for index, sender in enumerate(top, 1):
+            name = utils.escape_html(str(sender["name"]))
+            bar = self._bar(sender["count"], max_count)
+            text += f"{index}. {name}  {bar}  <b>{sender['count']}</b>\n"
         return text
 
     def _format_top(self, data: dict, n: int) -> str:
@@ -208,19 +265,21 @@ class DailyStatMod(loader.Module):
 
     async def _ds_today(self, message):
         data = self._get_day(self._today_key())
-        if data["sent"] == 0:
+        if data["sent"] == 0 and data["received"] == 0:
             return await utils.answer(message, self.strings["no_data"])
 
         text = self._format_stat(data, "сьогодні")
+        text += self._format_senders(data, self.config["top_count"])
         text += self._format_top(data, self.config["top_count"])
         await utils.answer(message, text)
 
     async def _ds_week(self, message):
         data = self._merge_days(self._week_keys())
-        if data["sent"] == 0:
+        if data["sent"] == 0 and data["received"] == 0:
             return await utils.answer(message, self.strings["no_data"])
 
         text = self._format_stat(data, "останні 7 днів")
+        text += self._format_senders(data, self.config["top_count"])
         text += self._format_top(data, self.config["top_count"])
         await utils.answer(message, text)
 
