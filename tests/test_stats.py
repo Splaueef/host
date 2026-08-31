@@ -39,6 +39,8 @@ def _load_module():
     utils.escape_html = lambda value: (
         value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     )
+    utils.get_args_raw = lambda message: ""
+    utils.answer = mock.AsyncMock()
     package.loader = loader
     package.utils = utils
     sys.modules.update(
@@ -196,6 +198,35 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("&lt;Alice&gt;", rendered)
         self.assertIn("08:00", rendered)
         self.assertIn("21:00", rendered)
+
+    async def test_scan_updates_message_returned_by_progress_answer(self):
+        original = object()
+        status = object()
+        stats.utils.answer.reset_mock()
+        stats.utils.answer.side_effect = [status, None]
+        self.module._scan_today = mock.AsyncMock(
+            return_value=(self.module._get_day("__empty__"), 0)
+        )
+
+        await self.module._ds_scan(original)
+
+        self.assertEqual(stats.utils.answer.await_args_list[0].args[0], original)
+        self.assertEqual(stats.utils.answer.await_args_list[1].args[0], status)
+
+    async def test_scan_displays_escaped_error_on_returned_message(self):
+        original = object()
+        status = object()
+        stats.utils.answer.reset_mock()
+        stats.utils.answer.side_effect = [status, None]
+        self.module._scan_today = mock.AsyncMock(
+            side_effect=RuntimeError("bad <dialog>")
+        )
+
+        await self.module._ds_scan(original)
+
+        target, text = stats.utils.answer.await_args_list[1].args
+        self.assertIs(target, status)
+        self.assertIn("bad &lt;dialog&gt;", text)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,14 @@
 # meta developer: @Huai_Baike
-# meta version: 1.1.1
+# meta version: 1.1.2
 # meta description: 📊 Статистика вашої активності в Telegram — повідомлення, чати, піки по годинах.
 
 import datetime
+import logging
 
 from .. import loader, utils
+
+
+logger = logging.getLogger(__name__)
 
 
 @loader.tds
@@ -31,6 +35,7 @@ class DailyStatMod(loader.Module):
             "Перевірено особистих діалогів: <b>{chats}</b>"
         ),
         "scan_progress": "⏳ <b>Аналізую особисті діалоги за сьогодні…</b>",
+        "scan_failed": "❌ <b>Не вдалося відновити статистику:</b> <code>{}</code>",
         "user_not_found": "🔎 <b>Користувача не знайдено у статистиці за сьогодні.</b>",
         "users_peak_header": "📊 <b>DailyStat</b> — піки співрозмовників сьогодні\n\n",
     }
@@ -470,13 +475,25 @@ class DailyStatMod(loader.Module):
         await utils.answer(message, text)
 
     async def _ds_scan(self, message):
-        await utils.answer(message, self.strings["scan_progress"])
-        data, chats = await self._scan_today()
+        # ``utils.answer`` may replace the original command message (rather than
+        # edit it in place).  Keep the returned message so the final update does
+        # not target a deleted/stale message and surface Hikka's generic
+        # "Call .ds scan failed" notification.
+        status = await utils.answer(message, self.strings["scan_progress"])
+        try:
+            data, chats = await self._scan_today()
+        except Exception as error:
+            logger.exception("DailyStat history scan failed")
+            error_text = utils.escape_html(str(error) or type(error).__name__)
+            return await utils.answer(
+                status or message,
+                self.strings["scan_failed"].format(error_text[:500]),
+            )
         text = self.strings["scan_done"].format(chats=chats) + "\n\n"
         text += self._format_stat(data, "сьогодні")
         text += self._format_senders(data, self.config["top_count"])
         text += self._format_top(data, self.config["top_count"])
-        await utils.answer(message, text)
+        await utils.answer(status or message, text)
 
     async def _ds_reset(self, message):
         self.set("stats", {})
