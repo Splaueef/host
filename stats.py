@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 1.1.0
+# meta version: 1.1.1
 # meta description: 📊 Статистика вашої активності в Telegram — повідомлення, чати, піки по годинах.
 
 import datetime
