@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 1.1.3
+# meta version: 1.2.0
 # meta description: 📊 Статистика вашої активності в Telegram — повідомлення, чати, піки по годинах.
 
 import datetime
@@ -79,6 +79,17 @@ class DailyStatMod(loader.Module):
         day.setdefault("senders", {})
         day.setdefault("hours", [0] * 24)
         day.setdefault("users", {})
+        # Older versions used the dictionary key as the only user identifier
+        # and did not persist usernames.  Normalize those records lazily so
+        # commands can safely work with both old and new data.
+        for user_id, user in day["users"].items():
+            user.setdefault("id", self._coerce_user_id(user_id))
+            user.setdefault("username", None)
+            user.setdefault("name", "Unknown")
+            user.setdefault("sent", 0)
+            user.setdefault("received", 0)
+            user.setdefault("sent_hours", [0] * 24)
+            user.setdefault("received_hours", [0] * 24)
         return day
 
     def _save_day(self, key: str, data: dict):
@@ -86,18 +97,34 @@ class DailyStatMod(loader.Module):
         stats[key] = data
         self.set("stats", stats)
 
-    def _ensure_user(self, day: dict, user_id: int, name: str) -> dict:
+    @staticmethod
+    def _coerce_user_id(user_id):
+        try:
+            return int(user_id)
+        except (TypeError, ValueError):
+            return user_id
+
+    def _ensure_user(self, day: dict, user_id: int, name: str,
+                     username: str = None) -> dict:
         key = str(user_id)
         if key not in day["users"]:
             day["users"][key] = {
+                "id": self._coerce_user_id(user_id),
+                "username": username,
                 "name": name, "sent": 0, "received": 0,
                 "sent_hours": [0] * 24, "received_hours": [0] * 24,
             }
-        day["users"][key]["name"] = name
-        return day["users"][key]
+        user = day["users"][key]
+        user["id"] = self._coerce_user_id(user_id)
+        user["name"] = name
+        if username:
+            user["username"] = username.lstrip("@")
+        else:
+            user.setdefault("username", None)
+        return user
 
     def _record_message(self, chat_id: int, chat_name: str, has_media: bool,
-                        hour: int = None):
+                        hour: int = None, username: str = None):
         key = self._today_key()
         day = self._get_day(key)
         hour = datetime.datetime.now().hour if hour is None else hour
@@ -111,15 +138,20 @@ class DailyStatMod(loader.Module):
 
         chats = day["chats"]
         if str(chat_id) not in chats:
-            chats[str(chat_id)] = {"name": chat_name, "count": 0}
+            chats[str(chat_id)] = {
+                "id": self._coerce_user_id(chat_id), "username": username,
+                "name": chat_name, "count": 0,
+            }
+        chats[str(chat_id)]["username"] = username or chats[str(chat_id)].get("username")
         chats[str(chat_id)]["count"] += 1
-        user = self._ensure_user(day, chat_id, chat_name)
+        user = self._ensure_user(day, chat_id, chat_name, username)
         user["sent"] += 1
         user["sent_hours"][hour] += 1
 
         self._save_day(key, day)
 
-    def _record_received(self, sender_id: int, sender_name: str, hour: int = None):
+    def _record_received(self, sender_id: int, sender_name: str, hour: int = None,
+                         username: str = None):
         """Record an incoming private message and its human/bot sender."""
         key = self._today_key()
         day = self._get_day(key)
@@ -128,10 +160,16 @@ class DailyStatMod(loader.Module):
 
         day["received"] += 1
         if sender_key not in day["senders"]:
-            day["senders"][sender_key] = {"name": sender_name, "count": 0}
+            day["senders"][sender_key] = {
+                "id": self._coerce_user_id(sender_id), "username": username,
+                "name": sender_name, "count": 0,
+            }
         day["senders"][sender_key]["name"] = sender_name
+        day["senders"][sender_key]["username"] = (
+            username or day["senders"][sender_key].get("username")
+        )
         day["senders"][sender_key]["count"] += 1
-        user = self._ensure_user(day, sender_id, sender_name)
+        user = self._ensure_user(day, sender_id, sender_name, username)
         user["received"] += 1
         user["received_hours"][hour] += 1
 
@@ -163,7 +201,9 @@ class DailyStatMod(loader.Module):
             except Exception:
                 return
 
-            self._record_received(sender_id, sender_name)
+            self._record_received(
+                sender_id, sender_name, username=getattr(sender, "username", None)
+            )
             return
 
         # Ігноруємо команди юзербота
@@ -184,11 +224,13 @@ class DailyStatMod(loader.Module):
             )
         except Exception:
             chat_name = "Unknown"
+            chat = None
 
         self._record_message(
             message.chat_id,
             chat_name,
             has_media=bool(message.media),
+            username=getattr(chat, "username", None),
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────
@@ -217,11 +259,13 @@ class DailyStatMod(loader.Module):
             for user_id, info in day["users"].items():
                 if user_id not in merged["users"]:
                     merged["users"][user_id] = {
+                        "id": info["id"], "username": info["username"],
                         "name": info["name"], "sent": 0, "received": 0,
                         "sent_hours": [0] * 24, "received_hours": [0] * 24,
                     }
                 target = merged["users"][user_id]
                 target["name"] = info["name"]
+                target["username"] = info["username"] or target["username"]
                 target["sent"] += info["sent"]
                 target["received"] += info["received"]
                 for h in range(24):
@@ -320,6 +364,12 @@ class DailyStatMod(loader.Module):
             return data["users"][query]
         matches = [
             user for user in data["users"].values()
+            if query == str(user.get("username") or "").casefold()
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        matches = [
+            user for user in data["users"].values()
             if query in str(user["name"]).casefold()
         ]
         return matches[0] if len(matches) == 1 else None
@@ -371,11 +421,14 @@ class DailyStatMod(loader.Module):
                 or getattr(entity, "title", None)
                 or "Unknown"
             )
+            username = getattr(entity, "username", None)
             for item, hour in messages:
                 if item.out:
-                    self._add_sent(rebuilt, user_id, name, bool(item.media), hour)
+                    self._add_sent(
+                        rebuilt, user_id, name, bool(item.media), hour, username
+                    )
                 else:
-                    self._add_received(rebuilt, user_id, name, hour)
+                    self._add_received(rebuilt, user_id, name, hour, username)
 
         stats = self.get("stats", {})
         stats[self._today_key()] = rebuilt
@@ -383,21 +436,31 @@ class DailyStatMod(loader.Module):
         self.set("stats", stats)
         return rebuilt, scanned
 
-    def _add_sent(self, day, user_id, name, has_media, hour):
+    def _add_sent(self, day, user_id, name, has_media, hour, username=None):
         day["sent"] += 1
         day["media"] += int(has_media)
         day["hours"][hour] += 1
-        chat = day["chats"].setdefault(str(user_id), {"name": name, "count": 0})
+        chat = day["chats"].setdefault(
+            str(user_id),
+            {"id": self._coerce_user_id(user_id), "username": username,
+             "name": name, "count": 0},
+        )
+        chat["username"] = username or chat.get("username")
         chat["count"] += 1
-        user = self._ensure_user(day, user_id, name)
+        user = self._ensure_user(day, user_id, name, username)
         user["sent"] += 1
         user["sent_hours"][hour] += 1
 
-    def _add_received(self, day, user_id, name, hour):
+    def _add_received(self, day, user_id, name, hour, username=None):
         day["received"] += 1
-        sender = day["senders"].setdefault(str(user_id), {"name": name, "count": 0})
+        sender = day["senders"].setdefault(
+            str(user_id),
+            {"id": self._coerce_user_id(user_id), "username": username,
+             "name": name, "count": 0},
+        )
+        sender["username"] = username or sender.get("username")
         sender["count"] += 1
-        user = self._ensure_user(day, user_id, name)
+        user = self._ensure_user(day, user_id, name, username)
         user["received"] += 1
         user["received_hours"][hour] += 1
 

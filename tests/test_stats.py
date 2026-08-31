@@ -104,7 +104,7 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.module._init_storage()
 
     async def test_private_user_and_bot_messages_are_counted_by_sender(self):
-        alice = types.SimpleNamespace(id=1, first_name="Alice")
+        alice = types.SimpleNamespace(id=1, first_name="Alice", username="alice")
         bot = types.SimpleNamespace(id=2, first_name="Helper Bot", bot=True)
 
         await self.module.watcher(_Message(private=True, sender=alice))
@@ -115,6 +115,8 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(day["received"], 3)
         self.assertEqual(day["senders"]["1"]["count"], 2)
         self.assertEqual(day["senders"]["2"]["count"], 1)
+        self.assertEqual(day["users"]["1"]["id"], 1)
+        self.assertEqual(day["users"]["1"]["username"], "alice")
 
     async def test_group_and_channel_messages_are_ignored(self):
         sender = types.SimpleNamespace(id=1, first_name="Alice")
@@ -123,6 +125,7 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         day = self.module._get_day(self.module._today_key())
         self.assertEqual(day["received"], 0)
         self.assertEqual(day["senders"], {})
+        self.assertEqual(day["users"], {})
 
         await self.module.watcher(
             _Message(outgoing=True, private=False, sender=sender)
@@ -158,9 +161,15 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("&lt;Alice&gt;", rendered)
         self.assertNotIn("<Alice>", rendered)
 
+        day["users"]["7"] = {"name": "Alice"}
+        migrated = self.module._get_day(key)["users"]["7"]
+        self.assertEqual(migrated["id"], 7)
+        self.assertIsNone(migrated["username"])
+        self.assertEqual(len(migrated["sent_hours"]), 24)
+
     async def test_scan_rebuilds_today_from_private_dialogs_with_outgoing(self):
         now = datetime.datetime.now(datetime.timezone.utc)
-        alice = types.SimpleNamespace(id=1, first_name="Alice")
+        alice = types.SimpleNamespace(id=1, first_name="Alice", username="alice_user")
         bob = types.SimpleNamespace(id=2, first_name="Bob")
         group = types.SimpleNamespace(id=3, title="Group")
         dialogs = [
@@ -186,6 +195,9 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((day["sent"], day["received"], day["media"]), (1, 1, 1))
         self.assertEqual(day["users"]["1"]["sent_hours"][9], 1)
         self.assertEqual(day["users"]["1"]["received_hours"][10], 1)
+        self.assertEqual(day["users"]["1"]["id"], 1)
+        self.assertEqual(day["users"]["1"]["username"], "alice_user")
+        self.assertIs(self.module._find_user(day, "@alice_user"), day["users"]["1"])
         self.assertNotIn("2", day["users"])
 
     async def test_scan_uses_dialog_input_entity_for_history(self):
