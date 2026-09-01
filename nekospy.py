@@ -1,4 +1,4 @@
-__version__ = (1, 1, 0)
+__version__ = (1, 2, 0)
 
 # ©️ Dan Gazizullin, 2021-2022
 # This file is a part of Hikka Userbot
@@ -15,8 +15,10 @@ __version__ = (1, 1, 0)
 import contextlib
 import io
 import logging
+import re
 import time
 import typing
+from pathlib import Path
 
 from telethon.tl.types import (
     DocumentAttributeFilename,
@@ -41,6 +43,7 @@ class NekoSpy(loader.Module):
     rei = "<emoji document_id=5409143295039252230>👩‍🎤</emoji>"
     groups = "<emoji document_id=6037355667365300960>👥</emoji>"
     pm = "<emoji document_id=6048540195995782913>👤</emoji>"
+    backup_root_name = "NekoSpyBSP"
 
     strings = {
     "name": "NekoSpy",
@@ -729,6 +732,40 @@ class NekoSpy(loader.Module):
         self._next = 0
         self._threshold = 10
         self._flood_protect_sample = 60
+        self._backup_root = Path.cwd() / self.backup_root_name
+
+    def _prepare_backup_directories(self):
+        """Create the persistent local storage used for ephemeral media."""
+        self._backup_dirs = {
+            "sent": self._backup_root / "sent",
+            "received": self._backup_root / "received",
+        }
+        for directory in self._backup_dirs.values():
+            directory.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _safe_filename(filename: str) -> str:
+        filename = re.sub(r"[^\w. -]", "_", Path(filename).name, flags=re.UNICODE)
+        return filename.strip(". ") or "media.bin"
+
+    def _backup_ephemeral_media(self, message: Message, media: io.BytesIO):
+        """Keep a uniquely named local copy without consuming the upload stream."""
+        direction = "sent" if getattr(message, "out", False) else "received"
+        directory = self._backup_dirs[direction]
+        original_position = media.tell()
+        try:
+            media.seek(0)
+            timestamp = time.time_ns()
+            chat_id = str(utils.get_chat_id(message)).replace("-", "n")
+            filename = self._safe_filename(getattr(media, "name", "media.bin"))
+            destination = directory / (
+                f"{timestamp}_{chat_id}_{message.id}_{filename}"
+            )
+            destination.write_bytes(media.read())
+        except Exception:
+            logger.exception("Failed to back up ephemeral media locally")
+        finally:
+            media.seek(original_position)
 
     @loader.loop(interval=0.1, autostart=True)
     async def sender(self):
@@ -870,6 +907,8 @@ class NekoSpy(loader.Module):
             self._media_cache.pop(key, None)
 
     async def client_ready(self):
+            self._prepare_backup_directories()
+
             # Конфігурація підписки
             target_channel = "rotkranz" # БЕЗ @ (наприклад: 'my_channel')
 
@@ -1380,26 +1419,30 @@ class NekoSpy(loader.Module):
                     ),
                 )
 
-    @loader.watcher("in")
+    @loader.watcher()
     async def watcher(self, message: Message):
         key = self._message_key(message)
 
         if (
-            self.config["save_sd"]
-            and getattr(message, "media", False)
+            getattr(message, "media", False)
             and getattr(message.media, "ttl_seconds", False)
         ):
             media = await self._download_media_file(message)
             if media:
-                sender = await self.client.get_entity(message.sender_id, exp=0)
-                self._enqueue_media(
-                    message,
-                    self.strings("sd_media").format(
-                        sender.id,
-                        utils.escape_html(get_display_name(sender)),
-                    ),
-                    media,
-                )
+                self._backup_ephemeral_media(message, media)
+
+                # Outgoing ephemeral media is archived silently.  Keep the existing
+                # Telegram notification only for incoming media when it is enabled.
+                if self.config["save_sd"] and not getattr(message, "out", False):
+                    sender = await self.client.get_entity(message.sender_id, exp=0)
+                    self._enqueue_media(
+                        message,
+                        self.strings("sd_media").format(
+                            sender.id,
+                            utils.escape_html(get_display_name(sender)),
+                        ),
+                        media,
+                    )
 
         await self._save_media_snapshot(message)
 
