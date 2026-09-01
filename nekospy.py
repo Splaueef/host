@@ -1,4 +1,4 @@
-__version__ = (1, 2, 1)
+__version__ = (1, 3, 0)
 
 # ©️ Dan Gazizullin, 2021-2022
 # This file is a part of Hikka Userbot
@@ -776,6 +776,22 @@ class NekoSpy(loader.Module):
         media = getattr(message, "media", None)
         return media is not None and getattr(media, "ttl_seconds", None) is not None
 
+    @staticmethod
+    def _is_round_video(message: Message) -> bool:
+        """Recognize round videos across old and current Telegram layers."""
+        if getattr(message, "video_note", None):
+            return True
+
+        media = getattr(message, "media", None)
+        if getattr(media, "round", False):
+            return True
+
+        document = getattr(message, "document", None)
+        return any(
+            getattr(attribute, "round_message", False)
+            for attribute in getattr(document, "attributes", ())
+        )
+
     @loader.loop(interval=0.1, autostart=True)
     async def sender(self):
         if not self._queue or self._next > time.time():
@@ -843,7 +859,7 @@ class NekoSpy(loader.Module):
     def _media_name(self, message: Message) -> str:
         if getattr(message, "photo", None):
             return "photo.jpg"
-        if getattr(message, "video_note", None):
+        if self._is_round_video(message):
             return "round_video.mp4"
         if getattr(message, "video", None):
             return "video.mp4"
@@ -877,7 +893,7 @@ class NekoSpy(loader.Module):
 
         if getattr(message, "photo", None):
             self._queue += [self.inline.bot.send_photo(*args, **kwargs)]
-        elif getattr(message, "video_note", None):
+        elif self._is_round_video(message):
             self._queue += [self.inline.bot.send_video_note(self._channel, media)]
             if caption:
                 self._queue += [

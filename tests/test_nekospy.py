@@ -117,6 +117,38 @@ class LocalBackupTests(unittest.TestCase):
 
         self.assertFalse(self.module._is_ephemeral_media(message))
 
+    def test_round_video_detection_uses_current_media_flag(self):
+        message = types.SimpleNamespace(
+            video_note=None,
+            media=types.SimpleNamespace(round=True, ttl_seconds=0),
+            document=None,
+        )
+
+        self.assertTrue(self.module._is_round_video(message))
+        self.assertEqual(self.module._media_name(message), "round_video.mp4")
+
+    def test_round_video_detection_supports_document_attribute(self):
+        message = types.SimpleNamespace(
+            video_note=None,
+            media=types.SimpleNamespace(),
+            document=types.SimpleNamespace(
+                attributes=[types.SimpleNamespace(round_message=True)],
+            ),
+        )
+
+        self.assertTrue(self.module._is_round_video(message))
+
+    def test_regular_video_is_not_detected_as_round(self):
+        message = types.SimpleNamespace(
+            video_note=None,
+            media=types.SimpleNamespace(round=False),
+            document=types.SimpleNamespace(
+                attributes=[types.SimpleNamespace(round_message=False)],
+            ),
+        )
+
+        self.assertFalse(self.module._is_round_video(message))
+
 
 if __name__ == "__main__":
     unittest.main()
