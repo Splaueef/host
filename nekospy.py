@@ -1,4 +1,4 @@
-__version__ = (1, 3, 0)
+__version__ = (1, 3, 1)
 
 # ©️ Dan Gazizullin, 2021-2022
 # This file is a part of Hikka Userbot
@@ -894,7 +894,7 @@ class NekoSpy(loader.Module):
         if getattr(message, "photo", None):
             self._queue += [self.inline.bot.send_photo(*args, **kwargs)]
         elif self._is_round_video(message):
-            self._queue += [self.inline.bot.send_video_note(self._channel, media)]
+            self._queue += [self._send_round_video(media)]
             if caption:
                 self._queue += [
                     self.inline.bot.send_message(
@@ -913,6 +913,22 @@ class NekoSpy(loader.Module):
             self._queue += [self.inline.bot.send_document(*args, **kwargs)]
         else:
             self._queue += [self.inline.bot.send_document(*args, **kwargs)]
+
+    async def _send_round_video(self, media: io.BytesIO):
+        """Send a video note, falling back to a document if Bot API rejects it."""
+        try:
+            await self.inline.bot.send_video_note(self._channel, media)
+        except Exception:
+            # Telegram occasionally returns an MP4 for an ephemeral video note
+            # that the Bot API refuses to accept as a video note.  The bytes are
+            # still valid (and have already been backed up), so deliver them as a
+            # regular file instead of leaving only the textual notification.
+            logger.warning(
+                "Bot API rejected an ephemeral video note; sending it as a document",
+                exc_info=True,
+            )
+            media.seek(0)
+            await self.inline.bot.send_document(self._channel, media)
 
     async def _save_media_snapshot(self, message: Message):
         if not getattr(message, "media", None):
