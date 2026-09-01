@@ -11,6 +11,7 @@ sys.path[:] = [entry for entry in sys.path if entry not in ("", str(_REPO))]
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 
 def _decorator(*args, **kwargs):
@@ -72,7 +73,7 @@ def _load_module():
 nekospy = _load_module()
 
 
-class LocalBackupTests(unittest.TestCase):
+class LocalBackupTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.module = object.__new__(nekospy.NekoSpy)
@@ -148,6 +149,36 @@ class LocalBackupTests(unittest.TestCase):
         )
 
         self.assertFalse(self.module._is_round_video(message))
+
+    async def test_round_video_falls_back_to_document_when_rejected(self):
+        media = io.BytesIO(b"round video")
+        media.name = "round_video.mp4"
+        bot = types.SimpleNamespace(
+            send_video_note=mock.AsyncMock(side_effect=RuntimeError("rejected")),
+            send_document=mock.AsyncMock(),
+        )
+        self.module.inline = types.SimpleNamespace(bot=bot)
+        self.module._channel = -10042
+
+        await self.module._send_round_video(media)
+
+        bot.send_video_note.assert_awaited_once_with(-10042, media)
+        bot.send_document.assert_awaited_once_with(-10042, media)
+        self.assertEqual(media.tell(), 0)
+
+    async def test_round_video_does_not_duplicate_successful_upload(self):
+        media = io.BytesIO(b"round video")
+        bot = types.SimpleNamespace(
+            send_video_note=mock.AsyncMock(),
+            send_document=mock.AsyncMock(),
+        )
+        self.module.inline = types.SimpleNamespace(bot=bot)
+        self.module._channel = -10042
+
+        await self.module._send_round_video(media)
+
+        bot.send_video_note.assert_awaited_once_with(-10042, media)
+        bot.send_document.assert_not_awaited()
 
 
 if __name__ == "__main__":
