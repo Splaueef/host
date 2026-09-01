@@ -180,6 +180,38 @@ class LocalBackupTests(unittest.IsolatedAsyncioTestCase):
         bot.send_video_note.assert_awaited_once_with(-10042, media)
         bot.send_document.assert_not_awaited()
 
+    async def test_photo_falls_back_to_document_when_rejected(self):
+        media = io.BytesIO(b"ephemeral photo")
+        media.name = "photo.jpg"
+        bot = types.SimpleNamespace(
+            send_photo=mock.AsyncMock(side_effect=RuntimeError("rejected")),
+            send_document=mock.AsyncMock(),
+        )
+        self.module.inline = types.SimpleNamespace(bot=bot)
+        self.module._channel = -10042
+
+        await self.module._send_photo(media, "sender")
+
+        bot.send_photo.assert_awaited_once_with(-10042, media, caption="sender")
+        bot.send_document.assert_awaited_once_with(
+            -10042,
+            media,
+            caption="sender",
+        )
+        self.assertEqual(media.tell(), 0)
+
+    async def test_sender_continues_after_failed_delivery(self):
+        failed_item = mock.AsyncMock(side_effect=RuntimeError("rejected"))()
+        next_item = mock.AsyncMock()()
+        self.module._queue = [failed_item, next_item]
+        self.module._next = 0
+        self.module.config = {"fw_protect": 0}
+
+        await self.module.sender()
+        await self.module.sender()
+
+        self.assertEqual(self.module._queue, [])
+
 
 if __name__ == "__main__":
     unittest.main()
