@@ -1,4 +1,4 @@
-__version__ = (1, 2, 0)
+__version__ = (1, 2, 1)
 
 # ©️ Dan Gazizullin, 2021-2022
 # This file is a part of Hikka Userbot
@@ -93,6 +93,7 @@ class NekoSpy(loader.Module):
     "sd_media": (
         "🔥 <b><a href='tg://user?id={}'>{}</a> надіслав(ла) вам медіа з самознищенням</b>"
     ),
+    "sd_media_out": "🔥 <b>Ви надіслали медіа з одноразовим переглядом</b>",
     "save_sd": (
         "<emoji document_id=5420315771991497307>🔥</emoji> <b>Збереження"
         " медіа з самознищенням</b>\n"
@@ -163,6 +164,7 @@ class NekoSpy(loader.Module):
             "🔥 <b><a href='tg://user?id={}'>{}</a> отправил вам самоуничтожающееся"
             " медиа</b>"
         ),
+        "sd_media_out": "🔥 <b>Вы отправили медиа для однократного просмотра</b>",
         "save_sd": (
             "<emoji document_id=5420315771991497307>🔥</emoji> <b>Сохраняю"
             " самоуничтожающиеся медиа</b>\n"
@@ -652,6 +654,7 @@ class NekoSpy(loader.Module):
         "sd_media": (
             "🔥 <b><a href='tg://user?id={}'>{}</a> надіслав(ла) вам медіа з самознищенням</b>"
         ),
+        "sd_media_out": "🔥 <b>Ви надіслали медіа з одноразовим переглядом</b>",
         "save_sd": (
             "<emoji document_id=5420315771991497307>🔥</emoji> <b>Зберігаю "
             "медіа з самознищенням</b>\n"
@@ -766,6 +769,12 @@ class NekoSpy(loader.Module):
             logger.exception("Failed to back up ephemeral media locally")
         finally:
             media.seek(original_position)
+
+    @staticmethod
+    def _is_ephemeral_media(message: Message) -> bool:
+        """Return whether Telegram marked this message's media as one-time."""
+        media = getattr(message, "media", None)
+        return media is not None and getattr(media, "ttl_seconds", None) is not None
 
     @loader.loop(interval=0.1, autostart=True)
     async def sender(self):
@@ -1423,24 +1432,28 @@ class NekoSpy(loader.Module):
     async def watcher(self, message: Message):
         key = self._message_key(message)
 
-        if (
-            getattr(message, "media", False)
-            and getattr(message.media, "ttl_seconds", False)
-        ):
+        if self._is_ephemeral_media(message):
             media = await self._download_media_file(message)
             if media:
                 self._backup_ephemeral_media(message, media)
 
-                # Outgoing ephemeral media is archived silently.  Keep the existing
-                # Telegram notification only for incoming media when it is enabled.
-                if self.config["save_sd"] and not getattr(message, "out", False):
-                    sender = await self.client.get_entity(message.sender_id, exp=0)
-                    self._enqueue_media(
-                        message,
-                        self.strings("sd_media").format(
+                # Report both received and sent one-time media. Telegram can encode
+                # "view once" with ttl_seconds=0, so presence matters, not truthiness.
+                if self.config["save_sd"]:
+                    if getattr(message, "out", False):
+                        caption = self.strings("sd_media_out")
+                    else:
+                        sender = await self._client.get_entity(
+                            message.sender_id,
+                            exp=0,
+                        )
+                        caption = self.strings("sd_media").format(
                             sender.id,
                             utils.escape_html(get_display_name(sender)),
-                        ),
+                        )
+                    self._enqueue_media(
+                        message,
+                        caption,
                         media,
                     )
 

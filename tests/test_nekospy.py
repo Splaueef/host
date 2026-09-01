@@ -105,6 +105,18 @@ class LocalBackupTests(unittest.TestCase):
             self.assertNotIn(":", backups[0].name)
             self.assertEqual(media.tell(), 4)
 
+    def test_ephemeral_detection_accepts_zero_ttl_for_view_once_media(self):
+        message = types.SimpleNamespace(
+            media=types.SimpleNamespace(ttl_seconds=0),
+        )
+
+        self.assertTrue(self.module._is_ephemeral_media(message))
+
+    def test_ephemeral_detection_rejects_regular_media(self):
+        message = types.SimpleNamespace(media=types.SimpleNamespace())
+
+        self.assertFalse(self.module._is_ephemeral_media(message))
+
 
 if __name__ == "__main__":
     unittest.main()
