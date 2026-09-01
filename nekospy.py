@@ -1,4 +1,4 @@
-__version__ = (1, 3, 1)
+__version__ = (1, 3, 2)
 
 # ©️ Dan Gazizullin, 2021-2022
 # This file is a part of Hikka Userbot
@@ -798,8 +798,15 @@ class NekoSpy(loader.Module):
             return
 
         item = self._queue.pop(0)
-        await item
-        self._next = int(time.time()) + self.config["fw_protect"]
+        try:
+            await item
+        except Exception:
+            # A rejected upload must not stop the loop and strand everything
+            # queued behind it.  Individual media senders provide their own
+            # document fallback where possible; this is the final safeguard.
+            logger.exception("Failed to deliver an item to the NekoSpy log")
+        finally:
+            self._next = int(time.time()) + self.config["fw_protect"]
 
     @staticmethod
     def _int(value: typing.Union[str, int], /) -> typing.Union[str, int]:
@@ -892,7 +899,7 @@ class NekoSpy(loader.Module):
         kwargs = {"caption": caption}
 
         if getattr(message, "photo", None):
-            self._queue += [self.inline.bot.send_photo(*args, **kwargs)]
+            self._queue += [self._send_photo(media, caption)]
         elif self._is_round_video(message):
             self._queue += [self._send_round_video(media)]
             if caption:
@@ -913,6 +920,29 @@ class NekoSpy(loader.Module):
             self._queue += [self.inline.bot.send_document(*args, **kwargs)]
         else:
             self._queue += [self.inline.bot.send_document(*args, **kwargs)]
+
+    async def _send_photo(self, media: io.BytesIO, caption: str):
+        """Send a photo without losing it when Bot API photo validation fails."""
+        try:
+            await self.inline.bot.send_photo(
+                self._channel,
+                media,
+                caption=caption,
+            )
+        except Exception:
+            # Telegram may return an unusual JPEG for timed/view-once photos.
+            # The Bot API can reject it as a photo even though it is a valid
+            # downloadable file, so retain the evidence as a document.
+            logger.warning(
+                "Bot API rejected an ephemeral photo; sending it as a document",
+                exc_info=True,
+            )
+            media.seek(0)
+            await self.inline.bot.send_document(
+                self._channel,
+                media,
+                caption=caption,
+            )
 
     async def _send_round_video(self, media: io.BytesIO):
         """Send a video note, falling back to a document if Bot API rejects it."""
