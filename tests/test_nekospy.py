@@ -33,6 +33,17 @@ def _load_module():
     utils = types.ModuleType("testhost.utils")
     utils.get_chat_id = lambda message: message.chat_id
 
+    aiogram = types.ModuleType("aiogram")
+    aiogram_types = types.ModuleType("aiogram.types")
+
+    class BufferedInputFile:
+        def __init__(self, file, filename, chunk_size=65536):
+            self.data = file
+            self.filename = filename
+            self.chunk_size = chunk_size
+
+    aiogram_types.BufferedInputFile = BufferedInputFile
+
     telethon = types.ModuleType("telethon")
     telethon_tl = types.ModuleType("telethon.tl")
     telethon_types = types.ModuleType("telethon.tl.types")
@@ -55,6 +66,8 @@ def _load_module():
             "testhost.modules": modules,
             "testhost.loader": loader,
             "testhost.utils": utils,
+            "aiogram": aiogram,
+            "aiogram.types": aiogram_types,
             "telethon": telethon,
             "telethon.tl": telethon_tl,
             "telethon.tl.types": telethon_types,
@@ -81,6 +94,10 @@ class LocalBackupTests(unittest.IsolatedAsyncioTestCase):
             pathlib.Path(self.temporary_directory.name) / "NekoSpyBSP"
         )
         self.module._prepare_backup_directories()
+        self.module._queue = []
+        self.module._cache = {}
+        self.module._media_cache = {}
+        self.module._media_cache_bytes = 0
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -162,8 +179,15 @@ class LocalBackupTests(unittest.IsolatedAsyncioTestCase):
 
         await self.module._send_round_video(media)
 
-        bot.send_video_note.assert_awaited_once_with(-10042, media)
-        bot.send_document.assert_awaited_once_with(-10042, media)
+        video_note = bot.send_video_note.await_args.kwargs
+        self.assertEqual(video_note["chat_id"], -10042)
+        self.assertEqual(video_note["video_note"].data, b"round video")
+        self.assertEqual(video_note["video_note"].filename, "round_video.mp4")
+
+        document = bot.send_document.await_args.kwargs
+        self.assertEqual(document["chat_id"], -10042)
+        self.assertEqual(document["document"].data, b"round video")
+        self.assertEqual(document["document"].filename, "round_video.mp4")
         self.assertEqual(media.tell(), 0)
 
     async def test_round_video_does_not_duplicate_successful_upload(self):
@@ -177,7 +201,8 @@ class LocalBackupTests(unittest.IsolatedAsyncioTestCase):
 
         await self.module._send_round_video(media)
 
-        bot.send_video_note.assert_awaited_once_with(-10042, media)
+        video_note = bot.send_video_note.await_args.kwargs
+        self.assertEqual(video_note["video_note"].data, b"round video")
         bot.send_document.assert_not_awaited()
 
     async def test_photo_falls_back_to_document_when_rejected(self):
@@ -192,13 +217,138 @@ class LocalBackupTests(unittest.IsolatedAsyncioTestCase):
 
         await self.module._send_photo(media, "sender")
 
-        bot.send_photo.assert_awaited_once_with(-10042, media, caption="sender")
-        bot.send_document.assert_awaited_once_with(
-            -10042,
-            media,
-            caption="sender",
-        )
+        photo = bot.send_photo.await_args.kwargs
+        self.assertEqual(photo["chat_id"], -10042)
+        self.assertEqual(photo["caption"], "sender")
+        self.assertEqual(photo["photo"].data, b"ephemeral photo")
+        self.assertEqual(photo["photo"].filename, "photo.jpg")
+
+        document = bot.send_document.await_args.kwargs
+        self.assertEqual(document["chat_id"], -10042)
+        self.assertEqual(document["caption"], "sender")
+        self.assertEqual(document["document"].data, b"ephemeral photo")
+        self.assertEqual(document["document"].filename, "photo.jpg")
         self.assertEqual(media.tell(), 0)
+
+    async def test_enqueued_photo_is_lazy_and_uses_buffered_input_file(self):
+        media = io.BytesIO(b"ephemeral photo")
+        media.name = "photo.jpg"
+        message = types.SimpleNamespace(photo=object())
+        bot = types.SimpleNamespace(
+            send_photo=mock.AsyncMock(),
+            send_document=mock.AsyncMock(),
+        )
+        self.module.inline = types.SimpleNamespace(bot=bot)
+        self.module._channel = -10042
+        self.module._next = 0
+        self.module.config = {"fw_protect": 0}
+
+        self.module._enqueue_media(message, "sender", media)
+
+        self.assertEqual(len(self.module._queue), 1)
+        self.assertTrue(callable(self.module._queue[0]))
+        bot.send_photo.assert_not_awaited()
+
+        await self.module.sender()
+
+        upload = bot.send_photo.await_args.kwargs["photo"]
+        self.assertEqual(upload.data, b"ephemeral photo")
+        self.assertEqual(upload.filename, "photo.jpg")
+
+    async def test_incoming_view_once_photo_is_logged_while_spy_mode_is_off(self):
+        sender = types.SimpleNamespace(id=99, first_name="Sender")
+        message = types.SimpleNamespace(
+            id=7,
+            chat_id=99,
+            sender_id=99,
+            sender=sender,
+            out=False,
+            photo=object(),
+            media=types.SimpleNamespace(ttl_seconds=0),
+        )
+        bot = types.SimpleNamespace(
+            send_photo=mock.AsyncMock(),
+            send_document=mock.AsyncMock(),
+        )
+        self.module._client = types.SimpleNamespace(
+            download_media=mock.AsyncMock(return_value=b"view once"),
+        )
+        self.module.inline = types.SimpleNamespace(bot=bot)
+        self.module._channel = -10042
+        self.module._next = 0
+        self.module.config = {"save_sd": True, "fw_protect": 0}
+        self.module.get = lambda key, default=None: False
+        self.module.strings = lambda key: {
+            "sd_media": "from {} {}",
+            "sd_media_out": "outgoing",
+            "sd_media_download_failed": " failed",
+        }[key]
+
+        await self.module.watcher(message)
+
+        self.module._client.download_media.assert_awaited_once_with(message, bytes)
+        backups = list(self.module._backup_dirs["received"].iterdir())
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), b"view once")
+        self.assertEqual(len(self.module._queue), 1)
+
+        await self.module.sender()
+
+        upload = bot.send_photo.await_args.kwargs["photo"]
+        self.assertEqual(upload.data, b"view once")
+        self.assertEqual(upload.filename, "photo.jpg")
+
+    async def test_download_retries_with_refetched_message(self):
+        original = types.SimpleNamespace(
+            id=7,
+            peer_id=object(),
+            photo=object(),
+        )
+        refreshed = types.SimpleNamespace(
+            id=7,
+            peer_id=original.peer_id,
+            photo=object(),
+            media=object(),
+        )
+        self.module._client = types.SimpleNamespace(
+            download_media=mock.AsyncMock(
+                side_effect=[RuntimeError("not ready"), b"photo bytes"],
+            ),
+            get_messages=mock.AsyncMock(return_value=refreshed),
+        )
+
+        with mock.patch.object(nekospy.asyncio, "sleep", new=mock.AsyncMock()):
+            media = await self.module._download_media_file(original, attempts=2)
+
+        self.assertEqual(media.getvalue(), b"photo bytes")
+        self.assertEqual(media.name, "photo.jpg")
+        self.assertEqual(self.module._client.download_media.await_count, 2)
+        self.module._client.get_messages.assert_awaited_once_with(
+            original.peer_id,
+            ids=7,
+        )
+
+    def test_media_cache_evicts_oldest_files_by_byte_limit(self):
+        self.module.media_cache_limit = 5
+        first = types.SimpleNamespace(
+            id=1,
+            is_private=True,
+            peer_id=None,
+            chat_id=11,
+        )
+        second = types.SimpleNamespace(
+            id=2,
+            is_private=True,
+            peer_id=None,
+            chat_id=11,
+        )
+
+        self.module._store_media_snapshot(first, io.BytesIO(b"one"))
+        self.module._store_media_snapshot(second, io.BytesIO(b"two"))
+
+        self.assertNotIn(1, self.module._media_cache)
+        self.assertEqual(self.module._media_cache[2].getvalue(), b"two")
+        self.assertEqual(self.module._media_cache_bytes, 3)
 
     async def test_sender_continues_after_failed_delivery(self):
         failed_item = mock.AsyncMock(side_effect=RuntimeError("rejected"))()

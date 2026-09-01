@@ -1,4 +1,4 @@
-__version__ = (1, 3, 2)
+__version__ = (1, 4, 0)
 
 # ©️ Dan Gazizullin, 2021-2022
 # This file is a part of Hikka Userbot
@@ -12,14 +12,17 @@ __version__ = (1, 3, 2)
 # scope: hikka_only
 # scope: hikka_min 1.6.0
 
+import asyncio
 import contextlib
 import io
 import logging
 import re
 import time
 import typing
+from functools import partial
 from pathlib import Path
 
+from aiogram.types import BufferedInputFile
 from telethon.tl.types import (
     DocumentAttributeFilename,
     Message,
@@ -44,6 +47,7 @@ class NekoSpy(loader.Module):
     groups = "<emoji document_id=6037355667365300960>👥</emoji>"
     pm = "<emoji document_id=6048540195995782913>👤</emoji>"
     backup_root_name = "NekoSpyBSP"
+    media_cache_limit = 128 * 1024 * 1024
 
     strings = {
     "name": "NekoSpy",
@@ -99,6 +103,14 @@ class NekoSpy(loader.Module):
         " медіа з самознищенням</b>\n"
     ),
     "cfg_save_sd": "Зберігати медіа з самознищенням",
+    "sd_media_download_failed": (
+        "\n\n⚠️ <i>Медіа виявлено, але Telegram не дозволив його завантажити. "
+        "Подробиці записано в журнал Hikka.</i>"
+    ),
+    "media_upload_failed": (
+        "⚠️ <i>Не вдалося передати медіа в лог-чат. Якщо завантаження було "
+        "успішним, локальна копія залишилася в NekoSpyBSP.</i>"
+    ),
 } 
 
     strings_ru = {
@@ -660,6 +672,14 @@ class NekoSpy(loader.Module):
             "медіа з самознищенням</b>\n"
         ),
         "cfg_save_sd": "Зберігати медіа з самознищенням",
+        "sd_media_download_failed": (
+            "\n\n⚠️ <i>Медіа виявлено, але Telegram не дозволив його "
+            "завантажити. Подробиці записано в журнал Hikka.</i>"
+        ),
+        "media_upload_failed": (
+            "⚠️ <i>Не вдалося передати медіа в лог-чат. Якщо завантаження "
+            "було успішним, локальна копія залишилася в NekoSpyBSP.</i>"
+        ),
     }
 
 
@@ -732,6 +752,7 @@ class NekoSpy(loader.Module):
         self._queue = []
         self._cache = {}
         self._media_cache = {}
+        self._media_cache_bytes = 0
         self._next = 0
         self._threshold = 10
         self._flood_protect_sample = 60
@@ -792,6 +813,10 @@ class NekoSpy(loader.Module):
             for attribute in getattr(document, "attributes", ())
         )
 
+    def _enqueue_call(self, callback: typing.Callable, *args, **kwargs):
+        """Queue a lazy async call so uploads are created only when sent."""
+        self._queue.append(partial(callback, *args, **kwargs))
+
     @loader.loop(interval=0.1, autostart=True)
     async def sender(self):
         if not self._queue or self._next > time.time():
@@ -799,11 +824,8 @@ class NekoSpy(loader.Module):
 
         item = self._queue.pop(0)
         try:
-            await item
+            await (item() if callable(item) else item)
         except Exception:
-            # A rejected upload must not stop the loop and strand everything
-            # queued behind it.  Individual media senders provide their own
-            # document fallback where possible; this is the final safeguard.
             logger.exception("Failed to deliver an item to the NekoSpy log")
         finally:
             self._next = int(time.time()) + self.config["fw_protect"]
@@ -884,89 +906,238 @@ class NekoSpy(loader.Module):
     async def _download_media_file(
         self,
         message: Message,
+        attempts: int = 1,
     ) -> typing.Optional[io.BytesIO]:
-        with contextlib.suppress(Exception):
-            data = await self._client.download_media(message, bytes)
-            if data:
-                media = io.BytesIO(data)
-                media.name = self._media_name(message)
-                return media
+        """Download media immediately, retrying transient Telegram failures."""
+        attempts = max(1, attempts)
+        candidate = message
+        last_error = None
+
+        for attempt in range(attempts):
+            try:
+                data = await self._client.download_media(candidate, bytes)
+                if data:
+                    media = io.BytesIO(bytes(data))
+                    media.name = self._media_name(candidate)
+                    return media
+
+                last_error = RuntimeError("Telegram returned an empty media payload")
+            except Exception as error:
+                last_error = error
+
+            if attempt + 1 >= attempts:
+                break
+
+            if attempt == 0:
+                candidate = await self._refetch_message(message)
+
+            await asyncio.sleep(0.2 * (attempt + 1))
+
+        if last_error is not None:
+            logger.warning(
+                "Failed to download NekoSpy media after %d attempt(s): %s",
+                attempts,
+                last_error,
+            )
 
         return None
 
+    async def _refetch_message(self, message: Message) -> Message:
+        """Refresh a possibly incomplete update before a download retry."""
+        try:
+            fresh = await self._client.get_messages(
+                message.peer_id,
+                ids=message.id,
+            )
+            if isinstance(fresh, (list, tuple)):
+                fresh = next(iter(fresh), None)
+            if fresh is not None and getattr(fresh, "media", None):
+                return fresh
+        except Exception:
+            logger.debug("Failed to refresh media message", exc_info=True)
+
+        return message
+
+    @staticmethod
+    def _media_payload(
+        media: typing.Union[bytes, bytearray, memoryview, io.BytesIO],
+        filename: typing.Optional[str] = None,
+    ) -> typing.Tuple[bytes, str]:
+        if isinstance(media, (bytes, bytearray, memoryview)):
+            data = bytes(media)
+        else:
+            data = media.getvalue()
+
+        return data, filename or getattr(media, "name", "media.bin")
+
+    def _input_file(self, data: bytes, filename: str) -> BufferedInputFile:
+        """Build the upload type required by aiogram 3.x."""
+        return BufferedInputFile(data, filename=self._safe_filename(filename))
+
+    async def _send_text(self, text: str):
+        await self.inline.bot.send_message(
+            chat_id=self._channel,
+            text=text,
+            disable_web_page_preview=True,
+        )
+
+    async def _send_bot_media(
+        self,
+        kind: str,
+        data: bytes,
+        filename: str,
+        caption: str = "",
+    ):
+        """Upload bytes through aiogram, with a document and text fallback."""
+        method_name, argument_name = {
+            "photo": ("send_photo", "photo"),
+            "video_note": ("send_video_note", "video_note"),
+            "video": ("send_video", "video"),
+            "animation": ("send_animation", "animation"),
+            "voice": ("send_voice", "voice"),
+            "audio": ("send_audio", "audio"),
+            "document": ("send_document", "document"),
+        }[kind]
+
+        kwargs = {
+            "chat_id": self._channel,
+            argument_name: self._input_file(data, filename),
+        }
+        if caption and kind != "video_note":
+            kwargs["caption"] = caption
+
+        try:
+            await getattr(self.inline.bot, method_name)(**kwargs)
+            return
+        except Exception:
+            logger.warning(
+                "Bot API rejected %s; trying a document fallback",
+                kind,
+                exc_info=True,
+            )
+
+        if kind != "document":
+            try:
+                document_kwargs = {
+                    "chat_id": self._channel,
+                    "document": self._input_file(data, filename),
+                }
+                if caption:
+                    document_kwargs["caption"] = caption
+                await self.inline.bot.send_document(**document_kwargs)
+                return
+            except Exception:
+                logger.exception("Document fallback also failed")
+
+        failure = self.strings("media_upload_failed")
+        await self._send_text(f"{caption}\n\n{failure}" if caption else failure)
+
     def _enqueue_media(self, message: Message, caption: str, media: io.BytesIO):
-        args = (self._channel, media)
-        kwargs = {"caption": caption}
+        data, filename = self._media_payload(media)
 
         if getattr(message, "photo", None):
-            self._queue += [self._send_photo(media, caption)]
+            self._enqueue_call(self._send_photo, data, caption, filename)
         elif self._is_round_video(message):
-            self._queue += [self._send_round_video(media)]
+            self._enqueue_call(self._send_round_video, data, filename)
             if caption:
-                self._queue += [
-                    self.inline.bot.send_message(
-                        self._channel,
-                        caption,
-                        disable_web_page_preview=True,
-                    )
-                ]
+                self._enqueue_call(self._send_text, caption)
         elif getattr(message, "video", None):
-            self._queue += [self.inline.bot.send_video(*args, **kwargs)]
+            self._enqueue_call(
+                self._send_bot_media,
+                "video",
+                data,
+                filename,
+                caption,
+            )
+        elif getattr(message, "gif", None):
+            self._enqueue_call(
+                self._send_bot_media,
+                "animation",
+                data,
+                filename,
+                caption,
+            )
         elif getattr(message, "voice", None):
-            self._queue += [self.inline.bot.send_voice(*args, **kwargs)]
+            self._enqueue_call(
+                self._send_bot_media,
+                "voice",
+                data,
+                filename,
+                caption,
+            )
         elif getattr(message, "audio", None):
-            self._queue += [self.inline.bot.send_audio(*args, **kwargs)]
-        elif getattr(message, "document", None):
-            self._queue += [self.inline.bot.send_document(*args, **kwargs)]
+            self._enqueue_call(
+                self._send_bot_media,
+                "audio",
+                data,
+                filename,
+                caption,
+            )
         else:
-            self._queue += [self.inline.bot.send_document(*args, **kwargs)]
-
-    async def _send_photo(self, media: io.BytesIO, caption: str):
-        """Send a photo without losing it when Bot API photo validation fails."""
-        try:
-            await self.inline.bot.send_photo(
-                self._channel,
-                media,
-                caption=caption,
-            )
-        except Exception:
-            # Telegram may return an unusual JPEG for timed/view-once photos.
-            # The Bot API can reject it as a photo even though it is a valid
-            # downloadable file, so retain the evidence as a document.
-            logger.warning(
-                "Bot API rejected an ephemeral photo; sending it as a document",
-                exc_info=True,
-            )
-            media.seek(0)
-            await self.inline.bot.send_document(
-                self._channel,
-                media,
-                caption=caption,
+            self._enqueue_call(
+                self._send_bot_media,
+                "document",
+                data,
+                filename,
+                caption,
             )
 
-    async def _send_round_video(self, media: io.BytesIO):
-        """Send a video note, falling back to a document if Bot API rejects it."""
-        try:
-            await self.inline.bot.send_video_note(self._channel, media)
-        except Exception:
-            # Telegram occasionally returns an MP4 for an ephemeral video note
-            # that the Bot API refuses to accept as a video note.  The bytes are
-            # still valid (and have already been backed up), so deliver them as a
-            # regular file instead of leaving only the textual notification.
-            logger.warning(
-                "Bot API rejected an ephemeral video note; sending it as a document",
-                exc_info=True,
-            )
-            media.seek(0)
-            await self.inline.bot.send_document(self._channel, media)
+    async def _send_photo(
+        self,
+        media: typing.Union[bytes, io.BytesIO],
+        caption: str,
+        filename: str = "photo.jpg",
+    ):
+        data, filename = self._media_payload(media, filename)
+        await self._send_bot_media("photo", data, filename, caption)
 
-    async def _save_media_snapshot(self, message: Message):
+    async def _send_round_video(
+        self,
+        media: typing.Union[bytes, io.BytesIO],
+        filename: str = "round_video.mp4",
+    ):
+        data, filename = self._media_payload(media, filename)
+        await self._send_bot_media("video_note", data, filename)
+
+    def _pop_media_snapshot(self, key):
+        media = self._media_cache.pop(key, None)
+        if media is not None:
+            self._media_cache_bytes = max(
+                0,
+                self._media_cache_bytes - len(media.getbuffer()),
+            )
+        return media
+
+    def _store_media_snapshot(self, message: Message, media: io.BytesIO):
+        data, filename = self._media_payload(media)
+        if len(data) > self.media_cache_limit:
+            logger.info("Skipping an oversized NekoSpy media snapshot")
+            return
+
+        key = self._message_key(message)
+        self._pop_media_snapshot(key)
+        while (
+            self._media_cache
+            and self._media_cache_bytes + len(data) > self.media_cache_limit
+        ):
+            self._pop_media_snapshot(next(iter(self._media_cache)))
+
+        snapshot = io.BytesIO(data)
+        snapshot.name = filename
+        self._media_cache[key] = snapshot
+        self._media_cache_bytes += len(data)
+
+    async def _save_media_snapshot(
+        self,
+        message: Message,
+        media: typing.Optional[io.BytesIO] = None,
+    ):
         if not getattr(message, "media", None):
             return
 
-        media = await self._download_media_file(message)
+        media = media or await self._download_media_file(message)
         if media:
-            self._media_cache[self._message_key(message)] = media
+            self._store_media_snapshot(message, media)
 
     def _prune_cache(self):
         if len(self._cache) <= self._threshold * self._flood_protect_sample:
@@ -975,7 +1146,7 @@ class NekoSpy(loader.Module):
         overflow = len(self._cache) - self._threshold * self._flood_protect_sample
         for key in list(self._cache)[:overflow]:
             self._cache.pop(key, None)
-            self._media_cache.pop(key, None)
+            self._pop_media_snapshot(key)
 
     async def client_ready(self):
             self._prepare_backup_directories()
@@ -1207,37 +1378,22 @@ class NekoSpy(loader.Module):
         caption = self.inline.sanitise_text(caption)
 
         if not getattr(msg_obj, "media", None):
-            self._queue += [
-                self.inline.bot.send_message(
-                    self._channel,
-                    caption,
-                    disable_web_page_preview=True,
-                )
-            ]
+            self._enqueue_call(self._send_text, caption)
             return
 
         if msg_obj.sticker:
-            self._queue += [
-                self.inline.bot.send_message(
-                    self._channel,
-                    caption + "\n\n&lt;sticker&gt;",
-                    disable_web_page_preview=True,
-                )
-            ]
+            self._enqueue_call(self._send_text, caption + "\n\n&lt;sticker&gt;")
             return
 
-        file = self._media_cache.pop(self._message_key(msg_obj), None)
+        file = self._pop_media_snapshot(self._message_key(msg_obj))
         if file is None:
-            file = await self._download_media_file(msg_obj)
+            file = await self._download_media_file(msg_obj, attempts=2)
 
         if file is None:
-            self._queue += [
-                self.inline.bot.send_message(
-                    self._channel,
-                    caption + "\n\n&lt;media unavailable&gt;",
-                    disable_web_page_preview=True,
-                )
-            ]
+            self._enqueue_call(
+                self._send_text,
+                caption + "\n\n&lt;media unavailable&gt;",
+            )
             return
 
         file.seek(0)
@@ -1247,13 +1403,7 @@ class NekoSpy(loader.Module):
         caption = self.inline.sanitise_text(caption)
 
         if not getattr(msg_obj, "media", None):
-            self._queue += [
-                self.inline.bot.send_message(
-                    self._channel,
-                    caption,
-                    disable_web_page_preview=True,
-                )
-            ]
+            self._enqueue_call(self._send_text, caption)
             return
 
         file = self._media_cache.get(self._message_key(msg_obj))
@@ -1261,13 +1411,10 @@ class NekoSpy(loader.Module):
             file = await self._download_media_file(msg_obj)
 
         if file is None:
-            self._queue += [
-                self.inline.bot.send_message(
-                    self._channel,
-                    caption + "\n\n&lt;media unavailable&gt;",
-                    disable_web_page_preview=True,
-                )
-            ]
+            self._enqueue_call(
+                self._send_text,
+                caption + "\n\n&lt;media unavailable&gt;",
+            )
             return
 
         file.seek(0)
@@ -1321,6 +1468,24 @@ class NekoSpy(loader.Module):
                 or chat_id in self.whitelist
                 or user_id in self.whitelist
             )
+        )
+
+    def _should_cache_message(self, message: Message) -> bool:
+        """Avoid downloading media that cannot produce a future spy log."""
+        sender_id = getattr(message, "sender_id", None)
+        chat_id = utils.get_chat_id(message)
+
+        if sender_id in self.always_track or chat_id in self.always_track:
+            return True
+        if self.config["ignore_inline"] and getattr(message, "via_bot_id", None):
+            return False
+        if not self._should_capture(sender_id, chat_id):
+            return False
+
+        return (
+            self.config["enable_pm"]
+            if getattr(message, "is_private", False)
+            else self.config["enable_groups"]
         )
 
     @loader.raw_handler(UpdateEditMessage)
@@ -1490,36 +1655,56 @@ class NekoSpy(loader.Module):
                     ),
                 )
 
-    @loader.watcher()
+    async def _ephemeral_caption(self, message: Message) -> str:
+        if getattr(message, "out", False):
+            return self.strings("sd_media_out")
+
+        sender_id = getattr(message, "sender_id", None) or 0
+        try:
+            sender = getattr(message, "sender", None) or await self._client.get_entity(
+                sender_id,
+                exp=0,
+            )
+            sender_id = getattr(sender, "id", sender_id)
+            sender_name = utils.escape_html(get_display_name(sender))
+        except Exception:
+            logger.debug("Failed to resolve an ephemeral-media sender", exc_info=True)
+            sender_name = f"ID {sender_id}"
+
+        return self.strings("sd_media").format(sender_id, sender_name)
+
+    @loader.watcher(only_messages=True)
     async def watcher(self, message: Message):
-        key = self._message_key(message)
+        state_enabled = self.get("state", False)
+        save_ephemeral = self.config["save_sd"]
+        ephemeral = self._is_ephemeral_media(message)
+        media = None
 
-        if self._is_ephemeral_media(message):
-            media = await self._download_media_file(message)
+        if ephemeral and (save_ephemeral or state_enabled):
+            media = await self._download_media_file(message, attempts=3)
             if media:
-                self._backup_ephemeral_media(message, media)
-
-                # Report both received and sent one-time media. Telegram can encode
-                # "view once" with ttl_seconds=0, so presence matters, not truthiness.
-                if self.config["save_sd"]:
-                    if getattr(message, "out", False):
-                        caption = self.strings("sd_media_out")
-                    else:
-                        sender = await self._client.get_entity(
-                            message.sender_id,
-                            exp=0,
-                        )
-                        caption = self.strings("sd_media").format(
-                            sender.id,
-                            utils.escape_html(get_display_name(sender)),
-                        )
+                if save_ephemeral:
+                    self._backup_ephemeral_media(message, media)
                     self._enqueue_media(
                         message,
-                        caption,
+                        await self._ephemeral_caption(message),
                         media,
                     )
+            elif save_ephemeral:
+                self._enqueue_call(
+                    self._send_text,
+                    await self._ephemeral_caption(message)
+                    + self.strings("sd_media_download_failed"),
+                )
 
-        await self._save_media_snapshot(message)
+        if not state_enabled or not self._should_cache_message(message):
+            return
+
+        key = self._message_key(message)
+        if media:
+            self._store_media_snapshot(message, media)
+        elif not ephemeral:
+            await self._save_media_snapshot(message)
 
         with contextlib.suppress(AttributeError):
             self._cache[key] = message
