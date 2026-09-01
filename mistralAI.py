@@ -1,20 +1,18 @@
 # meta developer: @RotKranz 
 # meta syntax: .mistral | .mistralimg | .mistralagent | .mistralagentadd
+# requires: langdetect numpy
 
-__version__ = (4, 5, 0)
+__version__ = (4, 6, 0)
 
 import asyncio
 import base64
 import collections
 import html
-import importlib
 import io
 import json
 import logging
 import math
 import re
-import subprocess
-import sys
 import time
 from urllib.parse import quote
 from typing import Dict, List, Optional, Tuple
@@ -23,31 +21,6 @@ import aiohttp
 from .. import loader, utils
 
 logger = logging.getLogger(__name__)
-
-# ── Авто-встановлення залежностей ────────────────────────────────────────────
-
-def _ensure_pkg(pkg: str, import_name: str | None = None) -> bool:
-    name = import_name or pkg
-    try:
-        importlib.import_module(name)
-        return True
-    except ImportError:
-        try:
-            logger.info("MistralAI: встановлюю %s...", pkg)
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", pkg, "-q"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            importlib.import_module(name)
-            logger.info("MistralAI: %s встановлено ✓", pkg)
-            return True
-        except Exception as e:
-            logger.warning("MistralAI: не вдалося встановити %s: %s", pkg, e)
-            return False
-
-_ensure_pkg("langdetect")
-_ensure_pkg("numpy")
 
 try:
     from langdetect import detect as _lang_detect
@@ -633,8 +606,18 @@ class MistralModule(loader.Module):
                 "Ти — корисний асистент. Відповідай чітко і зрозуміло.",
                 "Системний промпт для .mistral",
             ),
-            loader.ConfigValue("max_tokens", 2048, "Ліміт токенів"),
-            loader.ConfigValue("timeout", 120, "Таймаут (с)"),
+            loader.ConfigValue(
+                "max_tokens",
+                2048,
+                "Ліміт токенів",
+                validator=loader.validators.Integer(minimum=1, maximum=32768),
+            ),
+            loader.ConfigValue(
+                "timeout",
+                120,
+                "Таймаут (с)",
+                validator=loader.validators.Integer(minimum=5, maximum=600),
+            ),
             loader.ConfigValue(
                 "retry_count", 2,
                 "Кількість повторних спроб при помилці",
@@ -727,7 +710,7 @@ class MistralModule(loader.Module):
             ),
             # ── Werwolf ────────────────────────────────────────────────────
             loader.ConfigValue(
-                "werwolf_api_key", "T9Igz3OeJHvgEHlyqnQBPY8I0BjrYMvBTLDvKs8qopY",
+                "werwolf_api_key", "",
                 "API ключ Werwolf (отримати через /api у боті)",
                 validator=loader.validators.Hidden(loader.validators.String()),
             ),
@@ -785,6 +768,8 @@ class MistralModule(loader.Module):
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def client_ready(self, client, db):
+        if self._session and not self._session.closed:
+            await self._session.close()
         self._session = aiohttp.ClientSession()
         me = await client.get_me()
         self._me = me
@@ -796,8 +781,9 @@ class MistralModule(loader.Module):
         self._active_agent_name = self.db.get("MistralAI", "active_agent_name", "") or None
 
     async def on_unload(self):
-        if self._session:
+        if self._session and not self._session.closed:
             await self._session.close()
+        self._session = None
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -934,8 +920,9 @@ class MistralModule(loader.Module):
         """Пам'ять для чату — завжди спільна.
         В групах ім'я відправника вшивається у content: '[Ім'я]: текст'."""
         lim = self.config["agent_history_limit"]
-        if chat_id not in self._memory or not isinstance(self._memory[chat_id], collections.deque):
-            self._memory[chat_id] = collections.deque(maxlen=lim)
+        current = self._memory.get(chat_id)
+        if not isinstance(current, collections.deque) or current.maxlen != lim:
+            self._memory[chat_id] = collections.deque(current or (), maxlen=lim)
         return self._memory[chat_id]
 
     def _agent_id(self) -> str | None:
@@ -1312,12 +1299,10 @@ class MistralModule(loader.Module):
             )
             messages.append({"role": "system", "content": ctx_text})
 
-        # Вся поточна пам'ять чату (вже містить '[Ім'я]: текст' для груп)
+        # Вся поточна пам'ять чату вже містить поточне повідомлення: watcher
+        # додає його до виклику API, щоб агентський і модельний режими бачили
+        # однакову історію. Повторне додавання тут дублювало кожен запит.
         messages.extend(list(history))
-
-        # Поточне повідомлення (ще не збережене в history на момент виклику)
-        content = f"[{sender_name}]: {new_msg}" if (is_group and sender_name) else new_msg
-        messages.append({"role": ROLE_USER, "content": content})
 
         payload = {
             "model": self.config["agent_model"],
@@ -1834,24 +1819,17 @@ class MistralModule(loader.Module):
                 agent_id=agent_id,
             )
         else:
-            original = self.config["agent_system_prompt"]
-            if system_override:
-                self.config["agent_system_prompt"] = system_override
-            try:
-                reply_text = await self._chat_history(
-                    history=history,
-                    new_msg=text,
-                    chat_id=chat_id,
-                    sender_id=sender_id,
-                    sender_name=sender_name,
-                    is_group=is_group,
-                    group_title=group_title,
-                    extra_context=extra_context,
-                    system_override=system_override,
-                )
-            finally:
-                if system_override:
-                    self.config["agent_system_prompt"] = original
+            reply_text = await self._chat_history(
+                history=history,
+                new_msg=text,
+                chat_id=chat_id,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                is_group=is_group,
+                group_title=group_title,
+                extra_context=extra_context,
+                system_override=system_override,
+            )
             images = []
         return reply_text, images
 

@@ -95,6 +95,35 @@ class CookieManagerTests(unittest.TestCase):
 
 
 class VideoFormatTests(unittest.TestCase):
+    def test_supported_url_uses_the_parsed_hostname(self):
+        self.assertTrue(vdlt._is_supported_url("https://youtube.com:443/watch?v=1"))
+        self.assertFalse(vdlt._is_supported_url("https://youtube.com.evil.example/video"))
+
+    def test_private_and_local_urls_are_blocked(self):
+        self.assertFalse(vdlt._is_safe_http_url("http://127.0.0.1/admin"))
+        self.assertFalse(vdlt._is_safe_http_url("http://localhost/admin"))
+        self.assertFalse(vdlt._is_safe_http_url("http://100.64.0.1/admin"))
+        self.assertFalse(vdlt._is_safe_http_url("http://198.18.0.1/admin"))
+
+    def test_album_reports_failure_when_every_upload_fails(self):
+        module = object.__new__(vdlt.VideoDownloaderMod)
+
+        class Client:
+            async def send_file(self, *args, **kwargs):
+                raise RuntimeError("rejected")
+
+        message = types.SimpleNamespace(client=Client(), chat_id=1, id=2)
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for name in ("one.jpg", "two.jpg"):
+                path = os.path.join(directory, name)
+                pathlib.Path(path).write_bytes(b"image")
+                paths.append(path)
+
+            sent = asyncio.run(module._send_album(message, paths, "caption"))
+
+        self.assertFalse(sent)
+
     def test_diagnostics_use_the_supported_ytdlp_cli_prefix(self):
         module = object.__new__(vdlt.VideoDownloaderMod)
         module.config = {"cobalt_api_url": "", "ffmpeg_path": ""}

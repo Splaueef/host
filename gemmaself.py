@@ -1,6 +1,6 @@
 # meta developer: @Huai_Baike
 
-__version__ = (4, 1, 1)
+__version__ = (4, 2, 0)
 
 import asyncio
 import hashlib
@@ -109,6 +109,11 @@ class _RateLimiter:
             self._locks[chat_id] = asyncio.Lock()
         return self._locks[chat_id]
 
+    def discard(self, chat_id: int):
+        lock = self._locks.get(chat_id)
+        if lock is not None and not lock.locked():
+            self._locks.pop(chat_id, None)
+
 
 # ── Module ────────────────────────────────────────────────────────────────────
 
@@ -123,6 +128,7 @@ class GemmaSelf(loader.Module):
         "cleared": "🗑 <b>Історію чату очищено</b>",
         "busy":    "⏳ Зачекай, ще обробляю попереднє повідомлення…",
         "thinking": "⏳ Думаю…",
+        "failed": "⚠️ <b>Не вдалося отримати відповідь від Ollama.</b>",
         "quota_exhausted": (
             "⛔️ Ліміт ШІ-запитів вичерпано. "
             "Нові запити відновляться <b>{reset_at}</b>."
@@ -131,8 +137,14 @@ class GemmaSelf(loader.Module):
 
     def __init__(self):
         self.config = loader.ModuleConfig(
-            loader.ConfigValue("allowed_chats", [], "Список ID чатів"),
-            loader.ConfigValue("api_url", "http://localhost:11434/v1", "URL Ollama"),
+            loader.ConfigValue(
+                "allowed_chats", [], "Список ID чатів",
+                validator=loader.validators.Series(loader.validators.Integer()),
+            ),
+            loader.ConfigValue(
+                "api_url", "http://localhost:11434/v1", "URL Ollama",
+                validator=loader.validators.Link(),
+            ),
             loader.ConfigValue("model", "gemma3-limited:latest", "Назва моделі"),
             loader.ConfigValue(
                 "system_prompt",
@@ -156,17 +168,50 @@ class GemmaSelf(loader.Module):
                 "Відповідай як реальна людина. Не кажи що ти AI. Можна вживати repo, bot, server.",
                 "Поведінка",
             ),
-            loader.ConfigValue("max_history",  20, "Максимум повідомлень в історії"),
-            loader.ConfigValue("keep_recent",   6, "Скільки останніх не стискати"),
-            loader.ConfigValue("max_tokens",  120, "Ліміт токенів відповіді"),
-            loader.ConfigValue("timeout",     120, "Таймаут запиту (секунди)"),
-            loader.ConfigValue("stream", True, "Поступово редагувати повідомлення під час генерації"),
-            loader.ConfigValue("stream_edit_interval", 1.2, "Мінімальна пауза між редагуваннями (секунди)"),
-            loader.ConfigValue("stream_min_chars", 24, "Мінімум нових символів перед редагуванням"),
-            loader.ConfigValue("daily_user_limit", 0, "Денний ліміт ШІ-запитів на користувача (0=∞)"),
-            loader.ConfigValue("limit_exempt_chats", [], "ID чатів, де ліміти ШІ-запитів не діють"),
-            loader.ConfigValue("ignored_user_ids", [7635755119], "ID користувачів, яких ШІ повністю ігнорує"),
-            loader.ConfigValue("reply_all_in_allowed_groups", True, "Відповідати всім користувачам у дозволених групах"),
+            loader.ConfigValue(
+                "max_history", 20, "Максимум повідомлень в історії",
+                validator=loader.validators.Integer(minimum=1, maximum=200),
+            ),
+            loader.ConfigValue(
+                "keep_recent", 6, "Скільки останніх не стискати",
+                validator=loader.validators.Integer(minimum=1, maximum=100),
+            ),
+            loader.ConfigValue(
+                "max_tokens", 120, "Ліміт токенів відповіді",
+                validator=loader.validators.Integer(minimum=1, maximum=32768),
+            ),
+            loader.ConfigValue(
+                "timeout", 120, "Таймаут запиту (секунди)",
+                validator=loader.validators.Integer(minimum=5, maximum=600),
+            ),
+            loader.ConfigValue(
+                "stream", True, "Поступово редагувати повідомлення під час генерації",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "stream_edit_interval", 1.2, "Мінімальна пауза між редагуваннями (секунди)",
+                validator=loader.validators.Float(minimum=0.2, maximum=10),
+            ),
+            loader.ConfigValue(
+                "stream_min_chars", 24, "Мінімум нових символів перед редагуванням",
+                validator=loader.validators.Integer(minimum=1, maximum=1000),
+            ),
+            loader.ConfigValue(
+                "daily_user_limit", 0, "Денний ліміт ШІ-запитів на користувача (0=∞)",
+                validator=loader.validators.Integer(minimum=0, maximum=100000),
+            ),
+            loader.ConfigValue(
+                "limit_exempt_chats", [], "ID чатів, де ліміти ШІ-запитів не діють",
+                validator=loader.validators.Series(loader.validators.Integer()),
+            ),
+            loader.ConfigValue(
+                "ignored_user_ids", [7635755119], "ID користувачів, яких ШІ повністю ігнорує",
+                validator=loader.validators.Series(loader.validators.Integer()),
+            ),
+            loader.ConfigValue(
+                "reply_all_in_allowed_groups", True, "Відповідати всім користувачам у дозволених групах",
+                validator=loader.validators.Boolean(),
+            ),
         )
         self._me      = None
         self._rl      = _RateLimiter()
@@ -175,11 +220,14 @@ class GemmaSelf(loader.Module):
 
     async def client_ready(self, client, db):
         self._me      = await client.get_me()
+        if self._session and not self._session.closed:
+            await self._session.close()
         self._session = aiohttp.ClientSession()
 
     async def on_unload(self):
-        if self._session:
+        if self._session and not self._session.closed:
             await self._session.close()
+        self._session = None
 
     # ── Storage ───────────────────────────────────────────────────────────
 
@@ -304,7 +352,11 @@ class GemmaSelf(loader.Module):
                     reset_at = self._retry_after_reset_at(resp.headers.get("Retry-After"))
                     return self._quota_message(reset_at)
 
-                data = await resp.json()
+                if resp.status >= 400:
+                    logger.warning("GemmaSelf: Ollama HTTP %s: %.300s", resp.status, await resp.text())
+                    return None
+
+                data = await resp.json(content_type=None)
                 logger.debug("GemmaSelf: %.1fс", time.monotonic() - t0)
                 return data["choices"][0]["message"]["content"].strip()
         except asyncio.TimeoutError:
@@ -325,6 +377,10 @@ class GemmaSelf(loader.Module):
                     logger.warning("GemmaSelf stream: API quota/rate limit exhausted")
                     reset_at = self._retry_after_reset_at(resp.headers.get("Retry-After"))
                     yield self._quota_message(reset_at)
+                    return
+
+                if resp.status >= 400:
+                    logger.warning("GemmaSelf stream: Ollama HTTP %s: %.300s", resp.status, await resp.text())
                     return
 
                 async for raw_line in resp.content:
@@ -354,7 +410,12 @@ class GemmaSelf(loader.Module):
 
     async def _safe_edit(self, message, text: str):
         try:
-            await message.edit(text[:4096])
+            rendered = (
+                text[:4096]
+                if self._is_quota_message(text)
+                else utils.escape_html(text[:4000])
+            )
+            await message.edit(rendered)
         except Exception as e:
             if "message is not modified" not in str(e).lower():
                 logger.debug("GemmaSelf edit: %s", e)
@@ -369,6 +430,7 @@ class GemmaSelf(loader.Module):
 
         if chat_id in allowed:
             allowed.remove(chat_id)
+            self._rl.discard(chat_id)
             self.config["allowed_chats"] = allowed
             msg = await utils.answer(message, self.strings["removed"])
         else:
@@ -459,15 +521,21 @@ class GemmaSelf(loader.Module):
                         if not self._is_quota_message(response) and not self._quota_exempt(chat_id):
                             self._quota_inc(sender_id)
                     else:
-                        await answer.delete()
+                        await answer.edit(self.strings["failed"])
                 else:
                     async with message.client.action(chat_id, "typing"):
                         response = await self._call_ollama(self._get_history(chat_id))
 
                     if response:
-                        await message.reply(response)
+                        await message.reply(
+                            response
+                            if self._is_quota_message(response)
+                            else utils.escape_html(response)
+                        )
                         self._append(chat_id, "assistant", response)
                         if not self._is_quota_message(response) and not self._quota_exempt(chat_id):
                             self._quota_inc(sender_id)
+                    else:
+                        await message.reply(self.strings["failed"])
             except Exception as e:
                 logger.error("GemmaSelf: %s", e)

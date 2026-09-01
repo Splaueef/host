@@ -1,4 +1,4 @@
-__version__ = (6, 10, 0)
+__version__ = (6, 11, 0)
 VERSION = ".".join(map(str, __version__))
 
 import os
@@ -10,6 +10,7 @@ import logging
 import subprocess
 import sys
 import asyncio
+import tempfile
 import mimetypes
 import unicodedata
 import ipaddress
@@ -126,7 +127,7 @@ def _hostname_matches(hostname: str, domain: str) -> bool:
 
 def _is_supported_url(url: str) -> bool:
     try:
-        hostname = (urlsplit(url).netloc or "").lower().lstrip("www.")
+        hostname = (urlsplit(url).hostname or "").lower().lstrip("www.")
     except Exception:
         return False
     if not hostname:
@@ -185,9 +186,8 @@ def _is_safe_http_url(url: str) -> bool:
 
         def _ip_is_public(value: str) -> bool:
             ip = ipaddress.ip_address(value)
-            return not (
-                ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+            return ip.is_global and not (
+                ip.is_multicast or ip.is_reserved or ip.is_unspecified
             )
 
         try:
@@ -825,6 +825,7 @@ class VideoDownloaderMod(loader.Module):
         "err_queue_full":     "<b>⏳ Черга повна ({} завдань).</b>",
         "err_no_transcript":  "<b>❌ Транскрипт недоступний для цього відео.</b>",
         "err_timeout":        "<b>❌ Завантаження перервано: перевищено ліміт часу.</b>",
+        "err_unsafe_url":     "<b>❌ Дозволені лише публічні HTTP(S) URL.</b>",
         "playlist_done":      "<b>✅ Плейлист: {ok}/{total} завантажено.</b>",
         "queue_pos":          "<b>📋 Черга: позиція {pos}</b>",
         "toggled_on":         "<b>✅ Downloader: ON</b>",
@@ -915,35 +916,35 @@ class VideoDownloaderMod(loader.Module):
 
     def __init__(self):
         self.config = loader.ModuleConfig(
-            loader.ConfigValue("enabled",          True,  "Увімкнути?"),
-            loader.ConfigValue("max_size",         500,   "Макс. розмір файлу (МБ)"),
-            loader.ConfigValue("audio_mode",       False, "MP3 замість відео?"),
-            loader.ConfigValue("audio_format",     "mp3", "Формат аудіо: mp3/m4a/wav/opus/flac"),
-            loader.ConfigValue("quality",          "720", "Якість: 360/480/720/1080/best"),
-            loader.ConfigValue("cooldown",         0,     "Кулдаун (сек)"),
-            loader.ConfigValue("daily_limit",      0,     "Денний ліміт (0=∞)"),
-            loader.ConfigValue("auto_delete",      0,     "Авто-видалення (сек, 0=вимкнено)"),
-            loader.ConfigValue("retries",          3,     "Спроб зі зниженням якості"),
-            loader.ConfigValue("queue_max",        5,     "Макс. черга"),
-            loader.ConfigValue("queue_workers",    2,     "Паралельних завантажень (1-4)"),
-            loader.ConfigValue("fragment_workers", 8,     "Паралельних фрагментів одного відео (1-16)"),
-            loader.ConfigValue("notify_dm",        False, "Сповіщення в ЛС?"),
-            loader.ConfigValue("fix_orientation",  True,  "Авто-виправлення орієнтації відео?"),
-            loader.ConfigValue("playlist_enabled", False, "Дозволити плейлисти?"),
-            loader.ConfigValue("playlist_max",     10,    "Макс. відео з плейлиста"),
+            loader.ConfigValue("enabled", True, "Увімкнути?", validator=loader.validators.Boolean()),
+            loader.ConfigValue("max_size", 500, "Макс. розмір файлу (МБ)", validator=loader.validators.Integer(minimum=1, maximum=2048)),
+            loader.ConfigValue("audio_mode", False, "MP3 замість відео?", validator=loader.validators.Boolean()),
+            loader.ConfigValue("audio_format", "mp3", "Формат аудіо: mp3/m4a/wav/opus/flac", validator=loader.validators.Choice(["mp3", "m4a", "wav", "opus", "flac", "aac"])),
+            loader.ConfigValue("quality", "720", "Якість: 360/480/720/1080/best", validator=loader.validators.Choice(["360", "480", "720", "1080", "best"])),
+            loader.ConfigValue("cooldown", 0, "Кулдаун (сек)", validator=loader.validators.Integer(minimum=0, maximum=86400)),
+            loader.ConfigValue("daily_limit", 0, "Денний ліміт (0=∞)", validator=loader.validators.Integer(minimum=0, maximum=1000000)),
+            loader.ConfigValue("auto_delete", 0, "Авто-видалення (сек, 0=вимкнено)", validator=loader.validators.Integer(minimum=0, maximum=86400)),
+            loader.ConfigValue("retries", 3, "Спроб зі зниженням якості", validator=loader.validators.Integer(minimum=0, maximum=10)),
+            loader.ConfigValue("queue_max", 5, "Макс. черга", validator=loader.validators.Integer(minimum=1, maximum=100)),
+            loader.ConfigValue("queue_workers", 2, "Паралельних завантажень (1-4)", validator=loader.validators.Integer(minimum=1, maximum=4)),
+            loader.ConfigValue("fragment_workers", 8, "Паралельних фрагментів одного відео (1-16)", validator=loader.validators.Integer(minimum=1, maximum=16)),
+            loader.ConfigValue("notify_dm", False, "Сповіщення в ЛС?", validator=loader.validators.Boolean()),
+            loader.ConfigValue("fix_orientation", True, "Авто-виправлення орієнтації відео?", validator=loader.validators.Boolean()),
+            loader.ConfigValue("playlist_enabled", False, "Дозволити плейлисти?", validator=loader.validators.Boolean()),
+            loader.ConfigValue("playlist_max", 10, "Макс. відео з плейлиста", validator=loader.validators.Integer(minimum=1, maximum=100)),
             loader.ConfigValue("group_whitelist",  [],    "Білий список груп"),
             loader.ConfigValue("private_whitelist", [],    "Контакти в ЛС з дозволеним автозавантаженням"),
             loader.ConfigValue("user_blacklist",   [],    "Чорний список юзерів"),
             loader.ConfigValue("ig_username",      "",    "Instagram логін"),
-            loader.ConfigValue("ig_password",      "",    "Instagram пароль"),
+            loader.ConfigValue("ig_password", "", "Instagram пароль", validator=loader.validators.Hidden(loader.validators.String())),
             loader.ConfigValue("transcript_lang",  "uk",  "Мова транскрипту"),
-            loader.ConfigValue("task_timeout",     600,   "Таймаут завдання (сек)"),
-            loader.ConfigValue("auto_update_ytdlp", True, "Автоматично оновлювати yt-dlp раз на добу"),
-            loader.ConfigValue("auto_install_deps", True, "Автоматично ставити відсутні бібліотеки"),
-            loader.ConfigValue("use_gallery_dl",    True, "Fallback через gallery-dl для Reddit/Pinterest/X/Instagram тощо"),
-            loader.ConfigValue("use_cli_ytdlp",     True, "Використовувати універсальний yt-dlp CLI режим як у tuitube"),
-            loader.ConfigValue("force_ipv4",        False, "Додавати --force-ipv4 для yt-dlp CLI"),
-            loader.ConfigValue("allow_any_url",     False, "Автозавантажувати будь-які URL, які підтримує yt-dlp"),
+            loader.ConfigValue("task_timeout", 600, "Таймаут завдання (сек)", validator=loader.validators.Integer(minimum=30, maximum=3600)),
+            loader.ConfigValue("auto_update_ytdlp", True, "Автоматично оновлювати yt-dlp раз на добу", validator=loader.validators.Boolean()),
+            loader.ConfigValue("auto_install_deps", True, "Автоматично ставити відсутні бібліотеки", validator=loader.validators.Boolean()),
+            loader.ConfigValue("use_gallery_dl", True, "Fallback через gallery-dl для Reddit/Pinterest/X/Instagram тощо", validator=loader.validators.Boolean()),
+            loader.ConfigValue("use_cli_ytdlp", True, "Використовувати універсальний yt-dlp CLI режим як у tuitube", validator=loader.validators.Boolean()),
+            loader.ConfigValue("force_ipv4", False, "Додавати --force-ipv4 для yt-dlp CLI", validator=loader.validators.Boolean()),
+            loader.ConfigValue("allow_any_url", False, "Автозавантажувати будь-які URL, які підтримує yt-dlp", validator=loader.validators.Boolean()),
             loader.ConfigValue("yt_dlp_path",       "", "Шлях до yt-dlp binary (порожньо = auto/python -m yt_dlp)"),
             loader.ConfigValue("ffmpeg_path",       "", "Шлях до ffmpeg або директорії з ffmpeg (порожньо = auto)"),
             loader.ConfigValue("yt_browser_cookies", f"firefox:{FIREFOX_PROFILE}", "Browser cookies fallback для yt-dlp: browser:profile"),
@@ -955,7 +956,7 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("music_channels", [], "Канали для пошуку музики: @username або -100ID"),
             loader.ConfigValue("music_search_limit", 25, "Скільки повідомлень перевіряти в кожному музичному каналі"),
             loader.ConfigValue("cobalt_api_url", "", "Cobalt API fallback для YouTube (URL власного/доступного інстансу)"),
-            loader.ConfigValue("cobalt_api_key", "", "Необов'язковий API key для Cobalt"),
+            loader.ConfigValue("cobalt_api_key", "", "Необов'язковий API key для Cobalt", validator=loader.validators.Hidden(loader.validators.String())),
         )
         self._stats = {
             "total": 0, "ok": 0, "err": 0, "retried": 0,
@@ -1138,6 +1139,16 @@ class VideoDownloaderMod(loader.Module):
         except Exception:
             pass
         return url
+
+    async def _is_public_url(self, url: str) -> bool:
+        # DNS resolution can block, so keep it outside the Telegram event loop.
+        try:
+            return await asyncio.wait_for(
+                utils.run_sync(_is_safe_http_url, url), timeout=10
+            )
+        except asyncio.TimeoutError:
+            logger.warning("URL safety check timed out for %s", urlsplit(url).hostname)
+            return False
 
     def _audio_postprocessor(self) -> list[dict]:
         fmt = self.config.get("audio_format", "mp3").lower()
@@ -2918,8 +2929,11 @@ class VideoDownloaderMod(loader.Module):
 
                 headers = {"User-Agent": "Mozilla/5.0"}
                 resp = _safe_requests_get(requests, track["url"], headers=headers, timeout=15)
-                resp.raise_for_status()
-                text = _parse_vtt_text(resp.text)
+                try:
+                    resp.raise_for_status()
+                    text = _parse_vtt_text(resp.text)
+                finally:
+                    resp.close()
                 return (title, text) if text.strip() else None
             except Exception as e:
                 logger.warning("Transcript fetch failed: %s", e)
@@ -2959,12 +2973,12 @@ class VideoDownloaderMod(loader.Module):
         valid = [p for p in paths
                  if isinstance(p, str) and os.path.isfile(p) and os.path.getsize(p) > 0]
         if not valid:
-            return
+            return False
 
         if len(valid) == 1:
             ftype = _file_type(valid[0])
             await self._send(message, valid[0], caption, force_document=(ftype == "other"))
-            return
+            return True
 
         images    = [p for p in valid if _file_type(p) == "image"]
         non_images = [p for p in valid if _file_type(p) != "image"]
@@ -2976,6 +2990,7 @@ class VideoDownloaderMod(loader.Module):
             groups.append(non_images)
 
         first_group = True
+        sent_any = False
         MAX_ALBUM = 10
 
         for group in groups:
@@ -2996,6 +3011,7 @@ class VideoDownloaderMod(loader.Module):
                             force_document=(ftype == "other"),
                             part_size_kb=512,
                         )
+                        sent_any = True
                     except Exception as e:
                         logger.warning("Single file send failed: %s", e)
                     continue
@@ -3011,6 +3027,7 @@ class VideoDownloaderMod(loader.Module):
                         parse_mode="html",
                         part_size_kb=512,
                     )
+                    sent_any = True
                 except Exception as e:
                     logger.warning("Album send failed, trying individually: %s", e)
                     for i, p in enumerate(chunk):
@@ -3026,8 +3043,10 @@ class VideoDownloaderMod(loader.Module):
                                 force_document=(ftype == "other"),
                                 part_size_kb=512,
                             )
+                            sent_any = True
                         except Exception as e2:
                             logger.warning("Single file send failed: %s", e2)
+        return sent_any
 
     @staticmethod
     def _telegram_audio_metadata(candidate) -> tuple[str, str] | None:
@@ -3294,7 +3313,10 @@ class VideoDownloaderMod(loader.Module):
             return
         try:
             await self._client.send_message(
-                "me", f"<b>✅ [{platform}]</b> <code>{url}</code>", parse_mode="html"
+                "me",
+                f"<b>✅ [{utils.escape_html(platform)}]</b> "
+                f"<code>{utils.escape_html(url)}</code>",
+                parse_mode="html",
             )
         except Exception:
             pass
@@ -3487,16 +3509,20 @@ class VideoDownloaderMod(loader.Module):
 
                 if all_images:
                     cap = self.strings("caption_photo")
-                    self._stats["photos"] += len(valid)
+                    counter = "photos"
                 elif all_audio or audio:
                     cap = self.strings("caption_audio")
-                    self._stats["audio"] += len(valid)
+                    counter = "audio"
                 else:
                     cap = self.strings("caption_video")
+                    counter = None
 
-                await self._send_album(message, valid, cap)
+                if not await self._send_album(message, valid, cap):
+                    raise RuntimeError("Telegram rejected every media upload")
                 send_ok = True
 
+                if counter:
+                    self._stats[counter] += len(valid)
                 self._stats["ok"] += 1
                 self._stats["today"] += 1
                 self._stats["platforms"][platform] += 1
@@ -3573,6 +3599,8 @@ class VideoDownloaderMod(loader.Module):
         if (not self.config.get("allow_any_url", False)
                 and not _is_supported_url(url)):
             return
+        if not await self._is_public_url(url):
+            return
 
         cd = self._cooldown_left()
         if cd:
@@ -3642,6 +3670,8 @@ class VideoDownloaderMod(loader.Module):
             return await utils.answer(message, self.strings("dl_no_url"))
 
         url = self._normalize(url)
+        if not await self._is_public_url(url):
+            return await utils.answer(message, self.strings("err_unsafe_url"))
 
         if self._queue is None:
             return
@@ -3655,7 +3685,7 @@ class VideoDownloaderMod(loader.Module):
 
         status = await utils.answer(
             message,
-            self.strings("dl_started").format(url=url)
+            self.strings("dl_started").format(url=utils.escape_html(url))
         )
         await self._queue.put(self._process(url, message, status))
 
@@ -3701,6 +3731,8 @@ class VideoDownloaderMod(loader.Module):
                 await status.edit(self.strings("music_not_found"))
             return
         url = self._normalize(url)
+        if not await self._is_public_url(url):
+            return await utils.answer(message, self.strings("err_unsafe_url"))
         if self._queue is None:
             return
         if self._queue.qsize() >= self.config["queue_max"]:
@@ -3851,16 +3883,29 @@ class VideoDownloaderMod(loader.Module):
             return await utils.answer(message, "<b>❌ Невідомий параметр.</b>")
         cfg_key, cast, unit = mapping[key]
         try:
-            val = bool(int(raw)) if cast is bool else int(raw)
+            raw_number = int(raw)
         except ValueError:
             return await utils.answer(message, "<b>❌ Значення має бути числом.</b>")
+        if cast is bool and raw_number not in {0, 1}:
+            return await utils.answer(message, "<b>❌ Логічне значення має бути 0 або 1.</b>")
+        bounds = {
+            "cooldown": (0, 86400), "limit": (0, 1_000_000),
+            "size": (1, 2048), "auto_delete": (0, 86400),
+            "retries": (0, 10), "queue_max": (1, 100),
+            "workers": (1, 4), "fragments": (1, 16),
+            "playlist_max": (1, 100), "timeout": (30, 3600),
+        }
+        if key in bounds and not bounds[key][0] <= raw_number <= bounds[key][1]:
+            low, high = bounds[key]
+            return await utils.answer(
+                message,
+                f"<b>❌ Значення має бути від <code>{low}</code> до <code>{high}</code>.</b>",
+            )
+        val = bool(raw_number) if cast is bool else raw_number
         self.config[cfg_key] = val
         if key == "workers":
-            self.config[cfg_key] = max(1, min(4, val))
-            val = self.config[cfg_key]
             self._start_queue_workers()
         elif key == "fragments":
-            self.config[cfg_key] = max(1, min(16, val))
             val = self.config[cfg_key]
         if key == "queue_max" and self._queue is not None:
             if val < 1:
@@ -3900,6 +3945,8 @@ class VideoDownloaderMod(loader.Module):
             )
 
         url = self._normalize(url)
+        if not await self._is_public_url(url):
+            return await utils.answer(message, self.strings("err_unsafe_url"))
         status = await utils.answer(message, self.strings("loading_transcript"))
         result = await self._get_transcript(url)
         if not result:
@@ -3907,21 +3954,31 @@ class VideoDownloaderMod(loader.Module):
 
         title, text = result
         self._stats["transcripts"] += 1
-        full = self.strings("transcript_header").format(title=title) + text
+        safe_title = utils.escape_html(title)
+        safe_text = utils.escape_html(text)
+        full = self.strings("transcript_header").format(title=safe_title) + safe_text
 
         if len(full) > 4096:
-            tmp_path = f"/tmp/transcript_{os.urandom(4).hex()}.txt"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(full)
-            await message.client.send_file(
-                message.chat_id, tmp_path,
-                reply_to=message.id,
-                caption=f"<b>📝 {title}</b>",
-            )
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".txt",
+                prefix="transcript_",
+                encoding="utf-8",
+                delete=False,
+            ) as transcript_file:
+                transcript_file.write(f"Transcript: {title}\n\n{text}")
+                tmp_path = transcript_file.name
             try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+                await message.client.send_file(
+                    message.chat_id, tmp_path,
+                    reply_to=message.id,
+                    caption=f"<b>📝 {safe_title}</b>",
+                )
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    logger.warning("Could not remove transcript file %s", tmp_path)
             await status.delete()
         else:
             await status.edit(full)

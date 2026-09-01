@@ -39,6 +39,7 @@ def _load_module():
     loader.validators = types.SimpleNamespace(
         String=lambda: None,
         Integer=lambda **kwargs: None,
+        Hidden=lambda validator: None,
     )
     package.loader = loader
     package.utils = utils
@@ -95,6 +96,13 @@ class HelperTests(unittest.IsolatedAsyncioTestCase):
         rendered = rkapi._fmt_user({"_tg_id": 42, "_tg_name": "Test <User>"})
         self.assertIn("Test &lt;User&gt;", rendered)
         self.assertIn("id: 42", rendered)
+
+    def test_user_formatter_escapes_api_user_id(self):
+        rendered = rkapi._fmt_user(
+            {"user": {"id": "</code><b>spoofed</b>"}}
+        )
+        self.assertNotIn("</code><b>spoofed</b>", rendered)
+        self.assertIn("&lt;/code&gt;", rendered)
 
     def test_group_formatter_rejects_unsafe_link(self):
         rendered = rkapi._fmt_group({"title": "Group", "link": "javascript:alert(1)"})

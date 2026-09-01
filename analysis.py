@@ -1,8 +1,7 @@
 # meta developer: @Huai_Baike
-# meta version: 1.0.0
+# meta version: 1.0.1
 # meta description: 📈 Повний аналіз повідомлень у поточному чаті за командою !аналіз.
 
-import calendar
 import datetime
 import time
 from collections import defaultdict
@@ -10,6 +9,16 @@ from collections import defaultdict
 from telethon.tl.types import PeerUser
 
 from .. import loader, utils
+
+WEEKDAYS_UK = (
+    "понеділок",
+    "вівторок",
+    "середа",
+    "четвер",
+    "п’ятниця",
+    "субота",
+    "неділя",
+)
 
 
 @loader.tds
@@ -60,7 +69,10 @@ class ChatAnalysisMod(loader.Module):
         try:
             text = await self._build_analysis(message, status)
         except Exception as e:
-            return await utils.answer(status, self.strings["error"].format(utils.escape_html(str(e))))
+            return await utils.answer(
+                status,
+                self.strings["error"].format(utils.escape_html(str(e))),
+            )
 
         await utils.answer(status, text)
 
@@ -222,4 +234,4 @@ class ChatAnalysisMod(loader.Module):
         if not any(weekdays):
             return "—"
         day = max(range(7), key=lambda d: weekdays[d])
-        return f"{calendar.day_name[day]} ({weekdays[day]})"
+        return f"{WEEKDAYS_UK[day]} ({weekdays[day]})"

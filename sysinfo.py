@@ -34,6 +34,35 @@ class InfoMod(loader.Module):
         "ftg_type": "<b>FTG Type:</b> <code>{}</code>",
     }
 
+    @staticmethod
+    async def _git_version() -> str:
+        git = shutil.which("git")
+        if not git:
+            return "unknown"
+        try:
+            process = await asyncio.create_subprocess_exec(
+                git,
+                "-C",
+                utils.get_base_dir(),
+                "show",
+                "-s",
+                "--format=%h %cs",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+            if process.returncode == 0 and stdout.strip():
+                return stdout.decode("utf-8", errors="replace").strip()
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.communicate()
+        except (OSError, ValueError):
+            logger.debug("Could not read git version", exc_info=True)
+        return "unknown"
+
     async def infocmd(self, message):
         """Shows system information"""
         ftg_type = "PC/Server"
@@ -42,7 +71,7 @@ class InfoMod(loader.Module):
             utils.escape_html(platform.release())
         )
         reply += "\n" + self.strings("arch", message).format(
-            utils.escape_html(platform.architecture()[0])
+            utils.escape_html(platform.machine() or "unknown")
         )
         reply += "\n" + self.strings("os", message).format(
             utils.escape_html(platform.system())
@@ -51,16 +80,12 @@ class InfoMod(loader.Module):
         if platform.system() == "Linux":
             done = False
             try:
-                a = open("/etc/os-release").readlines()
-                b = {
-                    line.split("=")[0]: line.split("=")[1].strip().strip('"')
-                    for line in a
-                }
+                release = platform.freedesktop_os_release()
                 reply += "\n" + self.strings("distro", message).format(
-                    utils.escape_html(b["PRETTY_NAME"])
+                    utils.escape_html(release.get("PRETTY_NAME") or release.get("NAME") or "unknown")
                 )
                 done = True
-            except FileNotFoundError:
+            except OSError:
                 ftg_type = "Android (Termux)"
                 getprop = shutil.which("getprop")
                 if getprop is not None:
@@ -77,22 +102,22 @@ class InfoMod(loader.Module):
                         "ro.build.version.security_patch",
                         stdout=asyncio.subprocess.PIPE,
                     )
-                    sdks, unused = await sdk.communicate()
-                    vers, unused = await ver.communicate()
-                    secs, unused = await sec.communicate()
+                    (sdks, _), (vers, _), (secs, _) = await asyncio.gather(
+                        sdk.communicate(), ver.communicate(), sec.communicate()
+                    )
                     if (
                         sdk.returncode == 0
                         and ver.returncode == 0
                         and sec.returncode == 0
                     ):
                         reply += "\n" + self.strings("android_sdk", message).format(
-                            sdks.decode("utf-8").strip()
+                            utils.escape_html(sdks.decode("utf-8", errors="replace").strip())
                         )
                         reply += "\n" + self.strings("android_ver", message).format(
-                            vers.decode("utf-8").strip()
+                            utils.escape_html(vers.decode("utf-8", errors="replace").strip())
                         )
                         reply += "\n" + self.strings("android_patch", message).format(
-                            secs.decode("utf-8").strip()
+                            utils.escape_html(secs.decode("utf-8", errors="replace").strip())
                         )
                         done = True
             if not done:
@@ -107,16 +132,16 @@ class InfoMod(loader.Module):
             ftg_type = "Heroku"
         else:
             reply += "\n" + self.strings("git_version", message).format(
-                os.popen(
-                    f'cd {utils.get_base_dir()[:-17]} && git show -s --format="%h %cd"'
-                ).read()[:-7]
+                utils.escape_html(await self._git_version())
             )
         if "LAVHOST" in os.environ:
             reply += (
                 "\n"
                 + "<b>FTG Type:</b> "
-                + f"<code>lavHost {os.getenv('LAVHOST')}</code> (@lavHost)"
+                + f"<code>lavHost {utils.escape_html(os.getenv('LAVHOST'))}</code> (@lavHost)"
             )
         else:
-            reply += "\n" + self.strings("ftg_type", message).format(ftg_type)
+            reply += "\n" + self.strings("ftg_type", message).format(
+                utils.escape_html(ftg_type)
+            )
         await utils.answer(message, reply)

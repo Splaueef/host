@@ -1,7 +1,9 @@
 # meta developer: @Huai_Baike
+# meta version: 1.1.0
 # meta syntax: .m <приклад>
 # requires: sympy pint aiohttp matplotlib numpy scipy Pillow
 
+import asyncio
 import io
 import re
 import urllib.parse
@@ -21,6 +23,8 @@ import matplotlib.ticker as ticker
 from matplotlib.colors import LinearSegmentedColormap
 
 from .. import loader, utils
+
+MAX_RENDER_BYTES = 5 * 1024 * 1024
 
 try:
     import pint
@@ -204,6 +208,7 @@ class MathSolverMod(loader.Module):
 
     async def client_ready(self, client, db):
         self.client = client
+        self._render_lock = asyncio.Lock()
 
     def parse_math(self, expr_str: str):
         s = _preprocess(expr_str)
@@ -212,6 +217,13 @@ class MathSolverMod(loader.Module):
             s = f"({left})-({right})"
         tr = standard_transformations + (implicit_multiplication_application,)
         return parse_expr(s, transformations=tr)
+
+    def _solve(self, expression: str):
+        expr = self.parse_math(expression)
+        symbols = list(expr.free_symbols)
+        if symbols:
+            return "Корені", sp.solve(expr, symbols[0])
+        return "Результат", expr.evalf()
 
     # ── .m ────────────────────────────────────────────────────────────────────
     async def mcmd(self, message):
@@ -232,18 +244,15 @@ class MathSolverMod(loader.Module):
             )
             return
         try:
-            expr = self.parse_math(args)
-            syms = list(expr.free_symbols)
-            if syms:
-                roots = sp.solve(expr, syms[0])
-                res_text = f"<b>Корені:</b> <code>{roots}</code>"
-            else:
-                res_text = f"<b>Результат:</b> <code>{expr.evalf()}</code>"
+            result_label, result_value = await asyncio.to_thread(self._solve, args)
             await message.edit(
-                f"<b>📝 Ввід:</b> <code>{args}</code>\n<b>✅ {res_text}</b>"
+                f"<b>📝 Ввід:</b> <code>{utils.escape_html(args)}</code>\n"
+                f"<b>✅ {result_label}:</b> <code>{utils.escape_html(str(result_value))}</code>"
             )
         except Exception as e:
-            await message.edit(f"<b>❌ Помилка:</b> <code>{str(e)}</code>")
+            await message.edit(
+                f"<b>❌ Помилка:</b> <code>{utils.escape_html(str(e))}</code>"
+            )
 
     # ── .conv ─────────────────────────────────────────────────────────────────
     async def convcmd(self, message):
@@ -259,9 +268,14 @@ class MathSolverMod(loader.Module):
             t_str = parts[1].strip().replace("С", "degC").replace("Ф", "degF")
             val = ureg(v_str)
             res = val.to(t_str)
-            await message.edit(f"<b>🔄 {val:~P}</b> ⮕ <b><code>{res:.4g~P}</code></b>")
+            await message.edit(
+                f"<b>🔄 {utils.escape_html(f'{val:~P}')}</b> ⮕ "
+                f"<b><code>{utils.escape_html(f'{res:.4g~P}')}</code></b>"
+            )
         except Exception as e:
-            await message.edit(f"<b>❌ Невідомо:</b> <code>{str(e)}</code>")
+            await message.edit(
+                f"<b>❌ Невідомо:</b> <code>{utils.escape_html(str(e))}</code>"
+            )
 
     # ── .mdraw ────────────────────────────────────────────────────────────────
     async def mdrawcmd(self, message):
@@ -276,14 +290,21 @@ class MathSolverMod(loader.Module):
                 "https://latex.codecogs.com/png.image?"
                 f"\\dpi{{300}}\\bg_white\\huge {urllib.parse.quote(latex_str)}"
             )
-            async with aiohttp.ClientSession() as sess, sess.get(url) as r:
-                if r.status == 200:
-                    img = io.BytesIO(await r.read())
-                    img.name = "f.png"
-                    await self.client.send_file(
-                        message.chat_id, img, reply_to=message.reply_to_msg_id
-                    )
-                    await message.delete()
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as sess, sess.get(url) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"Codecogs HTTP {r.status}")
+                data = bytearray()
+                async for chunk in r.content.iter_chunked(64 * 1024):
+                    data.extend(chunk)
+                    if len(data) > MAX_RENDER_BYTES:
+                        raise RuntimeError("rendered image is too large")
+                img = io.BytesIO(bytes(data))
+                img.name = "f.png"
+                await self.client.send_file(
+                    message.chat_id, img, reply_to=message.reply_to_msg_id
+                )
+                await message.delete()
         except Exception:
             await message.edit("<b>❌ Помилка рендеру</b>")
 
@@ -366,6 +387,10 @@ class MathSolverMod(loader.Module):
     # ── .graph ────────────────────────────────────────────────────────────────
     async def graphcmd(self, message):
         """<формула> [діапазон] | param: | polar: | heat: — Графік"""
+        async with self._render_lock:
+            await self._graph(message)
+
+    async def _graph(self, message):
         args = utils.get_args_raw(message)
         if not args:
             await message.edit(
@@ -375,6 +400,7 @@ class MathSolverMod(loader.Module):
             return
         await message.edit("<b>📈 Генерую графік...</b>")
 
+        fig = None
         try:
             # ── Визначення режиму ─────────────────────────────────────────────
             mode = 'standard'
@@ -471,7 +497,11 @@ class MathSolverMod(loader.Module):
             await self._send_fig(message, fig, ', '.join(funcs))
 
         except Exception as e:
-            await message.edit(f"<b>❌ Помилка:</b> <code>{str(e)}</code>")
+            if fig is not None:
+                plt.close(fig)
+            await message.edit(
+                f"<b>❌ Помилка:</b> <code>{utils.escape_html(str(e))}</code>"
+            )
 
     # ── Параметричний ─────────────────────────────────────────────────────────
     async def _graph_parametric(self, message, args, t_min, t_max, COLORS):
@@ -571,7 +601,12 @@ class MathSolverMod(loader.Module):
 
     # ── .graphanim ────────────────────────────────────────────────────────────
     async def graphanimcmd(self, message):
-        """<формула1> == <формула2> [кадри] [fps] — Анімований морфінг між двома heatmap-формулами (GIF)
+        """<формула1> == <формула2> [кадри] [fps] — Анімований морфінг"""
+        async with self._render_lock:
+            await self._graphanim(message)
+
+    async def _graphanim(self, message):
+        """Анімований морфінг між двома heatmap-формулами (GIF)
 
         Підтримувані режими морфінгу:
           heat: f1 == heat: f2   — heatmap → heatmap
@@ -642,34 +677,40 @@ class MathSolverMod(loader.Module):
         )
 
         try:
-            frames_imgs = await self._anim_render(
-                mode, a_str, b_str, frames, pingpong
+            frames_imgs = await asyncio.to_thread(
+                self._anim_render, mode, a_str, b_str, frames, pingpong
             )
         except Exception as e:
-            await message.edit(f"<b>❌ Помилка рендеру:</b> <code>{str(e)}</code>")
+            await message.edit(
+                f"<b>❌ Помилка рендеру:</b> <code>{utils.escape_html(str(e))}</code>"
+            )
             return
 
         # ── Збираємо GIF через Pillow ─────────────────────────────────────────
         try:
             duration_ms = max(20, 1000 // fps)
-            gif_buf = io.BytesIO()
-            frames_imgs[0].save(
-                gif_buf,
-                format='GIF',
-                save_all=True,
-                append_images=frames_imgs[1:],
-                loop=0,
-                duration=duration_ms,
-                optimize=False,
-            )
+            def _encode_gif():
+                buffer = io.BytesIO()
+                frames_imgs[0].save(
+                    buffer,
+                    format='GIF',
+                    save_all=True,
+                    append_images=frames_imgs[1:],
+                    loop=0,
+                    duration=duration_ms,
+                    optimize=False,
+                )
+                return buffer
+
+            gif_buf = await asyncio.to_thread(_encode_gif)
             gif_buf.seek(0)
             gif_buf.name = "morph.gif"
 
             caption = (
                 f"<b>🎬 Морфінг:</b>\n"
-                f"<code>{a_str[:60]}{'…' if len(a_str)>60 else ''}</code>\n"
+                f"<code>{utils.escape_html(a_str[:60])}{'…' if len(a_str)>60 else ''}</code>\n"
                 f"<b>→</b>\n"
-                f"<code>{b_str[:60]}{'…' if len(b_str)>60 else ''}</code>\n"
+                f"<code>{utils.escape_html(b_str[:60])}{'…' if len(b_str)>60 else ''}</code>\n"
                 f"<i>{frames} кадрів · {fps} fps"
                 f"{' · loop' if pingpong else ''}</i>"
             )
@@ -680,9 +721,14 @@ class MathSolverMod(loader.Module):
             )
             await message.delete()
         except Exception as e:
-            await message.edit(f"<b>❌ Помилка GIF:</b> <code>{str(e)}</code>")
+            await message.edit(
+                f"<b>❌ Помилка GIF:</b> <code>{utils.escape_html(str(e))}</code>"
+            )
+        finally:
+            for frame in frames_imgs:
+                frame.close()
 
-    async def _anim_render(
+    def _anim_render(
         self, mode: str, a_str: str, b_str: str,
         n_frames: int, pingpong: bool
     ) -> list:
@@ -810,11 +856,11 @@ class MathSolverMod(loader.Module):
                 ax.spines['polar'].set_color('#222244')
                 ax.set_yticks([])
                 buf = io.BytesIO()
-                plt.savefig(buf, format='png', bbox_inches='tight',
+                fig.savefig(buf, format='png', bbox_inches='tight',
                             facecolor='#03010f', dpi=100)
                 buf.seek(0)
                 pil_frames.append(Image.open(buf).copy().convert('RGB'))
-                plt.close('all')
+                plt.close(fig)
 
         elif mode == 'param':
             fxa, fya = _compile_param(a_str)
@@ -834,11 +880,11 @@ class MathSolverMod(loader.Module):
                 ax.plot(Xf, Yf, color='#00b4d8', linewidth=1.0)
                 ax.axis('off')
                 buf = io.BytesIO()
-                plt.savefig(buf, format='png', bbox_inches='tight',
+                fig.savefig(buf, format='png', bbox_inches='tight',
                             facecolor='#03010f', dpi=100)
                 buf.seek(0)
                 pil_frames.append(Image.open(buf).copy().convert('RGB'))
-                plt.close('all')
+                plt.close(fig)
 
         else:
             raise ValueError(f"Невідомий режим: {mode}")
@@ -868,14 +914,16 @@ class MathSolverMod(loader.Module):
 
     async def _send_fig(self, message, fig, caption_text):
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight',
-                    facecolor=fig.get_facecolor())
+        try:
+            fig.savefig(buf, format='png', bbox_inches='tight',
+                        facecolor=fig.get_facecolor())
+        finally:
+            plt.close(fig)
         buf.seek(0)
         buf.name = "graph.png"
-        plt.close('all')
         await self.client.send_file(
             message.chat_id, buf,
             reply_to=message.reply_to_msg_id,
-            caption=f"<b>📈 Графік:</b> <code>{caption_text}</code>"
+            caption=f"<b>📈 Графік:</b> <code>{utils.escape_html(caption_text)}</code>"
         )
         await message.delete()
