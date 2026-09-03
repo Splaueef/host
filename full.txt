@@ -12,4 +12,5 @@ stats
 sysinfo
 systemd
 teledocs
+timeinfo
 vdlt
