@@ -5,6 +5,7 @@ import pathlib
 import sys
 import types
 import unittest
+from collections import deque
 
 # Avoid the repository's userbot ``math.py`` shadowing the standard library
 # while asyncio/aiohttp are imported.
@@ -99,6 +100,63 @@ class GroupModeTests(unittest.TestCase):
             mistral._group_mode_matches(
                 "mention", "@myassistant_fake ні", username="myassistant"
             )
+        )
+
+
+class MemoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_current_message_is_not_duplicated_in_chat_payload(self):
+        module = object.__new__(mistral.MistralModule)
+        module.config = {
+            "agent_system_prompt": "system",
+            "agent_model": "model",
+            "max_tokens": 100,
+            "werwolf_api_key": "",
+            "werwolf_enabled": False,
+        }
+        captured = {}
+
+        async def post(path, payload):
+            captured["payload"] = payload
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        module._post = post
+        history = deque([{"role": mistral.ROLE_USER, "content": "hello"}])
+
+        result = await module._chat_history(history=history, new_msg="hello")
+
+        self.assertEqual(result, "ok")
+        user_messages = [
+            item for item in captured["payload"]["messages"]
+            if item.get("role") == mistral.ROLE_USER
+        ]
+        self.assertEqual(user_messages, [{"role": mistral.ROLE_USER, "content": "hello"}])
+
+    def test_history_limit_change_resizes_existing_deque(self):
+        module = object.__new__(mistral.MistralModule)
+        module.config = {"agent_history_limit": 2}
+        module._memory = {
+            7: deque(
+                [
+                    {"role": "user", "content": "one"},
+                    {"role": "user", "content": "two"},
+                    {"role": "user", "content": "three"},
+                ],
+                maxlen=5,
+            )
+        }
+
+        history = module._get_plain_mem(7)
+
+        self.assertEqual(history.maxlen, 2)
+        self.assertEqual([item["content"] for item in history], ["two", "three"])
+
+    def test_repository_has_no_default_werwolf_credential(self):
+        source = (pathlib.Path(__file__).parents[1] / "mistralAI.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotRegex(
+            source,
+            r'"werwolf_api_key"\s*,\s*"[A-Za-z0-9_-]{24,}"',
         )
 
 
