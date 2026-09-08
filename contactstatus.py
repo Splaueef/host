@@ -1,12 +1,15 @@
 # meta developer: @Huai_Baike
-# meta version: 3.3.0
-# meta description: 🟢 Керування списком спостереження та розширена статистика online-активності.
+# meta version: 3.4.0
+# meta description: 🟢 Watchlist, графіки, HTML/JSON та інсайти online-активності.
 # requires: matplotlib
 
 import asyncio
 import datetime
+import html as html_lib
 import io
+import json
 import logging
+import statistics
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import matplotlib
@@ -98,6 +101,19 @@ class ContactStatusMod(loader.Module):
         "chart_failed": (
             "❌ <b>Не вдалося створити графік.</b>\n"
             "<i>Подробиці записано до журналу Hikka.</i>"
+        ),
+        "export_building": "📦 <b>Готую {format}-звіт…</b>",
+        "export_usage": (
+            "⚠️ Використання: <code>.contactexport [html|json] "
+            "[today|yesterday|1–31] [@username]</code>"
+        ),
+        "export_failed": (
+            "❌ <b>Не вдалося створити звіт.</b>\n"
+            "<i>Подробиці записано до журналу Hikka.</i>"
+        ),
+        "insights_usage": (
+            "⚠️ Використання: <code>.contactinsights "
+            "[today|yesterday|1–31] [@username]</code>"
         ),
     }
 
@@ -783,6 +799,64 @@ class ContactStatusMod(loader.Module):
         return totals
 
     @staticmethod
+    def _weekday_hour_totals(intervals, tzinfo):
+        """Return person-seconds for every local weekday/hour cell."""
+        buckets = [[0.0] * 24 for _ in range(7)]
+        for spans in intervals.values():
+            for start, end in spans:
+                cursor = float(start)
+                while cursor < end:
+                    local = datetime.datetime.fromtimestamp(cursor, tzinfo)
+                    boundary = (
+                        local.replace(minute=0, second=0, microsecond=0)
+                        + datetime.timedelta(hours=1)
+                    ).timestamp()
+                    if boundary <= cursor:
+                        boundary = cursor + 3600
+                    portion_end = min(float(end), boundary)
+                    buckets[local.weekday()][local.hour] += max(
+                        0,
+                        portion_end - cursor,
+                    )
+                    cursor = portion_end
+        return buckets
+
+    @staticmethod
+    def _longest_active_streak(daily_totals):
+        longest = current = 0
+        for total in daily_totals.values():
+            if total > 0:
+                current += 1
+                longest = max(longest, current)
+            else:
+                current = 0
+        return longest
+
+    @staticmethod
+    def _regularity_label(values):
+        if len(values) < 3 or not any(values):
+            return "ще замало даних"
+        average = statistics.fmean(values)
+        variation = statistics.pstdev(values) / average if average else 0
+        if variation <= 0.35:
+            return "стабільна"
+        if variation <= 0.75:
+            return "помірно мінлива"
+        return "нерівномірна"
+
+    @staticmethod
+    def _iso_timestamp(stamp, tzinfo):
+        if stamp is None:
+            return None
+        try:
+            return datetime.datetime.fromtimestamp(
+                float(stamp),
+                tzinfo,
+            ).isoformat(timespec="seconds")
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+
+    @staticmethod
     def _bar(seconds, maximum, width=10):
         filled = round(width * seconds / maximum) if maximum else 0
         if seconds > 0 and maximum > 0:
@@ -1174,6 +1248,706 @@ class ContactStatusMod(loader.Module):
             f"Останні {days_count} дн. · "
             f"{range_start:%d.%m}–{range_end:%d.%m.%Y}"
         )
+
+    def _build_export_payload(
+        self,
+        now,
+        days_count=1,
+        offset=0,
+        user_id=None,
+    ):
+        intervals, range_start, range_end = self._period_intervals(
+            now,
+            days_count,
+            offset,
+        )
+        if user_id is not None:
+            user_id = str(user_id)
+            intervals = (
+                {user_id: intervals[user_id]}
+                if user_id in intervals
+                else {}
+            )
+
+        contacts = self.get("contacts", {})
+        active = set(self.get("active", {})) if not offset else set()
+        ordered = sorted(
+            intervals.items(),
+            key=lambda item: sum(
+                end - start for start, end in item[1]
+            ),
+            reverse=True,
+        )
+        total_seconds = sum(
+            end - start
+            for spans in intervals.values()
+            for start, end in spans
+        )
+        range_seconds = max(
+            1,
+            range_end.timestamp() - range_start.timestamp(),
+        )
+        daily = self._daily_totals(
+            intervals,
+            range_start,
+            range_end,
+            now.tzinfo,
+        )
+        hourly = self._hourly_totals(intervals, now.tzinfo)
+        heatmap = self._weekday_hour_totals(intervals, now.tzinfo)
+        overlaps = self._overlaps(intervals)
+        peak, peak_at = self._peak_details(intervals)
+        busiest_hour, busiest_hour_seconds = self._busiest_hour(
+            intervals,
+            now.tzinfo,
+        )
+        pair, pair_spans, pair_seconds = self._top_pair(intervals)
+        users = []
+        for current_id, spans in ordered:
+            profile = contacts.get(current_id, {})
+            durations = [end - start for start, end in spans]
+            per_user_daily = self._daily_totals(
+                {current_id: spans},
+                range_start,
+                range_end,
+                now.tzinfo,
+            )
+            is_live = current_id in active
+            sessions = []
+            for index, (start, end) in enumerate(spans):
+                open_session = bool(
+                    is_live
+                    and index == len(spans) - 1
+                    and abs(end - range_end.timestamp()) < 1
+                )
+                sessions.append(
+                    {
+                        "start": self._iso_timestamp(start, now.tzinfo),
+                        "end": self._iso_timestamp(end, now.tzinfo),
+                        "duration_seconds": round(end - start, 3),
+                        "open": open_session,
+                    }
+                )
+            user_total = sum(durations)
+            users.append(
+                {
+                    "id": current_id,
+                    "name": str(profile.get("name") or current_id),
+                    "username": profile.get("username"),
+                    "is_contact": bool(profile.get("is_contact")),
+                    "manual": bool(profile.get("manual")),
+                    "currently_online": is_live,
+                    "status": profile.get("status", "hidden"),
+                    "last_seen": self._iso_timestamp(
+                        profile.get("last_seen"),
+                        now.tzinfo,
+                    ),
+                    "total_seconds": round(user_total, 3),
+                    "activity_share_percent": round(
+                        user_total / total_seconds * 100,
+                        3,
+                    )
+                    if total_seconds
+                    else 0,
+                    "period_share_percent": round(
+                        user_total / range_seconds * 100,
+                        3,
+                    ),
+                    "session_count": len(spans),
+                    "average_session_seconds": round(
+                        statistics.fmean(durations),
+                        3,
+                    ),
+                    "median_session_seconds": round(
+                        statistics.median(durations),
+                        3,
+                    ),
+                    "longest_session_seconds": round(
+                        max(durations),
+                        3,
+                    ),
+                    "active_days": sum(
+                        value > 0 for value in per_user_daily.values()
+                    ),
+                    "sessions": sessions,
+                }
+            )
+
+        pair_payload = None
+        if pair:
+            first_id, second_id = pair
+            pair_payload = {
+                "first": {
+                    "id": first_id,
+                    "name": str(
+                        contacts.get(first_id, {}).get("name") or first_id
+                    ),
+                },
+                "second": {
+                    "id": second_id,
+                    "name": str(
+                        contacts.get(second_id, {}).get("name") or second_id
+                    ),
+                },
+                "shared_seconds": round(pair_seconds, 3),
+                "sessions": [
+                    {
+                        "start": self._iso_timestamp(start, now.tzinfo),
+                        "end": self._iso_timestamp(end, now.tzinfo),
+                        "duration_seconds": round(end - start, 3),
+                    }
+                    for start, end in pair_spans
+                ],
+            }
+
+        return {
+            "schema": "contactstatus.export",
+            "schema_version": 1,
+            "generated_at": now.isoformat(timespec="seconds"),
+            "timezone": {
+                "configured": self.get("timezone", "local"),
+                "effective": str(now.tzinfo),
+            },
+            "period": {
+                "label": self._period_title(
+                    now,
+                    range_start,
+                    range_end,
+                    days_count,
+                    offset,
+                ),
+                "start": range_start.isoformat(timespec="seconds"),
+                "end": range_end.isoformat(timespec="seconds"),
+                "days": days_count,
+                "offset_days": offset,
+            },
+            "subject_user_id": user_id,
+            "summary": {
+                "user_count": len(intervals),
+                "currently_online": len(set(intervals) & active),
+                "session_count": sum(len(spans) for spans in intervals.values()),
+                "person_seconds": round(total_seconds, 3),
+                "coverage_seconds": round(
+                    self._union_duration(intervals),
+                    3,
+                ),
+                "shared_seconds": round(
+                    sum(end - start for start, end in overlaps),
+                    3,
+                ),
+                "longest_session_seconds": round(
+                    max(
+                        (
+                            end - start
+                            for spans in intervals.values()
+                            for start, end in spans
+                        ),
+                        default=0,
+                    ),
+                    3,
+                ),
+                "concurrent_peak": peak,
+                "concurrent_peak_at": self._iso_timestamp(
+                    peak_at,
+                    now.tzinfo,
+                ),
+                "busiest_hour": busiest_hour,
+                "busiest_hour_person_seconds": round(
+                    busiest_hour_seconds,
+                    3,
+                ),
+                "active_days": sum(value > 0 for value in daily.values()),
+                "longest_active_streak_days": self._longest_active_streak(
+                    daily
+                ),
+            },
+            "daily_activity": [
+                {
+                    "date": day.isoformat(),
+                    "person_seconds": round(value, 3),
+                }
+                for day, value in daily.items()
+            ],
+            "hourly_activity": [
+                {"hour": hour, "person_seconds": round(value, 3)}
+                for hour, value in enumerate(hourly)
+            ],
+            "weekday_hour_heatmap": [
+                {
+                    "weekday": weekday,
+                    "person_seconds": [round(value, 3) for value in row],
+                }
+                for weekday, row in enumerate(heatmap)
+            ],
+            "top_pair": pair_payload,
+            "users": users,
+            "privacy_note": (
+                "Звіт містить чутливу статистику присутності. "
+                "Поширюйте його лише за згодою людей у звіті."
+            ),
+        }
+
+    def _insights_report(
+        self,
+        now,
+        days_count=1,
+        offset=0,
+        user_id=None,
+    ):
+        payload = self._build_export_payload(
+            now,
+            days_count,
+            offset,
+            user_id,
+        )
+        if not payload["users"]:
+            return self.strings["empty"]
+
+        hourly = [
+            item["person_seconds"]
+            for item in payload["hourly_activity"]
+        ]
+        daily = {
+            item["date"]: item["person_seconds"]
+            for item in payload["daily_activity"]
+        }
+        all_sessions = [
+            session
+            for user in payload["users"]
+            for session in user["sessions"]
+        ]
+        durations = [
+            session["duration_seconds"] for session in all_sessions
+        ]
+        top_hours = sorted(
+            range(24),
+            key=lambda hour: hourly[hour],
+            reverse=True,
+        )[:3]
+        top_hours = [hour for hour in top_hours if hourly[hour] > 0]
+        dayparts = (
+            ("🌙 ніч", sum(hourly[0:6])),
+            ("🌅 ранок", sum(hourly[6:12])),
+            ("☀️ день", sum(hourly[12:18])),
+            ("🌆 вечір", sum(hourly[18:24])),
+        )
+        daypart, daypart_total = max(dayparts, key=lambda item: item[1])
+        total = payload["summary"]["person_seconds"]
+        daypart_share = daypart_total / total * 100 if total else 0
+        weekday_names = (
+            "понеділок",
+            "вівторок",
+            "середа",
+            "четвер",
+            "п’ятниця",
+            "субота",
+            "неділя",
+        )
+        weekday_totals = [
+            sum(row["person_seconds"])
+            for row in payload["weekday_hour_heatmap"]
+        ]
+        top_weekday = max(range(7), key=lambda day: weekday_totals[day])
+        regularity = self._regularity_label(list(daily.values()))
+
+        union_spans = self._merge_spans(
+            [
+                [
+                    datetime.datetime.fromisoformat(session["start"]).timestamp(),
+                    datetime.datetime.fromisoformat(session["end"]).timestamp(),
+                ]
+                for session in all_sessions
+            ]
+        )
+        gaps = [
+            union_spans[index][0] - union_spans[index - 1][1]
+            for index in range(1, len(union_spans))
+        ]
+        subject = "усі користувачі"
+        if user_id is not None:
+            current_id = str(user_id)
+            subject = self._profile_link(
+                current_id,
+                self.get("contacts", {}).get(current_id, {}),
+            )
+
+        hours_text = " · ".join(
+            f"<b>{hour:02d}:00</b> ({self._precise_duration(hourly[hour])})"
+            for hour in top_hours
+        )
+        summary = payload["summary"]
+        text = (
+            "🧠 <b>ContactStatus · інсайти</b>\n"
+            f"📅 <b>{payload['period']['label']}</b>\n"
+            f"👤 Об’єкт: {subject}\n\n"
+            "⏱ <b>Типовий ритм</b>\n"
+            f"• Медіанний сеанс: "
+            f"<b>{self._precise_duration(statistics.median(durations))}</b>\n"
+            f"• Середній сеанс: "
+            f"<b>{self._precise_duration(statistics.fmean(durations))}</b>\n"
+            f"• Найдовший: "
+            f"<b>{self._precise_duration(max(durations))}</b>\n\n"
+            "🎯 <b>Патерн активності</b>\n"
+            f"• Переважно: <b>{daypart}</b> "
+            f"({daypart_share:.1f}% часу)\n"
+            f"• Пікові години: {hours_text}\n"
+            f"• Найактивніший день тижня: "
+            f"<b>{weekday_names[top_weekday]}</b>\n\n"
+            "📆 <b>Стабільність</b>\n"
+            f"• Активних днів: <b>{summary['active_days']}</b> із "
+            f"<b>{len(daily)}</b>\n"
+            f"• Найдовша серія: "
+            f"<b>{summary['longest_active_streak_days']} дн.</b>\n"
+            f"• Регулярність: <b>{regularity}</b>"
+        )
+        if gaps:
+            text += (
+                "\n• Найдовша пауза між сеансами: "
+                f"<b>{self._precise_duration(max(gaps))}</b>"
+            )
+        pair = payload["top_pair"]
+        if pair:
+            text += (
+                "\n\n🤝 <b>Соціальний сигнал</b>\n"
+                f"Найчастіше разом: "
+                f"<b>{utils.escape_html(pair['first']['name'])}</b> + "
+                f"<b>{utils.escape_html(pair['second']['name'])}</b> · "
+                f"{self._precise_duration(pair['shared_seconds'])}"
+            )
+        if days_count < 3:
+            text += (
+                "\n\n<i>Висновки за 1–2 дні попередні; "
+                "для патернів краще вибрати 7–31 день.</i>"
+            )
+        return text
+
+    def _render_json_export(self, payload):
+        buffer = io.BytesIO(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=False,
+            ).encode("utf-8")
+        )
+        start = payload["period"]["start"][:10]
+        end = payload["period"]["end"][:10]
+        buffer.name = f"contactstatus-{start}-{end}.json"
+        return buffer
+
+    def _render_html_export(self, payload):
+        h = lambda value: html_lib.escape(str(value), quote=True)
+        summary = payload["summary"]
+        users = payload["users"]
+        maximum_user = max(
+            (user["total_seconds"] for user in users),
+            default=0,
+        )
+        maximum_day = max(
+            (
+                item["person_seconds"]
+                for item in payload["daily_activity"]
+            ),
+            default=0,
+        )
+        hourly = [
+            item["person_seconds"]
+            for item in payload["hourly_activity"]
+        ]
+        maximum_hour = max(hourly, default=0)
+        heat_maximum = max(
+            (
+                value
+                for row in payload["weekday_hour_heatmap"]
+                for value in row["person_seconds"]
+            ),
+            default=0,
+        )
+        weekday_names = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд")
+
+        cards = (
+            ("Людей з активністю", summary["user_count"]),
+            ("Сеансів", summary["session_count"]),
+            ("Людино-час", self._precise_duration(summary["person_seconds"])),
+            (
+                "Хоча б хтось online",
+                self._precise_duration(summary["coverage_seconds"]),
+            ),
+            (
+                "Щонайменше двоє",
+                self._precise_duration(summary["shared_seconds"]),
+            ),
+            (
+                "Найдовший сеанс",
+                self._precise_duration(summary["longest_session_seconds"]),
+            ),
+            ("Одночасний пік", summary["concurrent_peak"]),
+            ("Активних днів", summary["active_days"]),
+        )
+        card_html = "".join(
+            (
+                '<article class="metric">'
+                f'<span class="metric-label">{h(label)}</span>'
+                f'<strong>{h(value)}</strong>'
+                "</article>"
+            )
+            for label, value in cards
+        )
+
+        ranking_html = []
+        for rank, user in enumerate(users, 1):
+            width = (
+                max(1.5, user["total_seconds"] / maximum_user * 100)
+                if maximum_user
+                else 0
+            )
+            username = (
+                f"@{user['username']}" if user.get("username") else user["id"]
+            )
+            online = (
+                '<span class="online">зараз online</span>'
+                if user["currently_online"]
+                else ""
+            )
+            ranking_html.append(
+                '<div class="rank-row">'
+                f'<span class="rank">{rank}</span>'
+                '<div class="rank-body">'
+                '<div class="rank-head">'
+                f'<strong>{h(user["name"])}</strong>{online}'
+                f'<span>{h(username)}</span>'
+                "</div>"
+                '<div class="track"><span style="width:'
+                f'{width:.2f}%"></span></div>'
+                '<div class="rank-meta">'
+                f'<b>{h(self._precise_duration(user["total_seconds"]))}</b>'
+                f' · {user["session_count"]} '
+                f'{self._session_word(user["session_count"])}'
+                f' · {user["activity_share_percent"]:.1f}% загальної активності'
+                "</div></div></div>"
+            )
+
+        day_rows = []
+        for item in payload["daily_activity"]:
+            width = (
+                max(1, item["person_seconds"] / maximum_day * 100)
+                if maximum_day and item["person_seconds"]
+                else 0
+            )
+            day = datetime.date.fromisoformat(item["date"])
+            day_rows.append(
+                '<div class="day-row">'
+                f'<time datetime="{h(item["date"])}">{day:%d.%m}</time>'
+                '<div class="track"><span style="width:'
+                f'{width:.2f}%"></span></div>'
+                f'<b>{h(self._precise_duration(item["person_seconds"]))}</b>'
+                "</div>"
+            )
+
+        hour_bars = []
+        for hour, value in enumerate(hourly):
+            height = (
+                max(2, value / maximum_hour * 100)
+                if maximum_hour and value
+                else 0
+            )
+            label = f"{hour:02d}" if hour % 3 == 0 else ""
+            hour_bars.append(
+                '<div class="hour" title="'
+                f'{hour:02d}:00 · {h(self._precise_duration(value))}">'
+                f'<span style="height:{height:.2f}%"></span>'
+                f'<small>{label}</small></div>'
+            )
+
+        heat_header = "".join(
+            f"<th>{hour:02d}</th>" for hour in range(24)
+        )
+        heat_rows = []
+        for row_index, row in enumerate(payload["weekday_hour_heatmap"]):
+            cells = []
+            for hour, value in enumerate(row["person_seconds"]):
+                intensity = value / heat_maximum if heat_maximum else 0
+                alpha = 0.06 + intensity * 0.88 if value else 0.025
+                cells.append(
+                    '<td style="background:rgba(56,189,248,'
+                    f'{alpha:.3f})" title="{weekday_names[row_index]} '
+                    f'{hour:02d}:00 · {h(self._precise_duration(value))}">'
+                    '<span class="sr-only">'
+                    f'{h(self._precise_duration(value))}</span></td>'
+                )
+            heat_rows.append(
+                f"<tr><th>{weekday_names[row_index]}</th>{''.join(cells)}</tr>"
+            )
+
+        user_sections = []
+        for rank, user in enumerate(users, 1):
+            username = (
+                f"@{user['username']}" if user.get("username") else "без username"
+            )
+            search = f"{user['name']} {username} {user['id']}".lower()
+            session_rows = []
+            for number, session in enumerate(user["sessions"], 1):
+                start = datetime.datetime.fromisoformat(session["start"])
+                end = datetime.datetime.fromisoformat(session["end"])
+                end_text = "зараз" if session["open"] else end.strftime(
+                    "%d.%m.%Y %H:%M:%S"
+                )
+                session_rows.append(
+                    "<tr>"
+                    f"<td>{number}</td>"
+                    f'<td><time datetime="{h(session["start"])}">'
+                    f"{start:%d.%m.%Y %H:%M:%S}</time></td>"
+                    f'<td><time datetime="{h(session["end"])}">'
+                    f"{h(end_text)}</time></td>"
+                    '<td class="number">'
+                    f'{h(self._precise_duration(session["duration_seconds"]))}'
+                    "</td>"
+                    "</tr>"
+                )
+            online = " · 🟢 online" if user["currently_online"] else ""
+            opened = " open" if rank <= 3 else ""
+            user_sections.append(
+                f'<details class="user" data-search="{h(search)}"{opened}>'
+                "<summary><span>"
+                f'<b>{rank}. {h(user["name"])}</b>'
+                f"<small>{h(username)} · ID {h(user['id'])}{online}</small>"
+                "</span>"
+                f'<strong>{h(self._precise_duration(user["total_seconds"]))}</strong>'
+                "</summary>"
+                '<div class="user-metrics">'
+                f'<span><b>{user["session_count"]}</b> сеансів</span>'
+                '<span>медіана <b>'
+                f'{h(self._precise_duration(user["median_session_seconds"]))}'
+                "</b></span>"
+                '<span>максимум <b>'
+                f'{h(self._precise_duration(user["longest_session_seconds"]))}'
+                "</b></span>"
+                f'<span><b>{user["active_days"]}</b> активних днів</span>'
+                "</div>"
+                '<div class="table-wrap"><table><thead><tr>'
+                "<th>#</th><th>Вхід</th><th>Вихід</th><th>Тривалість</th>"
+                "</tr></thead><tbody>"
+                f"{''.join(session_rows)}</tbody></table></div></details>"
+            )
+
+        pair = payload["top_pair"]
+        pair_html = ""
+        if pair:
+            pair_html = (
+                '<section class="panel pair"><h2>🤝 Найчастіше разом</h2>'
+                f'<p><b>{h(pair["first"]["name"])}</b> + '
+                f'<b>{h(pair["second"]["name"])}</b></p>'
+                f'<strong>{h(self._precise_duration(pair["shared_seconds"]))}</strong>'
+                "</section>"
+            )
+
+        period = payload["period"]
+        generated_at = datetime.datetime.fromisoformat(payload["generated_at"])
+        document = f"""<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ContactStatus — {h(period['label'])}</title>
+  <style>
+    :root{{--bg:#07111f;--panel:#0f1b2d;--panel2:#122238;--text:#e8f0fa;
+      --muted:#8fa3ba;--line:#223650;--blue:#38bdf8;--violet:#a78bfa;
+      --green:#34d399;--amber:#fbbf24}}
+    *{{box-sizing:border-box}} body{{margin:0;background:radial-gradient(circle at 85% 0,
+      #14264a 0,#07111f 38%);color:var(--text);font:15px/1.5 Inter,system-ui,
+      -apple-system,"Segoe UI",sans-serif}} main{{width:min(1180px,calc(100% - 32px));
+      margin:0 auto;padding:42px 0 70px}} header{{display:flex;justify-content:space-between;
+      gap:28px;align-items:flex-end;margin-bottom:26px}} h1{{font-size:clamp(28px,5vw,48px);
+      line-height:1.05;margin:0 0 10px}} h1 span{{color:var(--blue)}} h2{{font-size:20px;
+      margin:0 0 18px}} p{{margin:0}} .eyebrow{{color:var(--blue);font-weight:750;
+      letter-spacing:.12em;text-transform:uppercase;font-size:12px}} .subtitle,.muted{{color:var(--muted)}}
+    .generated{{text-align:right;color:var(--muted);font-size:13px}} .metrics{{display:grid;
+      grid-template-columns:repeat(4,1fr);gap:12px;margin:22px 0}} .metric,.panel{{background:
+      linear-gradient(145deg,rgba(18,34,56,.96),rgba(12,25,43,.96));border:1px solid var(--line);
+      box-shadow:0 16px 40px rgba(0,0,0,.2);border-radius:16px}} .metric{{padding:17px}}
+    .metric-label{{display:block;color:var(--muted);font-size:12px;min-height:36px}}
+    .metric strong{{display:block;font-size:21px;margin-top:5px}} .layout{{display:grid;
+      grid-template-columns:1.15fr .85fr;gap:14px;margin:14px 0}} .panel{{padding:22px;
+      overflow:hidden}} .rank-row{{display:grid;grid-template-columns:28px 1fr;gap:10px;
+      margin:15px 0}} .rank{{font-weight:800;color:var(--amber)}} .rank-head{{display:flex;
+      flex-wrap:wrap;gap:7px;align-items:center}} .rank-head>span:not(.online){{color:var(--muted);
+      margin-left:auto;font-size:12px}} .online{{color:#052e25;background:var(--green);
+      border-radius:99px;padding:2px 7px;font-size:10px;font-weight:800}} .track{{height:8px;
+      background:#081321;border-radius:99px;overflow:hidden;margin:7px 0}} .track span{{display:block;
+      height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--blue),var(--violet))}}
+    .rank-meta{{font-size:12px;color:var(--muted)}} .rank-meta b{{color:var(--text)}}
+    .day-row{{display:grid;grid-template-columns:48px 1fr 92px;gap:10px;align-items:center;
+      margin:10px 0}} .day-row time,.day-row b{{font-size:12px}} .hour-chart{{height:190px;
+      display:grid;grid-template-columns:repeat(24,1fr);gap:4px;align-items:end;border-bottom:
+      1px solid var(--line);padding-top:18px}} .hour{{height:100%;display:flex;flex-direction:column;
+      justify-content:flex-end;align-items:center}} .hour span{{display:block;width:100%;min-width:2px;
+      background:linear-gradient(180deg,var(--amber),var(--blue));border-radius:4px 4px 0 0}}
+    .hour small{{height:20px;color:var(--muted);font-size:9px;padding-top:5px}}
+    .heat-wrap,.table-wrap{{overflow-x:auto}} .heatmap{{border-collapse:separate;border-spacing:3px;
+      min-width:900px;width:100%}} .heatmap th{{color:var(--muted);font-size:9px;font-weight:600}}
+    .heatmap td{{height:25px;border-radius:4px;border:1px solid rgba(255,255,255,.025)}}
+    .pair{{display:flex;align-items:center;gap:20px}} .pair h2{{margin:0;margin-right:auto}}
+    .pair>strong{{font-size:20px;color:var(--amber)}} .history-head{{display:flex;
+      justify-content:space-between;gap:16px;align-items:center;margin-bottom:14px}}
+    input{{width:min(360px,100%);background:#071321;color:var(--text);border:1px solid var(--line);
+      border-radius:10px;padding:10px 13px;outline:none}} input:focus{{border-color:var(--blue)}}
+    details.user{{border-top:1px solid var(--line)}} details.user:last-child{{border-bottom:
+      1px solid var(--line)}} summary{{cursor:pointer;display:flex;justify-content:space-between;
+      align-items:center;gap:15px;padding:16px 4px;list-style:none}} summary::-webkit-details-marker{{display:none}}
+    summary span{{display:flex;flex-direction:column}} summary small{{color:var(--muted)}}
+    summary>strong{{white-space:nowrap}} .user-metrics{{display:flex;flex-wrap:wrap;gap:8px;
+      margin:0 0 14px}} .user-metrics span{{background:#081523;border:1px solid var(--line);
+      border-radius:99px;padding:5px 10px;color:var(--muted);font-size:12px}}
+    table:not(.heatmap){{width:100%;border-collapse:collapse;min-width:620px}} table:not(.heatmap) th,
+      table:not(.heatmap) td{{text-align:left;padding:9px;border-bottom:1px solid var(--line);
+      font-size:12px}} table:not(.heatmap) th{{color:var(--muted)}} td.number{{text-align:right}}
+    footer{{color:var(--muted);font-size:12px;margin-top:22px;padding:16px;border-left:3px solid
+      var(--amber);background:rgba(251,191,36,.06)}} .sr-only{{position:absolute;width:1px;
+      height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;
+      border:0}} [hidden]{{display:none!important}}
+    @media(max-width:850px){{.metrics{{grid-template-columns:repeat(2,1fr)}}.layout{{grid-template-columns:1fr}}
+      header{{align-items:flex-start;flex-direction:column}}.generated{{text-align:left}}}}
+    @media(max-width:520px){{main{{width:min(100% - 20px,1180px);padding-top:25px}}.metrics{{grid-template-columns:1fr 1fr}}
+      .metric{{padding:13px}}.panel{{padding:16px}}.history-head{{align-items:flex-start;
+      flex-direction:column}}.pair{{align-items:flex-start;flex-direction:column}}}}
+    @media print{{body{{background:#fff;color:#111}}main{{width:100%;padding:0}}.metric,.panel{{box-shadow:none;
+      background:#fff;border-color:#ccc}}input{{display:none}}.subtitle,.muted,.generated{{color:#555}}
+      details{{break-inside:avoid}}details.user{{display:block}}details.user>*{{display:block!important}}}}
+  </style>
+</head>
+<body><main>
+  <header><div><div class="eyebrow">ContactStatus · повний звіт</div>
+    <h1>Активність <span>online</span></h1>
+    <p class="subtitle">{h(period['label'])} · {h(payload['timezone']['effective'])}</p></div>
+    <div class="generated">Сформовано<br><b>{generated_at:%d.%m.%Y %H:%M:%S}</b></div></header>
+  <section class="metrics">{card_html}</section>
+  <div class="layout"><section class="panel"><h2>🏆 Рейтинг</h2>{''.join(ranking_html)}</section>
+    <section class="panel"><h2>📆 Динаміка за днями</h2>{''.join(day_rows)}</section></div>
+  <section class="panel"><h2>🕘 Активність за годинами</h2>
+    <div class="hour-chart">{''.join(hour_bars)}</div></section>
+  <section class="panel" style="margin-top:14px"><h2>🗺 Теплова мапа · день × година</h2>
+    <p class="muted" style="margin-bottom:14px">Яскравіша клітинка означає більше часу online.</p>
+    <div class="heat-wrap"><table class="heatmap"><thead><tr><th></th>{heat_header}</tr></thead>
+      <tbody>{''.join(heat_rows)}</tbody></table></div></section>
+  {pair_html}
+  <section class="panel" style="margin-top:14px"><div class="history-head"><div><h2>🕓 Повна хронологія</h2>
+    <p class="muted">Усі {summary['session_count']} сеанси без скорочень.</p></div>
+    <input id="search" type="search" placeholder="Пошук за ім’ям, @username або ID"></div>
+    <div id="users">{''.join(user_sections)}</div><p id="no-results" class="muted" hidden>Нічого не знайдено.</p></section>
+  <footer>⚠️ {h(payload['privacy_note'])} Файл не завантажує зовнішні ресурси.</footer>
+</main><script>
+  const input=document.querySelector('#search');
+  const cards=[...document.querySelectorAll('.user')];
+  const empty=document.querySelector('#no-results');
+  input.addEventListener('input',()=>{{const query=input.value.trim().toLocaleLowerCase('uk');
+    let visible=0;cards.forEach(card=>{{const show=card.dataset.search.includes(query);
+      card.hidden=!show;if(show)visible++;}});empty.hidden=visible!==0;}});
+</script></body></html>"""
+        buffer = io.BytesIO(document.encode("utf-8"))
+        start = period["start"][:10]
+        end = period["end"][:10]
+        buffer.name = f"contactstatus-{start}-{end}.html"
+        return buffer
 
     def _timeline_blocks(
         self,
@@ -1617,6 +2391,70 @@ class ContactStatusMod(loader.Module):
         user = await self._resolve_user(message, raw)
         return str(user.id) if user not in (None, False) else user
 
+    async def _parse_period_target(self, message, tokens, usage):
+        period_token = None
+        target_token = ""
+        aliases = {"today", "сьогодні", "yesterday", "вчора"}
+        for token in tokens:
+            lowered = token.lower()
+            if lowered in aliases:
+                if period_token is not None:
+                    await utils.answer(message, usage)
+                    return None
+                period_token = lowered
+            elif lowered.isdigit():
+                if (
+                    period_token is not None
+                    or not 1 <= int(lowered) <= self.RETENTION_DAYS
+                ):
+                    await utils.answer(message, usage)
+                    return None
+                period_token = lowered
+            elif not target_token:
+                target_token = token
+            else:
+                await utils.answer(message, usage)
+                return None
+
+        period_token = period_token or "today"
+        if period_token in {"today", "сьогодні"}:
+            days_count, offset = 1, 0
+        elif period_token in {"yesterday", "вчора"}:
+            days_count, offset = 1, 1
+        else:
+            days_count, offset = int(period_token), 0
+
+        user_id = None
+        if target_token:
+            user_id = await self._resolve_target_id(message, target_token)
+        else:
+            try:
+                reply = await message.get_reply_message()
+            except Exception:
+                reply = None
+            if reply:
+                user = await reply.get_sender()
+                user_id = (
+                    str(user.id)
+                    if user and getattr(user, "id", None)
+                    else None
+                )
+
+        if user_id is False:
+            await utils.answer(
+                message,
+                self.strings["user_not_found"].format(
+                    utils.escape_html(target_token or "reply")
+                ),
+            )
+            return None
+        if user_id is not None:
+            user_id = str(user_id)
+            if user_id not in self._watched():
+                await utils.answer(message, self.strings["not_watched"])
+                return None
+        return days_count, offset, user_id
+
     @loader.command(ru_doc="Панель стану ContactStatus")
     async def contactstatus(self, message):
         """ℹ️ Стан модуля, синхронізації та коротка довідка"""
@@ -1685,6 +2523,8 @@ class ContactStatusMod(loader.Module):
             "<code>.contactremove @user</code> — призупинити\n"
             "<code>.contactstats 7 @user</code> — статистика\n"
             "<code>.contactchart 7 @user</code> — PNG-графік\n"
+            "<code>.contactexport html 7</code> — HTML/JSON-звіт\n"
+            "<code>.contactinsights 7 @user</code> — інсайти\n"
             "<code>.contactcompare @a @b 7</code> — порівняти\n"
             "<code>.contactsync</code> — синхронізувати зараз"
         )
@@ -2190,6 +3030,109 @@ class ContactStatusMod(loader.Module):
         finally:
             if chart is not None:
                 chart.close()
+
+    @loader.command(ru_doc="Експортувати всю статистику в HTML або JSON")
+    async def contactexport(self, message):
+        """📦 .contactexport [html|json] [today|yesterday|1–31] [@user]"""
+        tokens = utils.get_args_raw(message).strip().split()
+        export_format = "html"
+        format_tokens = [
+            token.lower()
+            for token in tokens
+            if token.lower() in {"html", "json"}
+        ]
+        if len(format_tokens) > 1:
+            await utils.answer(message, self.strings["export_usage"])
+            return
+        if format_tokens:
+            export_format = format_tokens[0]
+            removed = False
+            remaining = []
+            for token in tokens:
+                if not removed and token.lower() == export_format:
+                    removed = True
+                    continue
+                remaining.append(token)
+            tokens = remaining
+
+        parsed = await self._parse_period_target(
+            message,
+            tokens,
+            self.strings["export_usage"],
+        )
+        if parsed is None:
+            return
+        days_count, offset, user_id = parsed
+        now = self._now()
+        payload = self._build_export_payload(
+            now,
+            days_count,
+            offset,
+            user_id,
+        )
+        if not payload["users"]:
+            await utils.answer(message, self.strings["empty"])
+            return
+
+        await utils.answer(
+            message,
+            self.strings["export_building"].format(
+                format=export_format.upper()
+            ),
+        )
+        export_file = None
+        try:
+            renderer = (
+                self._render_html_export
+                if export_format == "html"
+                else self._render_json_export
+            )
+            export_file = await asyncio.to_thread(renderer, payload)
+            caption = (
+                f"📦 <b>ContactStatus · {export_format.upper()}-звіт</b>\n"
+                f"📅 <b>{payload['period']['label']}</b>\n"
+                f"👥 Користувачів: <b>{payload['summary']['user_count']}</b> · "
+                f"сеансів: <b>{payload['summary']['session_count']}</b>\n"
+                "⚠️ <i>У файлі є чутлива статистика присутності.</i>"
+            )
+            await self._client.send_file(
+                message.peer_id,
+                export_file,
+                caption=caption,
+                parse_mode="html",
+                reply_to=getattr(message, "reply_to_msg_id", None),
+            )
+            try:
+                await message.delete()
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("ContactStatus: export rendering failed")
+            await utils.answer(message, self.strings["export_failed"])
+        finally:
+            if export_file is not None:
+                export_file.close()
+
+    @loader.command(ru_doc="Показати автоматичні інсайти активності")
+    async def contactinsights(self, message):
+        """🧠 .contactinsights [today|yesterday|1–31] [@user / reply]"""
+        parsed = await self._parse_period_target(
+            message,
+            utils.get_args_raw(message).strip().split(),
+            self.strings["insights_usage"],
+        )
+        if parsed is None:
+            return
+        days_count, offset, user_id = parsed
+        await utils.answer(
+            message,
+            self._insights_report(
+                self._now(),
+                days_count,
+                offset,
+                user_id,
+            ),
+        )
 
     @loader.command(ru_doc="Порівняти online-активність двох користувачів")
     async def contactcompare(self, message):
