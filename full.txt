@@ -2,6 +2,7 @@ quietschedule
 dailynews
 analysis
 backup
+contactstatus
 eval
 gemmaself
 math
