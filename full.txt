@@ -6,6 +6,7 @@ contactstatus
 eval
 gemmaself
 math
+modulehub
 mistralAI
 nekospy
 purge
