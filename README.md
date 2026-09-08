@@ -9,6 +9,18 @@ The original repository was copied manually and uploaded as a separate project s
 
 The purpose of this repository is to maintain hosting-related files used by custom builds, forks, and related tools.
 
+## ModuleHub
+
+`modulehub.py` додає єдине owner-only inline-меню для основних модулів репозиторію. Воно автоматично показує тільки актуальні команди завантажених модулів, підтримує категорії, пошук, пагінацію, введення аргументів, запуск команд у відповіді на повідомлення та підтвердження небезпечних дій.
+
+Відкрити панель: `.modmenu` або `.hub`.
+
+Встановити окремо:
+
+```text
+.dlmod https://raw.githubusercontent.com/Splaueef/host/main/modulehub.py
+```
+
 Original projects that used these resources include:
 
 - https://github.com/hikariatama/Hikka
