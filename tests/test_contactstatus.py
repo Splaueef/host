@@ -270,6 +270,62 @@ class ContactStatusTests(unittest.TestCase):
             "█░░░░░░░░░",
         )
 
+    def test_chart_renderer_returns_a_png_dashboard(self):
+        day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
+        self.module._store_interval(
+            1,
+            day.replace(hour=8),
+            day.replace(hour=10),
+        )
+        self.module._store_interval(
+            2,
+            day.replace(hour=9),
+            day.replace(hour=11),
+        )
+        intervals, start, end = self.module._period_intervals(
+            day.replace(hour=12)
+        )
+
+        chart = self.module._render_chart(
+            intervals,
+            self.module.get("contacts"),
+            start,
+            end,
+            1,
+            "Сьогодні · 00:00–12:00",
+        )
+
+        self.assertEqual(chart.name, "contactstatus-chart.png")
+        self.assertTrue(chart.getvalue().startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertGreater(len(chart.getvalue()), 20000)
+        chart.close()
+
+    def test_daily_chart_buckets_include_empty_days(self):
+        start = datetime.datetime(2026, 9, 6, tzinfo=UTC)
+        end = datetime.datetime(2026, 9, 9, tzinfo=UTC)
+        intervals = {
+            "1": [
+                [
+                    start.timestamp(),
+                    (start + datetime.timedelta(hours=1)).timestamp(),
+                ]
+            ]
+        }
+
+        totals = self.module._daily_totals(
+            intervals,
+            start,
+            end,
+            UTC,
+        )
+
+        self.assertEqual(len(totals), 3)
+        self.assertEqual(totals[start.date()], 3600)
+        self.assertEqual(
+            totals[(start + datetime.timedelta(days=1)).date()],
+            0,
+        )
+
     def test_open_session_is_counted_without_being_closed(self):
         day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
         self.module._set_online(1, True, day.replace(hour=7))
