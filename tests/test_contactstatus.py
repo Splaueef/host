@@ -215,11 +215,11 @@ class ContactStatusTests(unittest.TestCase):
         report = self.module._report(day.replace(hour=12))
 
         self.assertIn("&lt;Alice&gt;", report)
-        self.assertIn("08:00–10:00", report)
-        self.assertIn("Людино-час: <b>4 год</b>", report)
+        self.assertIn("08:00:00–10:00:00", report)
+        self.assertIn("Сумарна активність: <b>4 год</b>", report)
         self.assertIn("Одночасний пік: <b>2</b>", report)
         self.assertIn(
-            "Коли online були щонайменше двоє:</b> 1 год",
+            "Щонайменше двоє online: <b>1 год</b>",
             report,
         )
 
@@ -236,10 +236,38 @@ class ContactStatusTests(unittest.TestCase):
             user_id="1",
         )
 
-        self.assertIn("ContactStatus · користувач", report)
-        self.assertIn("Загалом: <b>2 год</b>", report)
-        self.assertIn("Сеансів: <b>1</b>", report)
+        self.assertIn("👤 <b>ContactStatus</b>", report)
+        self.assertIn("У мережі: <b>2 год</b>", report)
+        self.assertIn("Входів: <b>1</b>", report)
+        self.assertIn("08:00:00–10:00:00", report)
         self.assertIn("@alice", report)
+
+    def test_all_sessions_are_shown_and_long_reports_are_paginated(self):
+        day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
+        for minute in range(0, 360, 3):
+            start = day + datetime.timedelta(hours=6, minutes=minute)
+            self.module._store_interval(
+                1,
+                start,
+                start + datetime.timedelta(seconds=45),
+            )
+
+        pages = self.module._report_pages(
+            day.replace(hour=13),
+            user_id="1",
+        )
+        complete = "\n".join(pages)
+
+        self.assertGreater(len(pages), 1)
+        self.assertTrue(all(len(page) < 4096 for page in pages))
+        self.assertIn("01. <code>06:00:00–06:00:45</code>", complete)
+        self.assertIn("120. <code>11:57:00–11:57:45</code>", complete)
+
+    def test_short_activity_still_has_visible_bar(self):
+        self.assertEqual(
+            self.module._bar(1, 1000),
+            "█░░░░░░░░░",
+        )
 
     def test_open_session_is_counted_without_being_closed(self):
         day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
@@ -432,4 +460,3 @@ class ContactStatusAsyncTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
