@@ -1,6 +1,6 @@
 # meta developer: @Huai_Baike
-# meta version: 1.0.0
-# meta description: 🟢 Щоденна статистика online-статусу контактів.
+# meta version: 2.0.0
+# meta description: 🟢 Детальна статистика online-активності контактів.
 
 import datetime
 import logging
@@ -9,7 +9,6 @@ from telethon.tl.functions.contacts import GetContactsRequest
 from telethon.tl.types import UpdateUserStatus, UserStatusOnline
 
 from .. import loader, utils
-
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +20,21 @@ class ContactStatusMod(loader.Module):
     strings = {
         "name": "ContactStatus",
         "empty": (
-            "📭 <b>Сьогодні online-активність контактів ще не "
+            "📭 <b>Online-активність контактів за цей період не "
             "зафіксована.</b>\n<i>Модуль бачить лише статуси, які Telegram "
             "дозволяє бачити.</i>"
         ),
         "load_failed": "ContactStatus: не вдалося завантажити контакти",
+        "bad_period": (
+            "⚠️ <b>Невірний період.</b> Використайте: "
+            "<code>.contactstats [today|yesterday|7]</code>"
+        ),
+        "cleared": "🗑 <b>Історію online-активності очищено.</b>",
     }
+
+    RETENTION_DAYS = 31
+    MAX_CONTACTS = 15
+    MAX_PERIODS = 4
 
     async def client_ready(self, client, db):
         self._client = client
@@ -50,6 +58,7 @@ class ContactStatusMod(loader.Module):
             # would incorrectly look online for the entire downtime.
             for key in set(self.get("active", {})) | online:
                 self._set_online(key, key in online, now)
+            self._prune(now.date())
         except Exception:
             logger.exception(self.strings["load_failed"])
 
@@ -89,14 +98,29 @@ class ContactStatusMod(loader.Module):
         cursor = start
         while cursor.date() < end.date():
             boundary = self._day_start(cursor) + datetime.timedelta(days=1)
-            days.setdefault(cursor.date().isoformat(), {}).setdefault(
-                str(user_id), []
-            ).append([cursor.timestamp(), boundary.timestamp()])
+            self._append_interval(
+                days, cursor.date().isoformat(), user_id, cursor, boundary
+            )
             cursor = boundary
-        days.setdefault(cursor.date().isoformat(), {}).setdefault(
-            str(user_id), []
-        ).append([cursor.timestamp(), end.timestamp()])
+        self._append_interval(days, cursor.date().isoformat(), user_id, cursor, end)
         self.set("days", days)
+
+    @staticmethod
+    def _append_interval(days, day, user_id, start, end):
+        """Append a span, coalescing duplicate/adjacent Telegram updates."""
+        spans = days.setdefault(day, {}).setdefault(str(user_id), [])
+        current = [start.timestamp(), end.timestamp()]
+        if spans and current[0] <= spans[-1][1] + 1:
+            spans[-1][1] = max(spans[-1][1], current[1])
+        else:
+            spans.append(current)
+
+    def _prune(self, today):
+        cutoff = today - datetime.timedelta(days=self.RETENTION_DAYS - 1)
+        days = self.get("days", {})
+        fresh = {key: value for key, value in days.items() if key >= cutoff.isoformat()}
+        if fresh != days:
+            self.set("days", fresh)
 
     def _set_online(self, user_id, online, moment=None):
         moment = moment or self._now()
@@ -122,15 +146,42 @@ class ContactStatusMod(loader.Module):
         start = self._day_start(now)
         result = {
             key: [list(interval) for interval in intervals]
-            for key, intervals in self.get("days", {}).get(
-                now.date().isoformat(), {}
-            ).items()
+            for key, intervals in self.get("days", {})
+            .get(now.date().isoformat(), {})
+            .items()
         }
         for key, stamp in self.get("active", {}).items():
             session_start = max(float(stamp), start.timestamp())
             if session_start < now.timestamp():
                 result.setdefault(key, []).append([session_start, now.timestamp()])
         return result
+
+    def _period_intervals(self, now, days_count=1, offset=0):
+        """Return persisted and live spans clipped to a local-day range."""
+        end_day = now.date() - datetime.timedelta(days=offset)
+        start_day = end_day - datetime.timedelta(days=days_count - 1)
+        range_start = self._day_start(now).replace(
+            year=start_day.year, month=start_day.month, day=start_day.day
+        )
+        range_end = min(
+            now,
+            self._day_start(now).replace(
+                year=end_day.year, month=end_day.month, day=end_day.day
+            )
+            + datetime.timedelta(days=1),
+        )
+        result = {}
+        cursor = start_day
+        stored = self.get("days", {})
+        while cursor <= end_day:
+            for user_id, spans in stored.get(cursor.isoformat(), {}).items():
+                result.setdefault(user_id, []).extend([list(span) for span in spans])
+            cursor += datetime.timedelta(days=1)
+        for user_id, stamp in self.get("active", {}).items():
+            begin = max(float(stamp), range_start.timestamp())
+            if begin < range_end.timestamp():
+                result.setdefault(user_id, []).append([begin, range_end.timestamp()])
+        return result, range_start, range_end
 
     @staticmethod
     def _duration(seconds):
@@ -166,45 +217,109 @@ class ContactStatusMod(loader.Module):
                 began = None
         return overlaps
 
-    def _report(self, now):
-        intervals = self._today_intervals(now)
+    @staticmethod
+    def _peak_online(intervals):
+        events = []
+        for spans in intervals.values():
+            for start, end in spans:
+                events.extend(((start, 1), (end, -1)))
+        current = peak = 0
+        for _, delta in sorted(events, key=lambda item: (item[0], item[1])):
+            current += delta
+            peak = max(peak, current)
+        return peak
+
+    @staticmethod
+    def _bar(seconds, maximum, width=10):
+        filled = round(width * seconds / maximum) if maximum else 0
+        return "█" * filled + "░" * (width - filled)
+
+    def _report(self, now, days_count=1, offset=0):
+        intervals, range_start, range_end = self._period_intervals(
+            now, days_count, offset
+        )
         if not intervals:
             return self.strings["empty"]
         contacts = self.get("contacts", {})
-        start = self._day_start(now).strftime("%H:%M")
-        text = (
-            f"🟢 <b>Активність контактів</b>\n"
-            f"📅 Сьогодні, <b>{start}–{now.strftime('%H:%M:%S')}</b>\n\n"
-        )
         ordered = sorted(
             intervals.items(),
             key=lambda item: sum(end - begin for begin, end in item[1]),
             reverse=True,
         )
-        for user_id, spans in ordered:
+        all_time = sum(sum(end - begin for begin, end in spans) for _, spans in ordered)
+        active_now = (
+            len(set(intervals) & set(self.get("active", {}))) if not offset else 0
+        )
+        period = (
+            f"сьогодні, {range_start:%H:%M}–{range_end:%H:%M}"
+            if days_count == 1 and not offset
+            else f"{range_start:%d.%m.%Y}–{range_end:%d.%m.%Y}"
+        )
+        text = (
+            f"🟢 <b>ContactStatus · огляд</b>\n"
+            f"📅 <b>{period}</b>\n\n"
+            f"👥 Активних: <b>{len(intervals)}</b>"
+            f"  ·  🟢 Зараз: <b>{active_now}</b>\n"
+            f"⏱ Сумарно: <b>{self._duration(all_time)}</b>"
+            f"  ·  📈 Пік: <b>{self._peak_online(intervals)}</b>\n\n"
+            "🏆 <b>Рейтинг активності</b>\n"
+        )
+        maximum = sum(end - begin for begin, end in ordered[0][1])
+        for index, (user_id, spans) in enumerate(ordered[: self.MAX_CONTACTS], 1):
             contact = contacts.get(user_id, {})
             name = utils.escape_html(str(contact.get("name", user_id)))
             total = sum(end - begin for begin, end in spans)
-            periods = ", ".join(
+            periods = " · ".join(
                 f"{self._clock(begin, now.tzinfo)}–{self._clock(end, now.tzinfo)}"
-                for begin, end in spans
+                for begin, end in spans[-self.MAX_PERIODS :]
+            )
+            status = (
+                " 🟢" if str(user_id) in self.get("active", {}) and not offset else ""
             )
             text += (
-                f"👤 <b>{name}</b> — {self._duration(total)}\n"
-                f"<code>{periods}</code>\n\n"
+                f"\n<b>{index}. {name}</b>{status}  ·  <b>{self._duration(total)}</b>\n"
+                f"<code>{self._bar(total, maximum)}  {len(spans)} сеанс.</code>\n"
+                f"└ <code>{periods}</code>"
             )
+            if len(spans) > self.MAX_PERIODS:
+                text += f" <i>(+ще {len(spans) - self.MAX_PERIODS})</i>"
+            text += "\n"
+        if len(ordered) > self.MAX_CONTACTS:
+            text += f"\n<i>…і ще {len(ordered) - self.MAX_CONTACTS} контактів</i>\n"
         overlaps = self._overlaps(intervals)
-        text += "🤝 <b>Спільний online:</b> "
+        text += "\n🤝 <b>Спільний online:</b> "
         if not overlaps:
             return text + "—"
         total = sum(end - begin for begin, end in overlaps)
-        text += self._duration(total) + "\n" + "\n".join(
-            f"<code>{self._clock(begin, now.tzinfo)}–{self._clock(end, now.tzinfo)}</code>"
-            for begin, end in overlaps
+        text += (
+            self._duration(total)
+            + "\n"
+            + "\n".join(
+                f"<code>{self._clock(begin, now.tzinfo)}–{self._clock(end, now.tzinfo)}</code>"
+                for begin, end in overlaps[-self.MAX_PERIODS :]
+            )
         )
         return text
 
     @loader.command(ru_doc="Online-статистика контактів з 00:00 до поточного часу")
     async def contactstats(self, message):
-        """📊 Показати online-статистику контактів з 00:00 до зараз"""
-        await utils.answer(message, self._report(self._now()))
+        """📊 Статистика: .contactstats [today|yesterday|7]"""
+        argument = utils.get_args_raw(message).strip().lower()
+        if argument in ("", "today", "сьогодні"):
+            report = self._report(self._now())
+        elif argument in ("yesterday", "вчора"):
+            report = self._report(self._now(), offset=1)
+        elif argument.isdigit() and 1 <= int(argument) <= self.RETENTION_DAYS:
+            report = self._report(self._now(), days_count=int(argument))
+        else:
+            report = self.strings["bad_period"]
+        await utils.answer(message, report)
+
+    @loader.command(ru_doc="Очистити історію online-активності")
+    async def contactclear(self, message):
+        """🗑 Очистити накопичену статистику"""
+        self.set("days", {})
+        # Keep currently open sessions, but restart their measurement now.
+        now = self._now().timestamp()
+        self.set("active", {key: now for key in self.get("active", {})})
+        await utils.answer(message, self.strings["cleared"])
