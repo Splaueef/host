@@ -1,10 +1,19 @@
 # meta developer: @Huai_Baike
-# meta version: 3.2.0
+# meta version: 3.3.0
 # meta description: 🟢 Керування списком спостереження та розширена статистика online-активності.
+# requires: matplotlib
 
+import asyncio
 import datetime
+import io
 import logging
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
 
 from telethon.tl.functions.contacts import GetContactsRequest
 from telethon.tl.types import UpdateUserStatus, UserStatusOnline
@@ -85,6 +94,11 @@ class ContactStatusMod(loader.Module):
             "[today|yesterday|1–31]</code>"
         ),
         "same_user": "⚠️ <b>Для порівняння потрібні два різні користувачі.</b>",
+        "chart_building": "📊 <b>Створюю графічний звіт…</b>",
+        "chart_failed": (
+            "❌ <b>Не вдалося створити графік.</b>\n"
+            "<i>Подробиці записано до журналу Hikka.</i>"
+        ),
     }
 
     RETENTION_DAYS = 31
@@ -94,10 +108,12 @@ class ContactStatusMod(loader.Module):
     MAX_CONTACTS = 12
     LIST_PAGE_SIZE = 15
     MESSAGE_LIMIT = 3800
+    CHART_MAX_USERS = 10
 
     async def client_ready(self, client, db):
         self._client = client
         self._syncing = False
+        self._chart_lock = asyncio.Lock()
         self._ensure_storage()
 
         now = self._now()
@@ -709,7 +725,7 @@ class ContactStatusMod(loader.Module):
         return sum(end - start for start, end in cls._merge_spans(spans))
 
     @staticmethod
-    def _busiest_hour(intervals, tzinfo):
+    def _hourly_totals(intervals, tzinfo):
         buckets = [0.0] * 24
         for spans in intervals.values():
             for start, end in spans:
@@ -720,11 +736,51 @@ class ContactStatusMod(loader.Module):
                         local.replace(minute=0, second=0, microsecond=0)
                         + datetime.timedelta(hours=1)
                     ).timestamp()
+                    if boundary <= cursor:
+                        boundary = cursor + 3600
                     portion_end = min(float(end), boundary)
                     buckets[local.hour] += max(0, portion_end - cursor)
                     cursor = portion_end
+        return buckets
+
+    @classmethod
+    def _busiest_hour(cls, intervals, tzinfo):
+        buckets = cls._hourly_totals(intervals, tzinfo)
         maximum = max(buckets, default=0)
         return (buckets.index(maximum), maximum) if maximum else (None, 0)
+
+    @classmethod
+    def _daily_totals(cls, intervals, range_start, range_end, tzinfo):
+        totals = {}
+        cursor = range_start.date()
+        while cursor <= (range_end - datetime.timedelta(microseconds=1)).date():
+            totals[cursor] = 0.0
+            cursor += datetime.timedelta(days=1)
+
+        for spans in intervals.values():
+            for raw_start, raw_end in spans:
+                cursor_dt = datetime.datetime.fromtimestamp(
+                    raw_start,
+                    tzinfo,
+                )
+                end_dt = datetime.datetime.fromtimestamp(raw_end, tzinfo)
+                while cursor_dt.date() < end_dt.date():
+                    boundary = cls._day_start(cursor_dt) + datetime.timedelta(
+                        days=1
+                    )
+                    totals[cursor_dt.date()] = (
+                        totals.get(cursor_dt.date(), 0)
+                        + boundary.timestamp()
+                        - cursor_dt.timestamp()
+                    )
+                    cursor_dt = boundary
+                if end_dt > cursor_dt:
+                    totals[cursor_dt.date()] = (
+                        totals.get(cursor_dt.date(), 0)
+                        + end_dt.timestamp()
+                        - cursor_dt.timestamp()
+                    )
+        return totals
 
     @staticmethod
     def _bar(seconds, maximum, width=10):
@@ -738,6 +794,353 @@ class ContactStatusMod(loader.Module):
     def _profile_link(user_id, profile):
         name = utils.escape_html(str(profile.get("name") or user_id))
         return f'<a href="tg://user?id={user_id}">{name}</a>'
+
+    @staticmethod
+    def _chart_name(user_id, profile, limit=22):
+        name = str(profile.get("name") or user_id).replace("\n", " ").strip()
+        return name if len(name) <= limit else name[: limit - 1] + "…"
+
+    @staticmethod
+    def _chart_scale(values):
+        maximum = max(values, default=0)
+        if maximum >= 3600:
+            return 3600, "години"
+        if maximum >= 60:
+            return 60, "хвилини"
+        return 1, "секунди"
+
+    @staticmethod
+    def _style_chart_axis(ax, grid_axis="y"):
+        ax.set_facecolor("#111827")
+        ax.tick_params(colors="#cbd5e1", labelsize=9)
+        ax.title.set_color("#f8fafc")
+        ax.xaxis.label.set_color("#cbd5e1")
+        ax.yaxis.label.set_color("#cbd5e1")
+        for spine in ax.spines.values():
+            spine.set_color("#334155")
+        ax.grid(
+            True,
+            axis=grid_axis,
+            color="#334155",
+            alpha=0.45,
+            linewidth=0.7,
+        )
+        ax.set_axisbelow(True)
+
+    def _draw_timeline(
+        self,
+        ax,
+        ordered,
+        contacts,
+        range_start,
+        range_end,
+    ):
+        palette = (
+            "#38bdf8",
+            "#a78bfa",
+            "#34d399",
+            "#fbbf24",
+            "#fb7185",
+            "#22d3ee",
+            "#c084fc",
+            "#4ade80",
+            "#f97316",
+            "#60a5fa",
+        )
+        shown = ordered[: self.CHART_MAX_USERS]
+        shown = list(reversed(shown))
+        for row, (user_id, spans) in enumerate(shown):
+            color = palette[(len(shown) - row - 1) % len(palette)]
+            bars = [
+                (
+                    mdates.date2num(
+                        datetime.datetime.fromtimestamp(
+                            start,
+                            range_start.tzinfo,
+                        )
+                    ),
+                    (end - start) / 86400,
+                )
+                for start, end in spans
+            ]
+            ax.broken_barh(
+                bars,
+                (row - 0.32, 0.64),
+                facecolors=color,
+                edgecolors=color,
+                linewidth=0.5,
+                alpha=0.92,
+            )
+        ax.set_yticks(range(len(shown)))
+        ax.set_yticklabels(
+            [
+                self._chart_name(
+                    user_id,
+                    contacts.get(user_id, {}),
+                )
+                for user_id, _ in shown
+            ]
+        )
+        ax.set_xlim(
+            mdates.date2num(range_start),
+            mdates.date2num(range_end),
+        )
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=5, maxticks=10))
+        ax.xaxis.set_major_formatter(
+            mdates.DateFormatter(
+                "%H:%M",
+                tz=range_start.tzinfo,
+            )
+        )
+        ax.set_title(
+            "Хронологія online-сеансів",
+            loc="left",
+            fontsize=13,
+            color="#f8fafc",
+        )
+        ax.set_xlabel("Час")
+        subtitle = f"Показано {len(shown)}"
+        if len(ordered) > len(shown):
+            subtitle += f" із {len(ordered)} найактивніших"
+        ax.text(
+            1,
+            1.02,
+            subtitle,
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            color="#94a3b8",
+            fontsize=8,
+        )
+        self._style_chart_axis(ax, "x")
+
+    def _draw_daily(
+        self,
+        ax,
+        intervals,
+        range_start,
+        range_end,
+    ):
+        totals = self._daily_totals(
+            intervals,
+            range_start,
+            range_end,
+            range_start.tzinfo,
+        )
+        labels = [day.strftime("%d.%m") for day in totals]
+        raw_values = list(totals.values())
+        divisor, unit = self._chart_scale(raw_values)
+        values = [value / divisor for value in raw_values]
+        colors = [
+            "#fbbf24" if value == max(values, default=0) and value else "#38bdf8"
+            for value in values
+        ]
+        ax.bar(labels, values, color=colors, alpha=0.9, width=0.72)
+        ax.plot(labels, values, color="#a78bfa", marker="o", linewidth=2)
+        ax.set_title(
+            "Активність за днями",
+            loc="left",
+            fontsize=13,
+            color="#f8fafc",
+        )
+        ax.set_ylabel(unit.capitalize())
+        if len(labels) > 10:
+            ax.tick_params(axis="x", rotation=45)
+        self._style_chart_axis(ax)
+
+    def _draw_hourly(self, ax, intervals, tzinfo):
+        raw_values = self._hourly_totals(intervals, tzinfo)
+        divisor, unit = self._chart_scale(raw_values)
+        values = [value / divisor for value in raw_values]
+        maximum = max(values, default=0)
+        colors = [
+            "#fbbf24" if value == maximum and value else "#38bdf8"
+            for value in values
+        ]
+        ax.bar(range(24), values, color=colors, alpha=0.9, width=0.78)
+        ax.set_xticks(range(0, 24, 2))
+        ax.set_xticklabels([f"{hour:02d}" for hour in range(0, 24, 2)])
+        ax.set_xlim(-0.7, 23.7)
+        ax.set_title(
+            "Розподіл за годинами",
+            loc="left",
+            fontsize=12,
+            color="#f8fafc",
+        )
+        ax.set_xlabel("Година доби")
+        ax.set_ylabel(unit.capitalize())
+        self._style_chart_axis(ax)
+
+    def _draw_ranking(self, ax, ordered, contacts):
+        shown = ordered[: self.CHART_MAX_USERS]
+        raw_values = [
+            sum(end - start for start, end in spans)
+            for _, spans in shown
+        ]
+        divisor, unit = self._chart_scale(raw_values)
+        values = [value / divisor for value in reversed(raw_values)]
+        labels = [
+            self._chart_name(user_id, contacts.get(user_id, {}), 18)
+            for user_id, _ in reversed(shown)
+        ]
+        colors = ["#38bdf8"] * len(values)
+        if colors:
+            colors[-1] = "#fbbf24"
+        ax.barh(labels, values, color=colors, alpha=0.9, height=0.68)
+        for row, (value, raw_value) in enumerate(
+            zip(values, reversed(raw_values))
+        ):
+            ax.text(
+                value,
+                row,
+                f"  {self._precise_duration(raw_value)}",
+                va="center",
+                color="#e2e8f0",
+                fontsize=8,
+            )
+        ax.set_title(
+            "Рейтинг активності",
+            loc="left",
+            fontsize=12,
+            color="#f8fafc",
+        )
+        ax.set_xlabel(unit.capitalize())
+        self._style_chart_axis(ax, "x")
+
+    def _draw_session_distribution(self, ax, spans):
+        raw_values = [end - start for start, end in spans]
+        divisor, unit = self._chart_scale(raw_values)
+        values = [value / divisor for value in raw_values]
+        bins = max(1, min(10, len(values)))
+        ax.hist(
+            values,
+            bins=bins,
+            color="#a78bfa",
+            edgecolor="#c4b5fd",
+            alpha=0.9,
+        )
+        ax.set_title(
+            "Тривалість сеансів",
+            loc="left",
+            fontsize=12,
+            color="#f8fafc",
+        )
+        ax.set_xlabel(unit.capitalize())
+        ax.set_ylabel("Кількість")
+        self._style_chart_axis(ax)
+
+    def _render_chart(
+        self,
+        intervals,
+        contacts,
+        range_start,
+        range_end,
+        days_count,
+        period,
+        user_id=None,
+    ):
+        ordered = sorted(
+            intervals.items(),
+            key=lambda item: sum(
+                end - start for start, end in item[1]
+            ),
+            reverse=True,
+        )
+        figure = plt.figure(figsize=(14, 10), dpi=140)
+        figure.patch.set_facecolor("#0b1120")
+        grid = figure.add_gridspec(
+            2,
+            2,
+            height_ratios=(1.35, 1),
+            hspace=0.38,
+            wspace=0.28,
+        )
+        main_ax = figure.add_subplot(grid[0, :])
+        hourly_ax = figure.add_subplot(grid[1, 0])
+        detail_ax = figure.add_subplot(grid[1, 1])
+
+        if days_count == 1:
+            self._draw_timeline(
+                main_ax,
+                ordered,
+                contacts,
+                range_start,
+                range_end,
+            )
+        else:
+            self._draw_daily(
+                main_ax,
+                intervals,
+                range_start,
+                range_end,
+            )
+        self._draw_hourly(hourly_ax, intervals, range_start.tzinfo)
+        if user_id is None:
+            self._draw_ranking(detail_ax, ordered, contacts)
+            subject = "усі користувачі"
+        else:
+            self._draw_session_distribution(
+                detail_ax,
+                intervals[user_id],
+            )
+            subject = self._chart_name(
+                user_id,
+                contacts.get(user_id, {}),
+                40,
+            )
+
+        session_count = sum(len(spans) for spans in intervals.values())
+        total = sum(
+            end - start
+            for spans in intervals.values()
+            for start, end in spans
+        )
+        figure.suptitle(
+            "ContactStatus — графічний звіт",
+            x=0.06,
+            y=0.975,
+            ha="left",
+            color="#f8fafc",
+            fontsize=19,
+            fontweight="bold",
+        )
+        figure.text(
+            0.06,
+            0.94,
+            f"{period}  •  {subject}",
+            color="#94a3b8",
+            fontsize=10,
+        )
+        figure.text(
+            0.5,
+            0.018,
+            (
+                f"{session_count} {self._session_word(session_count)}  •  "
+                f"{self._precise_duration(total)} сумарної активності"
+            ),
+            ha="center",
+            color="#94a3b8",
+            fontsize=9,
+        )
+        figure.subplots_adjust(
+            left=0.09,
+            right=0.96,
+            top=0.89,
+            bottom=0.08,
+        )
+        buffer = io.BytesIO()
+        try:
+            figure.savefig(
+                buffer,
+                format="png",
+                facecolor=figure.get_facecolor(),
+                bbox_inches="tight",
+            )
+        finally:
+            plt.close(figure)
+        buffer.seek(0)
+        buffer.name = "contactstatus-chart.png"
+        return buffer
 
     def _presence(self, user_id, profile, now=None):
         if str(user_id) in self.get("active", {}):
@@ -1281,6 +1684,7 @@ class ContactStatusMod(loader.Module):
             "<code>.contactadd @user</code> — додати користувача\n"
             "<code>.contactremove @user</code> — призупинити\n"
             "<code>.contactstats 7 @user</code> — статистика\n"
+            "<code>.contactchart 7 @user</code> — PNG-графік\n"
             "<code>.contactcompare @a @b 7</code> — порівняти\n"
             "<code>.contactsync</code> — синхронізувати зараз"
         )
@@ -1648,6 +2052,144 @@ class ContactStatusMod(loader.Module):
                 user_id,
             ),
         )
+
+    @loader.command(ru_doc="Створити PNG-графік online-активності")
+    async def contactchart(self, message):
+        """📊 .contactchart [today|yesterday|1–31] [@username / reply]"""
+        tokens = utils.get_args_raw(message).strip().split()
+        period_token = None
+        target_token = ""
+        for token in tokens:
+            lowered = token.lower()
+            is_period = (
+                lowered
+                in {"today", "сьогодні", "yesterday", "вчора"}
+                or (
+                    lowered.isdigit()
+                    and 1 <= int(lowered) <= self.RETENTION_DAYS
+                )
+            )
+            if is_period and period_token is None:
+                period_token = lowered
+            elif not is_period and not target_token:
+                target_token = token
+            else:
+                await utils.answer(message, self.strings["bad_period"])
+                return
+
+        period_token = period_token or "today"
+        if period_token in {"today", "сьогодні"}:
+            days_count, offset = 1, 0
+        elif period_token in {"yesterday", "вчора"}:
+            days_count, offset = 1, 1
+        else:
+            days_count, offset = int(period_token), 0
+
+        user_id = None
+        if target_token:
+            user_id = await self._resolve_target_id(
+                message,
+                target_token,
+            )
+        elif tokens:
+            try:
+                reply = await message.get_reply_message()
+            except Exception:
+                reply = None
+            if reply:
+                user = await reply.get_sender()
+                user_id = (
+                    str(user.id)
+                    if user and getattr(user, "id", None)
+                    else None
+                )
+
+        if user_id is False:
+            await utils.answer(
+                message,
+                self.strings["user_not_found"].format(
+                    utils.escape_html(target_token)
+                ),
+            )
+            return
+        if user_id is not None:
+            user_id = str(user_id)
+            if user_id not in self._watched():
+                await utils.answer(message, self.strings["not_watched"])
+                return
+
+        now = self._now()
+        intervals, range_start, range_end = self._period_intervals(
+            now,
+            days_count,
+            offset,
+        )
+        if user_id is not None:
+            intervals = (
+                {user_id: intervals[user_id]}
+                if user_id in intervals
+                else {}
+            )
+        if not intervals:
+            await utils.answer(message, self.strings["empty"])
+            return
+
+        await utils.answer(message, self.strings["chart_building"])
+        contacts = {
+            key: dict(value)
+            for key, value in self.get("contacts", {}).items()
+        }
+        period = self._period_title(
+            now,
+            range_start,
+            range_end,
+            days_count,
+            offset,
+        )
+        if not hasattr(self, "_chart_lock"):
+            self._chart_lock = asyncio.Lock()
+        chart = None
+        try:
+            async with self._chart_lock:
+                chart = await asyncio.to_thread(
+                    self._render_chart,
+                    intervals,
+                    contacts,
+                    range_start,
+                    range_end,
+                    days_count,
+                    period,
+                    user_id,
+                )
+            caption = (
+                "📊 <b>ContactStatus · графічний звіт</b>\n"
+                f"📅 <b>{period}</b>"
+            )
+            if user_id is not None:
+                caption += (
+                    "\n👤 "
+                    + self._profile_link(
+                        user_id,
+                        contacts.get(user_id, {}),
+                    )
+                )
+            await self._client.send_file(
+                message.peer_id,
+                chart,
+                caption=caption,
+                parse_mode="html",
+                reply_to=getattr(message, "reply_to_msg_id", None),
+            )
+            try:
+                await message.delete()
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("ContactStatus: chart rendering failed")
+            await utils.answer(message, self.strings["chart_failed"])
+        finally:
+            if chart is not None:
+                chart.close()
 
     @loader.command(ru_doc="Порівняти online-активність двох користувачів")
     async def contactcompare(self, message):
