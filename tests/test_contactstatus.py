@@ -171,6 +171,37 @@ class _Reply:
         return self.sender
 
 
+class _InlineCall:
+    def __init__(self):
+        self.form = {"chat": 100}
+        self.edits = []
+        self.callback_answers = []
+
+    async def edit(self, text, reply_markup=None):
+        self.edits.append(
+            {"text": text, "reply_markup": reply_markup}
+        )
+        return True
+
+    async def answer(self, text):
+        self.callback_answers.append(text)
+
+
+class _InlineManager:
+    def __init__(self):
+        self.forms = []
+
+    async def form(self, text, message, reply_markup=None):
+        self.forms.append(
+            {
+                "text": text,
+                "message": message,
+                "reply_markup": reply_markup,
+            }
+        )
+        return True
+
+
 class ContactStatusTests(unittest.TestCase):
     def setUp(self):
         self.module = contactstatus.ContactStatusMod()
@@ -779,6 +810,100 @@ class ContactStatusAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sent["name"].endswith(".html"))
         self.assertIn(b"<!doctype html>", sent["content"])
         self.assertIn("HTML-звіт", sent["caption"])
+
+    async def test_contactstats_opens_paginated_inline_navigator(self):
+        day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
+        self.module.set(
+            "contacts",
+            {"1": {"name": "Alice", "username": "alice"}},
+        )
+        self.module.set("watchlist", ["1"])
+        for minute in range(0, 360, 3):
+            start = day + datetime.timedelta(hours=6, minutes=minute)
+            self.module._store_interval(
+                1,
+                start,
+                start + datetime.timedelta(seconds=45),
+            )
+        self.module._now = lambda: day.replace(hour=13)
+        self.module.inline = _InlineManager()
+
+        await self.module.contactstats(_Message("today"))
+
+        self.assertEqual(len(self.module.inline.forms), 1)
+        form = self.module.inline.forms[0]
+        labels = [
+            button["text"]
+            for row in form["reply_markup"]
+            for button in row
+        ]
+        self.assertIn("◀️", labels)
+        self.assertIn("▶️", labels)
+        self.assertIn("• Сьогодні", labels)
+        self.assertIn("🌐 HTML", labels)
+        self.assertIn("📈 PNG-графік", labels)
+
+    async def test_inline_picker_pages_through_all_watched_users(self):
+        profiles = {
+            str(user_id): {"name": f"User {user_id}"}
+            for user_id in range(1, 19)
+        }
+        self.module.set("contacts", profiles)
+        self.module.set("watchlist", list(profiles))
+        call = _InlineCall()
+
+        await self.module._inline_user_picker(call, 7, 0)
+
+        self.assertEqual(len(call.edits), 1)
+        edit = call.edits[0]
+        self.assertIn("У списку спостереження: <b>18</b>", edit["text"])
+        labels = [
+            button["text"]
+            for row in edit["reply_markup"]
+            for button in row
+        ]
+        self.assertIn("1/3", labels)
+        user_buttons = [label for label in labels if label.startswith("⚪️")]
+        self.assertEqual(len(user_buttons), self.module.INLINE_LIST_PAGE_SIZE)
+
+    async def test_contactstatus_opens_main_inline_panel(self):
+        self.module.inline = _InlineManager()
+
+        await self.module.contactstatus(_Message())
+
+        form = self.module.inline.forms[0]
+        labels = [
+            button["text"]
+            for row in form["reply_markup"]
+            for button in row
+        ]
+        self.assertIn("📊 Статистика", labels)
+        self.assertIn("👥 Список", labels)
+        self.assertIn("🔄 Синхронізувати", labels)
+
+    async def test_inline_export_button_sends_file_to_form_chat(self):
+        day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
+        self.module.set(
+            "contacts",
+            {"1": {"name": "Alice", "username": "alice"}},
+        )
+        self.module.set("watchlist", ["1"])
+        self.module._store_interval(
+            1,
+            day.replace(hour=8),
+            day.replace(hour=9),
+        )
+        self.module._now = lambda: day.replace(hour=12)
+        self.module._client = _Client()
+        call = _InlineCall()
+
+        await self.module._inline_send_asset(call, "json", 1, 0)
+
+        self.assertEqual(call.callback_answers, ["Готую файл…"])
+        self.assertEqual(len(self.module._client.sent_files), 1)
+        sent = self.module._client.sent_files[0]
+        self.assertEqual(sent["peer_id"], call.form["chat"])
+        self.assertTrue(sent["name"].endswith(".json"))
 
 
 if __name__ == "__main__":
