@@ -2,6 +2,7 @@
 
 import datetime
 import importlib.util
+import json
 import pathlib
 import sys
 import types
@@ -124,6 +125,7 @@ class _Client:
     def __init__(self, contacts=None, entities=None):
         self.contacts = contacts or []
         self.entities = entities or {}
+        self.sent_files = []
 
     async def __call__(self, request):
         return types.SimpleNamespace(users=self.contacts)
@@ -134,15 +136,31 @@ class _Client:
             raise ValueError("not found")
         return self.entities[key]
 
+    async def send_file(self, peer_id, file, **kwargs):
+        self.sent_files.append(
+            {
+                "peer_id": peer_id,
+                "name": file.name,
+                "content": file.getvalue(),
+                **kwargs,
+            }
+        )
+
 
 class _Message:
     def __init__(self, args="", reply=None):
         self.args = args
         self.reply = reply
         self.answers = []
+        self.peer_id = 100
+        self.reply_to_msg_id = None
+        self.deleted = False
 
     async def get_reply_message(self):
         return self.reply
+
+    async def delete(self):
+        self.deleted = True
 
 
 class _Reply:
@@ -325,6 +343,99 @@ class ContactStatusTests(unittest.TestCase):
             totals[(start + datetime.timedelta(days=1)).date()],
             0,
         )
+
+    def test_export_payload_is_complete_and_excludes_secrets(self):
+        day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
+        self.module.get("contacts")["1"]["access_hash"] = "secret"
+        for hour in (8, 10):
+            self.module._store_interval(
+                1,
+                day.replace(hour=hour),
+                day.replace(hour=hour, minute=15),
+            )
+
+        payload = self.module._build_export_payload(day.replace(hour=12))
+
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["summary"]["session_count"], 2)
+        self.assertEqual(len(payload["users"][0]["sessions"]), 2)
+        self.assertEqual(payload["users"][0]["median_session_seconds"], 900)
+        self.assertNotIn("access_hash", json.dumps(payload))
+
+    def test_json_export_is_valid_utf8_with_all_sessions(self):
+        day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
+        self.module._store_interval(
+            1,
+            day.replace(hour=8),
+            day.replace(hour=9),
+        )
+        payload = self.module._build_export_payload(day.replace(hour=12))
+
+        export = self.module._render_json_export(payload)
+        decoded = json.loads(export.getvalue().decode("utf-8"))
+
+        self.assertEqual(decoded["users"][0]["name"], "<Alice>")
+        self.assertEqual(decoded["users"][0]["sessions"][0]["duration_seconds"], 3600)
+        self.assertTrue(export.name.endswith(".json"))
+        export.close()
+
+    def test_html_export_is_self_contained_escaped_and_searchable(self):
+        day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
+        self.module._store_interval(
+            1,
+            day.replace(hour=8),
+            day.replace(hour=9),
+        )
+        payload = self.module._build_export_payload(day.replace(hour=12))
+
+        export = self.module._render_html_export(payload)
+        document = export.getvalue().decode("utf-8")
+
+        self.assertIn("<!doctype html>", document)
+        self.assertIn("&lt;Alice&gt;", document)
+        self.assertNotIn("<Alice>", document)
+        self.assertIn("08.09.2026 08:00:00", document)
+        self.assertIn('id="search"', document)
+        self.assertNotIn("https://", document)
+        self.assertTrue(export.name.endswith(".html"))
+        export.close()
+
+    def test_weekday_hour_heatmap_splits_cross_hour_session(self):
+        monday = datetime.datetime(2026, 9, 7, 8, 30, tzinfo=UTC)
+        intervals = {
+            "1": [
+                [
+                    monday.timestamp(),
+                    (monday + datetime.timedelta(hours=1)).timestamp(),
+                ]
+            ]
+        }
+
+        heatmap = self.module._weekday_hour_totals(intervals, UTC)
+
+        self.assertEqual(heatmap[0][8], 1800)
+        self.assertEqual(heatmap[0][9], 1800)
+
+    def test_insights_report_explains_rhythm_and_peak_hours(self):
+        start = datetime.datetime(2026, 9, 6, tzinfo=UTC)
+        for offset in range(3):
+            day = start + datetime.timedelta(days=offset)
+            self.module._store_interval(
+                1,
+                day.replace(hour=18),
+                day.replace(hour=19),
+            )
+
+        report = self.module._insights_report(
+            start.replace(day=8, hour=23),
+            days_count=3,
+            user_id="1",
+        )
+
+        self.assertIn("ContactStatus · інсайти", report)
+        self.assertIn("Медіанний сеанс: <b>1 год</b>", report)
+        self.assertIn("Пікові години: <b>18:00</b>", report)
+        self.assertIn("Найдовша серія: <b>3 дн.</b>", report)
 
     def test_open_session_is_counted_without_being_closed(self):
         day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
@@ -637,6 +748,37 @@ class ContactStatusAsyncTests(unittest.IsolatedAsyncioTestCase):
         await self.module.status_watcher(update)
 
         self.assertNotIn("77", self.module.get("active"))
+
+    async def test_html_export_command_sends_a_complete_file(self):
+        day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
+        self.module.set(
+            "contacts",
+            {
+                "1": {
+                    "name": "Alice",
+                    "username": "alice",
+                    "is_contact": True,
+                }
+            },
+        )
+        self.module.set("watchlist", ["1"])
+        self.module._store_interval(
+            1,
+            day.replace(hour=8),
+            day.replace(hour=9),
+        )
+        self.module._now = lambda: day.replace(hour=12)
+        self.module._client = _Client()
+        message = _Message("html today")
+
+        await self.module.contactexport(message)
+
+        self.assertTrue(message.deleted)
+        self.assertEqual(len(self.module._client.sent_files), 1)
+        sent = self.module._client.sent_files[0]
+        self.assertTrue(sent["name"].endswith(".html"))
+        self.assertIn(b"<!doctype html>", sent["content"])
+        self.assertIn("HTML-звіт", sent["caption"])
 
 
 if __name__ == "__main__":
