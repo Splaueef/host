@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 3.0.0
+# meta version: 3.1.0
 # meta description: 🟢 Керування списком спостереження та розширена статистика online-активності.
 
 import datetime
@@ -75,8 +75,8 @@ class ContactStatusMod(loader.Module):
     SYNC_INTERVAL_SECONDS = 5 * 60
     HEARTBEAT_GRACE_SECONDS = 90
     MAX_CONTACTS = 12
-    MAX_PERIODS = 3
     LIST_PAGE_SIZE = 15
+    MESSAGE_LIMIT = 3800
 
     async def client_ready(self, client, db):
         self._client = client
@@ -469,14 +469,7 @@ class ContactStatusMod(loader.Module):
         )
 
     @staticmethod
-    def _duration(seconds):
-        seconds = max(0, int(seconds))
-        hours, seconds = divmod(seconds, 3600)
-        minutes, seconds = divmod(seconds, 60)
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
-    @staticmethod
-    def _human_duration(seconds):
+    def _precise_duration(seconds):
         seconds = max(0, int(seconds))
         days, remainder = divmod(seconds, 86400)
         hours, remainder = divmod(remainder, 3600)
@@ -488,13 +481,24 @@ class ContactStatusMod(loader.Module):
             parts.append(f"{hours} год")
         if minutes:
             parts.append(f"{minutes} хв")
-        if not parts:
+        if seconds or not parts:
             parts.append(f"{seconds} с")
-        return " ".join(parts[:2])
+        return " ".join(parts)
 
     @staticmethod
-    def _clock(stamp, tzinfo, include_date=False):
-        pattern = "%d.%m %H:%M" if include_date else "%H:%M"
+    def _session_word(count):
+        if count % 10 == 1 and count % 100 != 11:
+            return "сеанс"
+        if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+            return "сеанси"
+        return "сеансів"
+
+    @staticmethod
+    def _clock(stamp, tzinfo, include_date=False, seconds=False):
+        if include_date:
+            pattern = "%d.%m %H:%M:%S" if seconds else "%d.%m %H:%M"
+        else:
+            pattern = "%H:%M:%S" if seconds else "%H:%M"
         return datetime.datetime.fromtimestamp(stamp, tzinfo).strftime(pattern)
 
     @staticmethod
@@ -521,15 +525,22 @@ class ContactStatusMod(loader.Module):
 
     @staticmethod
     def _peak_online(intervals):
+        return ContactStatusMod._peak_details(intervals)[0]
+
+    @staticmethod
+    def _peak_details(intervals):
         events = []
         for spans in intervals.values():
             for start, end in spans:
                 events.extend(((start, 1), (end, -1)))
         current = peak = 0
-        for _, delta in sorted(events, key=lambda item: (item[0], item[1])):
+        peak_at = None
+        for stamp, delta in sorted(events, key=lambda item: (item[0], item[1])):
             current += delta
-            peak = max(peak, current)
-        return peak
+            if current > peak:
+                peak = current
+                peak_at = stamp
+        return peak, peak_at
 
     @classmethod
     def _union_duration(cls, intervals):
@@ -561,6 +572,8 @@ class ContactStatusMod(loader.Module):
     @staticmethod
     def _bar(seconds, maximum, width=10):
         filled = round(width * seconds / maximum) if maximum else 0
+        if seconds > 0 and maximum > 0:
+            filled = max(1, filled)
         filled = max(0, min(width, filled))
         return "█" * filled + "░" * (width - filled)
 
@@ -602,7 +615,84 @@ class ContactStatusMod(loader.Module):
             f"{range_start:%d.%m}–{range_end:%d.%m.%Y}"
         )
 
-    def _report(self, now, days_count=1, offset=0, user_id=None):
+    def _timeline_blocks(
+        self,
+        ordered,
+        now,
+        range_end,
+        include_date,
+        offset,
+    ):
+        active = set(self.get("active", {})) if not offset else set()
+        blocks = []
+        medals = ("🥇", "🥈", "🥉")
+        for rank, (user_id, spans) in enumerate(ordered, 1):
+            profile = self.get("contacts", {}).get(user_id, {})
+            icon = medals[rank - 1] if rank <= len(medals) else f"{rank}."
+            title = (
+                f"{icon} <b>{self._profile_link(user_id, profile)}</b> · "
+                f"{len(spans)} {self._session_word(len(spans))}\n"
+            )
+            continuation = (
+                f"↳ <b>{self._profile_link(user_id, profile)} · "
+                "продовження</b>\n"
+            )
+            block = title
+            for number, (begin, end) in enumerate(spans, 1):
+                is_live = (
+                    user_id in active
+                    and abs(end - range_end.timestamp()) < 1
+                    and number == len(spans)
+                )
+                begin_text = self._clock(
+                    begin,
+                    now.tzinfo,
+                    include_date,
+                    seconds=True,
+                )
+                end_text = (
+                    "зараз"
+                    if is_live
+                    else self._clock(
+                        end,
+                        now.tzinfo,
+                        include_date,
+                        seconds=True,
+                    )
+                )
+                line = (
+                    f"  {number:02d}. <code>{begin_text}–{end_text}</code> "
+                    f"· {self._precise_duration(end - begin)}\n"
+                )
+                if len(block) + len(line) > 2600 and block != title:
+                    blocks.append(block.rstrip())
+                    block = continuation
+                block += line
+            blocks.append(block.rstrip())
+        return blocks
+
+    def _paginate_report(self, summary, blocks):
+        pages = []
+        current = summary.rstrip()
+        continuation = "🕓 <b>Повна хронологія · продовження</b>"
+        for block in blocks:
+            addition = f"\n\n{block}"
+            if len(current) + len(addition) > self.MESSAGE_LIMIT:
+                pages.append(current)
+                current = f"{continuation}\n\n{block}"
+            else:
+                current += addition
+        if current:
+            pages.append(current)
+        if len(pages) > 1:
+            total = len(pages)
+            pages = [
+                f"{page}\n\n<i>Сторінка {index}/{total}</i>"
+                for index, page in enumerate(pages, 1)
+            ]
+        return pages
+
+    def _report_pages(self, now, days_count=1, offset=0, user_id=None):
         intervals, range_start, range_end = self._period_intervals(
             now,
             days_count,
@@ -617,13 +707,13 @@ class ContactStatusMod(loader.Module):
             )
         if not intervals:
             if user_id is None:
-                return self.strings["empty"]
+                return [self.strings["empty"]]
             profile = self.get("contacts", {}).get(user_id, {})
-            return (
+            return [(
                 f"📭 <b>Для {self._profile_link(user_id, profile)} немає даних "
                 "за вибраний період.</b>\n"
                 f"{self._presence(user_id, profile, now)}"
-            )
+            )]
 
         contacts = self.get("contacts", {})
         ordered = sorted(
@@ -642,6 +732,7 @@ class ContactStatusMod(loader.Module):
             1,
             range_end.timestamp() - range_start.timestamp(),
         )
+        include_date = days_count > 1
 
         if user_id is not None:
             spans = ordered[0][1]
@@ -649,36 +740,38 @@ class ContactStatusMod(loader.Module):
             total = sum(end - begin for begin, end in spans)
             longest = max(end - begin for begin, end in spans)
             average = total / len(spans)
-            include_date = days_count > 1
-            recent = spans[-10:]
             text = (
-                "👤 <b>ContactStatus · користувач</b>\n"
-                f"{self._profile_link(user_id, profile)}\n"
+                "👤 <b>ContactStatus</b>\n"
+                f"╰ {self._profile_link(user_id, profile)}\n"
+                f"📅 <b>{period}</b>\n"
                 f"{self._presence(user_id, profile, now)}\n"
             )
             username = profile.get("username")
             if username:
                 text += f"🔗 <code>@{utils.escape_html(username)}</code>\n"
             text += (
-                f"📅 <b>{period}</b>\n\n"
-                f"⏱ Загалом: <b>{self._human_duration(total)}</b> "
-                f"({total / range_seconds * 100:.1f}% періоду)\n"
-                f"🔁 Сеансів: <b>{len(spans)}</b> · середній: "
-                f"<b>{self._human_duration(average)}</b>\n"
-                f"🏅 Найдовший: <b>{self._human_duration(longest)}</b>\n"
-                f"🕐 Перший: <b>{self._clock(spans[0][0], now.tzinfo, include_date)}</b> "
-                f"· останній: <b>{self._clock(spans[-1][1], now.tzinfo, include_date)}</b>\n\n"
-                "🧭 <b>Останні сеанси</b>\n"
+                "\n📊 <b>Підсумок</b>\n"
+                f"⏱ У мережі: <b>{self._precise_duration(total)}</b>\n"
+                f"📐 Частка періоду: <b>{total / range_seconds * 100:.1f}%</b>\n"
+                f"🔁 Входів: <b>{len(spans)}</b> · у середньому "
+                f"<b>{self._precise_duration(average)}</b>\n"
+                f"🏅 Найдовший сеанс: <b>{self._precise_duration(longest)}</b>\n"
+                f"⏮ Перший вхід: <b>"
+                f"{self._clock(spans[0][0], now.tzinfo, include_date, True)}"
+                "</b>\n"
+                f"⏭ Останній вихід: <b>"
+                f"{self._clock(spans[-1][1], now.tzinfo, include_date, True)}"
+                "</b>\n"
+                "\n🕓 <b>Повна хронологія</b>"
             )
-            text += "\n".join(
-                f"<code>{self._clock(begin, now.tzinfo, include_date)}–"
-                f"{self._clock(end, now.tzinfo, include_date)}</code> · "
-                f"{self._human_duration(end - begin)}"
-                for begin, end in recent
+            blocks = self._timeline_blocks(
+                ordered,
+                now,
+                range_end,
+                include_date,
+                offset,
             )
-            if len(spans) > len(recent):
-                text += f"\n<i>…і ще {len(spans) - len(recent)} сеансів</i>"
-            return text
+            return self._paginate_report(text, blocks)
 
         all_time = sum(
             sum(end - begin for begin, end in spans)
@@ -699,26 +792,56 @@ class ContactStatusMod(loader.Module):
             else 0
         )
         coverage = self._union_duration(intervals)
-        peak = self._peak_online(intervals)
+        peak, peak_at = self._peak_details(intervals)
         busiest_hour, _ = self._busiest_hour(intervals, now.tzinfo)
+        overlaps = self._overlaps(intervals)
+        shared = sum(end - begin for begin, end in overlaps)
+        current_names = (
+            [
+                self._profile_link(key, contacts.get(key, {}))
+                for key in sorted(
+                    set(intervals) & set(self.get("active", {})),
+                    key=lambda key: str(
+                        contacts.get(key, {}).get("name") or key
+                    ).casefold(),
+                )
+            ]
+            if not offset
+            else []
+        )
 
         text = (
-            "🟢 <b>ContactStatus · огляд</b>\n"
-            f"📅 <b>{period}</b>\n\n"
-            f"👥 З активністю: <b>{len(intervals)}</b> · зараз online: "
-            f"<b>{active_now}</b>\n"
-            f"⏱ Людино-час: <b>{self._human_duration(all_time)}</b> · "
-            f"покриття: <b>{self._human_duration(coverage)}</b>\n"
-            f"🔁 Сеансів: <b>{sessions}</b> · найдовший: "
-            f"<b>{self._human_duration(longest)}</b>\n"
+            "🟢 <b>ContactStatus</b>\n"
+            f"📅 <b>{period}</b>\n"
+            f"🟢 Зараз online: <b>{active_now}</b>"
+        )
+        if current_names:
+            text += " · " + ", ".join(current_names[:5])
+            if len(current_names) > 5:
+                text += f" <i>(+{len(current_names) - 5})</i>"
+        text += (
+            "\n\n📊 <b>Підсумок</b>\n"
+            f"👥 З активністю: <b>{len(intervals)}</b> · входів: "
+            f"<b>{sessions}</b>\n"
+            f"⏱ Сумарна активність: <b>{self._precise_duration(all_time)}</b>\n"
+            f"🌐 Хоча б хтось online: <b>{self._precise_duration(coverage)}</b>\n"
+            f"🤝 Щонайменше двоє online: "
+            f"<b>{self._precise_duration(shared) if shared else '—'}</b>\n"
+            f"🏅 Найдовший сеанс: <b>{self._precise_duration(longest)}</b>\n"
             f"📈 Одночасний пік: <b>{peak}</b>"
         )
+        if peak_at is not None:
+            text += (
+                f" · о <b>{self._clock(peak_at, now.tzinfo, include_date, True)}</b>"
+            )
         if busiest_hour is not None:
-            text += f" · активна година: <b>{busiest_hour:02d}:00</b>"
+            text += (
+                f"\n🕘 Найактивніша година: <b>{busiest_hour:02d}:00–"
+                f"{(busiest_hour + 1) % 24:02d}:00</b>"
+            )
         text += "\n\n🏆 <b>Рейтинг активності</b>\n"
 
         maximum = sum(end - begin for begin, end in ordered[0][1])
-        include_date = days_count > 1
         for index, (current_id, spans) in enumerate(
             ordered[: self.MAX_CONTACTS],
             1,
@@ -730,34 +853,57 @@ class ContactStatusMod(loader.Module):
                 if current_id in self.get("active", {}) and not offset
                 else ""
             )
+            medal = (
+                ("🥇", "🥈", "🥉")[index - 1]
+                if index <= 3
+                else f"{index}."
+            )
+            share = total / all_time * 100 if all_time else 0
             text += (
-                f"\n<b>{index}. {self._profile_link(current_id, profile)}</b>{status}\n"
-                f"<code>{self._bar(total, maximum)}</code> "
-                f"<b>{self._human_duration(total)}</b> · {len(spans)} сеанс. · "
-                f"{total / range_seconds * 100:.1f}%\n"
+                f"\n{medal} <b>{self._profile_link(current_id, profile)}</b>{status}\n"
+                f"   <b>{self._precise_duration(total)}</b> · "
+                f"{share:.1f}% активності · {len(spans)} "
+                f"{self._session_word(len(spans))}\n"
+                f"   <code>{self._bar(total, maximum)}</code>\n"
             )
-            recent = spans[-self.MAX_PERIODS :]
-            text += "└ " + " · ".join(
-                f"<code>{self._clock(begin, now.tzinfo, include_date)}–"
-                f"{self._clock(end, now.tzinfo, include_date)}</code>"
-                for begin, end in recent
-            )
-            if len(spans) > self.MAX_PERIODS:
-                text += f" <i>(+{len(spans) - self.MAX_PERIODS})</i>"
-            text += "\n"
 
         if len(ordered) > self.MAX_CONTACTS:
             text += (
                 f"\n<i>…і ще {len(ordered) - self.MAX_CONTACTS} "
                 "користувачів</i>\n"
             )
-        overlaps = self._overlaps(intervals)
-        shared = sum(end - begin for begin, end in overlaps)
-        text += (
-            "\n🤝 <b>Коли online були щонайменше двоє:</b> "
-            f"{self._human_duration(shared) if shared else '—'}"
+        text += "\n🕓 <b>Повна хронологія всіх входів</b>"
+        blocks = self._timeline_blocks(
+            ordered,
+            now,
+            range_end,
+            include_date,
+            offset,
         )
-        return text
+        return self._paginate_report(text, blocks)
+
+    def _report(self, now, days_count=1, offset=0, user_id=None):
+        """Compatibility helper used by tests and integrations."""
+        return "\n\n".join(
+            self._report_pages(now, days_count, offset, user_id)
+        )
+
+    async def _send_report_pages(self, message, pages):
+        await utils.answer(message, pages[0])
+        for page in pages[1:]:
+            if hasattr(message, "respond"):
+                await message.respond(
+                    page,
+                    parse_mode="html",
+                    link_preview=False,
+                )
+            else:
+                await self._client.send_message(
+                    message.peer_id,
+                    page,
+                    parse_mode="html",
+                    link_preview=False,
+                )
 
     async def _resolve_user(self, message, raw=None):
         raw = (raw or "").strip()
@@ -1171,9 +1317,9 @@ class ContactStatusMod(loader.Module):
         if user_id is not None and str(user_id) not in self._watched():
             await utils.answer(message, self.strings["not_watched"])
             return
-        await utils.answer(
+        await self._send_report_pages(
             message,
-            self._report(
+            self._report_pages(
                 self._now(),
                 days_count,
                 offset,
@@ -1239,4 +1385,3 @@ class ContactStatusMod(loader.Module):
                 self._profile_link(key, profile)
             ),
         )
-
