@@ -1,7 +1,8 @@
 # meta developer: @Huai_Baike
-# meta version: 3.4.0
-# meta description: 🟢 Watchlist, графіки, HTML/JSON та інсайти online-активності.
+# meta version: 3.5.0
+# meta description: 🟢 Inline-панель, watchlist, графіки та експорт online-статистики.
 # requires: matplotlib
+# scope: inline
 
 import asyncio
 import datetime
@@ -115,6 +116,10 @@ class ContactStatusMod(loader.Module):
             "⚠️ Використання: <code>.contactinsights "
             "[today|yesterday|1–31] [@username]</code>"
         ),
+        "inline_unavailable": (
+            "⚠️ <b>Inline-панель тимчасово недоступна.</b>\n"
+            "<i>Показую звичайний текстовий звіт.</i>"
+        ),
     }
 
     RETENTION_DAYS = 31
@@ -125,6 +130,7 @@ class ContactStatusMod(loader.Module):
     LIST_PAGE_SIZE = 15
     MESSAGE_LIMIT = 3800
     CHART_MAX_USERS = 10
+    INLINE_LIST_PAGE_SIZE = 8
 
     async def client_ready(self, client, db):
         self._client = client
@@ -2455,9 +2461,636 @@ class ContactStatusMod(loader.Module):
                 return None
         return days_count, offset, user_id
 
-    @loader.command(ru_doc="Панель стану ContactStatus")
-    async def contactstatus(self, message):
-        """ℹ️ Стан модуля, синхронізації та коротка довідка"""
+    async def _inline_notice(self, call, text):
+        await call.answer(text)
+
+    @staticmethod
+    def _inline_period_label(days_count, offset, value_days, value_offset, label):
+        selected = days_count == value_days and offset == value_offset
+        return f"• {label}" if selected else label
+
+    def _inline_stats_markup(
+        self,
+        days_count,
+        offset,
+        user_id,
+        page,
+        page_count,
+    ):
+        periods = (
+            (1, 0, "Сьогодні"),
+            (1, 1, "Вчора"),
+            (7, 0, "7 днів"),
+            (30, 0, "30 днів"),
+        )
+        markup = [
+            [
+                {
+                    "text": self._inline_period_label(
+                        days_count,
+                        offset,
+                        value_days,
+                        value_offset,
+                        label,
+                    ),
+                    "callback": self._inline_stats_view,
+                    "args": (value_days, value_offset, user_id, 0),
+                }
+                for value_days, value_offset, label in periods
+            ]
+        ]
+        if page_count > 1:
+            markup.append(
+                [
+                    {
+                        "text": "◀️",
+                        "callback": self._inline_stats_view,
+                        "args": (
+                            days_count,
+                            offset,
+                            user_id,
+                            (page - 1) % page_count,
+                        ),
+                    },
+                    {
+                        "text": f"{page + 1}/{page_count}",
+                        "callback": self._inline_notice,
+                        "args": (f"Сторінка {page + 1} з {page_count}",),
+                    },
+                    {
+                        "text": "▶️",
+                        "callback": self._inline_stats_view,
+                        "args": (
+                            days_count,
+                            offset,
+                            user_id,
+                            (page + 1) % page_count,
+                        ),
+                    },
+                ]
+            )
+        subject_row = [
+            {
+                "text": "👤 Обрати користувача",
+                "callback": self._inline_user_picker,
+                "args": (days_count, offset, 0, user_id),
+            }
+        ]
+        if user_id is not None:
+            subject_row.insert(
+                0,
+                {
+                    "text": "👥 Усі",
+                    "callback": self._inline_stats_view,
+                    "args": (days_count, offset, None, 0),
+                },
+            )
+        markup.append(subject_row)
+        markup.extend(
+            [
+                [
+                    {
+                        "text": "🧠 Інсайти",
+                        "callback": self._inline_insights_view,
+                        "args": (days_count, offset, user_id),
+                    },
+                    {
+                        "text": "📈 PNG-графік",
+                        "callback": self._inline_send_asset,
+                        "args": ("chart", days_count, offset, user_id),
+                    },
+                ],
+                [
+                    {
+                        "text": "🌐 HTML",
+                        "callback": self._inline_send_asset,
+                        "args": ("html", days_count, offset, user_id),
+                    },
+                    {
+                        "text": "{ } JSON",
+                        "callback": self._inline_send_asset,
+                        "args": ("json", days_count, offset, user_id),
+                    },
+                ],
+                [
+                    {
+                        "text": "🔄 Оновити",
+                        "callback": self._inline_stats_refresh,
+                        "args": (days_count, offset, user_id, page),
+                    },
+                    {
+                        "text": "🏠 Панель",
+                        "callback": self._inline_home,
+                    },
+                    {"text": "✖️ Закрити", "action": "close"},
+                ],
+            ]
+        )
+        return markup
+
+    async def _inline_stats_view(
+        self,
+        call,
+        days_count=1,
+        offset=0,
+        user_id=None,
+        page=0,
+    ):
+        pages = self._report_pages(
+            self._now(),
+            int(days_count),
+            int(offset),
+            user_id,
+        )
+        page = max(0, min(int(page), len(pages) - 1))
+        await call.edit(
+            pages[page],
+            reply_markup=self._inline_stats_markup(
+                int(days_count),
+                int(offset),
+                user_id,
+                page,
+                len(pages),
+            ),
+        )
+
+    async def _inline_stats_refresh(
+        self,
+        call,
+        days_count,
+        offset,
+        user_id,
+        page,
+    ):
+        await call.answer("Статистику оновлено")
+        await self._inline_stats_view(
+            call,
+            days_count,
+            offset,
+            user_id,
+            page,
+        )
+
+    def _inline_picker_entries(self):
+        profiles = self.get("contacts", {})
+        active = set(self.get("active", {}))
+        return sorted(
+            (
+                (user_id, profiles.get(user_id, {}))
+                for user_id in self._watched()
+            ),
+            key=lambda item: (
+                item[0] not in active,
+                str(item[1].get("name") or item[0]).casefold(),
+            ),
+        )
+
+    async def _inline_user_picker(
+        self,
+        call,
+        days_count,
+        offset,
+        picker_page=0,
+        selected_user_id=None,
+    ):
+        entries = self._inline_picker_entries()
+        page_count = max(
+            1,
+            (len(entries) + self.INLINE_LIST_PAGE_SIZE - 1)
+            // self.INLINE_LIST_PAGE_SIZE,
+        )
+        picker_page = max(0, min(int(picker_page), page_count - 1))
+        start = picker_page * self.INLINE_LIST_PAGE_SIZE
+        shown = entries[start : start + self.INLINE_LIST_PAGE_SIZE]
+        active = set(self.get("active", {}))
+        buttons = []
+        for user_id, profile in shown:
+            name = self._chart_name(user_id, profile, 24)
+            prefix = "🟢" if user_id in active else "⚪️"
+            if str(user_id) == str(selected_user_id):
+                prefix = "✅"
+            buttons.append(
+                {
+                    "text": f"{prefix} {name}",
+                    "callback": self._inline_stats_view,
+                    "args": (days_count, offset, user_id, 0),
+                }
+            )
+        markup = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+        if page_count > 1:
+            markup.append(
+                [
+                    {
+                        "text": "◀️",
+                        "callback": self._inline_user_picker,
+                        "args": (
+                            days_count,
+                            offset,
+                            (picker_page - 1) % page_count,
+                            selected_user_id,
+                        ),
+                    },
+                    {
+                        "text": f"{picker_page + 1}/{page_count}",
+                        "callback": self._inline_notice,
+                        "args": (
+                            f"Сторінка {picker_page + 1} з {page_count}",
+                        ),
+                    },
+                    {
+                        "text": "▶️",
+                        "callback": self._inline_user_picker,
+                        "args": (
+                            days_count,
+                            offset,
+                            (picker_page + 1) % page_count,
+                            selected_user_id,
+                        ),
+                    },
+                ]
+            )
+        markup.append(
+            [
+                {
+                    "text": "👥 Загальна статистика",
+                    "callback": self._inline_stats_view,
+                    "args": (days_count, offset, None, 0),
+                },
+                {
+                    "text": "↩️ Назад",
+                    "callback": self._inline_stats_view,
+                    "args": (days_count, offset, selected_user_id, 0),
+                },
+            ]
+        )
+        text = (
+            "👤 <b>Оберіть користувача</b>\n\n"
+            "🟢 — зараз online · ✅ — вже обрано\n"
+            f"👁 У списку спостереження: <b>{len(entries)}</b>"
+        )
+        await call.edit(text, reply_markup=markup)
+
+    async def _inline_insights_view(
+        self,
+        call,
+        days_count=7,
+        offset=0,
+        user_id=None,
+    ):
+        await call.edit(
+            self._insights_report(
+                self._now(),
+                int(days_count),
+                int(offset),
+                user_id,
+            ),
+            reply_markup=[
+                [
+                    {
+                        "text": "↩️ До статистики",
+                        "callback": self._inline_stats_view,
+                        "args": (days_count, offset, user_id, 0),
+                    },
+                    {
+                        "text": "🔄 Оновити",
+                        "callback": self._inline_insights_view,
+                        "args": (days_count, offset, user_id),
+                    },
+                ],
+                [
+                    {
+                        "text": "📈 PNG",
+                        "callback": self._inline_send_asset,
+                        "args": ("chart", days_count, offset, user_id),
+                    },
+                    {
+                        "text": "🌐 HTML",
+                        "callback": self._inline_send_asset,
+                        "args": ("html", days_count, offset, user_id),
+                    },
+                    {"text": "✖️", "action": "close"},
+                ],
+            ],
+        )
+
+    @staticmethod
+    def _inline_chat_id(call):
+        form = getattr(call, "form", {}) or {}
+        if isinstance(form, dict) and form.get("chat") is not None:
+            return form["chat"]
+        message = getattr(call, "message", None)
+        return getattr(message, "chat_id", None)
+
+    async def _inline_send_asset(
+        self,
+        call,
+        asset,
+        days_count,
+        offset,
+        user_id=None,
+    ):
+        await call.answer("Готую файл…")
+        chat_id = self._inline_chat_id(call)
+        if chat_id is None:
+            return
+        now = self._now()
+        intervals, range_start, range_end = self._period_intervals(
+            now,
+            int(days_count),
+            int(offset),
+        )
+        if user_id is not None:
+            user_id = str(user_id)
+            intervals = (
+                {user_id: intervals[user_id]}
+                if user_id in intervals
+                else {}
+            )
+        if not intervals:
+            await self._client.send_message(
+                chat_id,
+                self.strings["empty"],
+                parse_mode="html",
+            )
+            return
+
+        contacts = {
+            key: dict(value)
+            for key, value in self.get("contacts", {}).items()
+        }
+        period = self._period_title(
+            now,
+            range_start,
+            range_end,
+            int(days_count),
+            int(offset),
+        )
+        output = None
+        try:
+            if asset == "chart":
+                if not hasattr(self, "_chart_lock"):
+                    self._chart_lock = asyncio.Lock()
+                async with self._chart_lock:
+                    output = await asyncio.to_thread(
+                        self._render_chart,
+                        intervals,
+                        contacts,
+                        range_start,
+                        range_end,
+                        int(days_count),
+                        period,
+                        user_id,
+                    )
+                title = "PNG-графік"
+            else:
+                payload = self._build_export_payload(
+                    now,
+                    int(days_count),
+                    int(offset),
+                    user_id,
+                )
+                renderer = (
+                    self._render_html_export
+                    if asset == "html"
+                    else self._render_json_export
+                )
+                output = await asyncio.to_thread(renderer, payload)
+                title = f"{asset.upper()}-звіт"
+            caption = (
+                f"📊 <b>ContactStatus · {title}</b>\n"
+                f"📅 <b>{period}</b>\n"
+                "⚠️ <i>Файл містить статистику присутності.</i>"
+            )
+            await self._client.send_file(
+                chat_id,
+                output,
+                caption=caption,
+                parse_mode="html",
+            )
+        except Exception:
+            logger.exception("ContactStatus: inline asset rendering failed")
+            await self._client.send_message(
+                chat_id,
+                self.strings["export_failed"],
+                parse_mode="html",
+            )
+        finally:
+            if output is not None:
+                output.close()
+
+    def _watchlist_view_data(self, category):
+        profiles = self.get("contacts", {})
+        watched = self._watched()
+        active = set(self.get("active", {}))
+        filters = {
+            "watched": lambda key, value: key in watched,
+            "contacts": lambda key, value: value.get("is_contact"),
+            "manual": lambda key, value: value.get("manual") and key in watched,
+            "online": lambda key, value: key in watched and key in active,
+            "paused": lambda key, value: value.get("is_contact") and key not in watched,
+        }
+        selected = [
+            (key, value)
+            for key, value in profiles.items()
+            if filters[category](key, value)
+        ]
+        selected.sort(
+            key=lambda item: (
+                item[0] not in active,
+                item[0] not in watched,
+                str(item[1].get("name") or item[0]).casefold(),
+            )
+        )
+        return selected
+
+    async def _inline_watchlist(self, call, category="watched", page=0):
+        labels = {
+            "watched": "👁 Відстежуються",
+            "contacts": "👥 Контакти",
+            "manual": "➕ Вручну",
+            "online": "🟢 Online",
+            "paused": "⏸ Пауза",
+        }
+        category = category if category in labels else "watched"
+        selected = self._watchlist_view_data(category)
+        page_count = max(
+            1,
+            (len(selected) + self.LIST_PAGE_SIZE - 1) // self.LIST_PAGE_SIZE,
+        )
+        page = max(0, min(int(page), page_count - 1))
+        shown = selected[
+            page * self.LIST_PAGE_SIZE : (page + 1) * self.LIST_PAGE_SIZE
+        ]
+        watched = self._watched()
+        active = set(self.get("active", {}))
+        lines = []
+        for index, (current_id, profile) in enumerate(
+            shown,
+            page * self.LIST_PAGE_SIZE + 1,
+        ):
+            icon = "🟢" if current_id in active else "⚪️"
+            state = "👁" if current_id in watched else "⏸"
+            username = profile.get("username")
+            suffix = f" · <code>@{utils.escape_html(username)}</code>" if username else ""
+            lines.append(
+                f"{index}. {icon}{state} "
+                f"{self._profile_link(current_id, profile)}{suffix}"
+            )
+        text = (
+            f"👥 <b>ContactStatus · {labels[category]}</b>\n"
+            f"Знайдено: <b>{len(selected)}</b> · "
+            f"сторінка <b>{page + 1}/{page_count}</b>\n\n"
+            + ("\n".join(lines) if lines else "<i>Список порожній.</i>")
+        )
+        markup = [
+            [
+                {
+                    "text": ("• " if category == key else "") + label,
+                    "callback": self._inline_watchlist,
+                    "args": (key, 0),
+                }
+                for key, label in list(labels.items())[:3]
+            ],
+            [
+                {
+                    "text": ("• " if category == key else "") + label,
+                    "callback": self._inline_watchlist,
+                    "args": (key, 0),
+                }
+                for key, label in list(labels.items())[3:]
+            ],
+        ]
+        if page_count > 1:
+            markup.append(
+                [
+                    {
+                        "text": "◀️",
+                        "callback": self._inline_watchlist,
+                        "args": (category, (page - 1) % page_count),
+                    },
+                    {
+                        "text": f"{page + 1}/{page_count}",
+                        "callback": self._inline_notice,
+                        "args": (f"Сторінка {page + 1} з {page_count}",),
+                    },
+                    {
+                        "text": "▶️",
+                        "callback": self._inline_watchlist,
+                        "args": (category, (page + 1) % page_count),
+                    },
+                ]
+            )
+        markup.append(
+            [
+                {
+                    "text": "📊 Статистика",
+                    "callback": self._inline_stats_view,
+                    "args": (1, 0, None, 0),
+                },
+                {"text": "🏠 Панель", "callback": self._inline_home},
+                {"text": "✖️", "action": "close"},
+            ]
+        )
+        await call.edit(text, reply_markup=markup)
+
+    def _inline_home_markup(self):
+        auto_enabled = self.get("auto_watch_contacts", True)
+        return [
+            [
+                {
+                    "text": "📊 Статистика",
+                    "callback": self._inline_stats_view,
+                    "args": (1, 0, None, 0),
+                },
+                {
+                    "text": "👥 Список",
+                    "callback": self._inline_watchlist,
+                    "args": ("watched", 0),
+                },
+            ],
+            [
+                {
+                    "text": "🧠 Інсайти · 7 днів",
+                    "callback": self._inline_insights_view,
+                    "args": (7, 0, None),
+                },
+                {
+                    "text": "📈 Графік · сьогодні",
+                    "callback": self._inline_send_asset,
+                    "args": ("chart", 1, 0, None),
+                },
+            ],
+            [
+                {
+                    "text": "🔄 Синхронізувати",
+                    "callback": self._inline_sync,
+                },
+                {
+                    "text": (
+                        "✅ Автододавання"
+                        if auto_enabled
+                        else "❌ Автододавання"
+                    ),
+                    "callback": self._inline_toggle_autowatch,
+                },
+            ],
+            [
+                {
+                    "text": "🌐 HTML · 7 днів",
+                    "callback": self._inline_send_asset,
+                    "args": ("html", 7, 0, None),
+                },
+                {
+                    "text": "{ } JSON · 7 днів",
+                    "callback": self._inline_send_asset,
+                    "args": ("json", 7, 0, None),
+                },
+            ],
+            [
+                {"text": "🔄 Оновити панель", "callback": self._inline_home},
+                {"text": "✖️ Закрити", "action": "close"},
+            ],
+        ]
+
+    async def _inline_home(self, call):
+        await call.edit(
+            self._dashboard_text(),
+            reply_markup=self._inline_home_markup(),
+        )
+
+    async def _inline_sync(self, call):
+        await call.answer("Синхронізую контакти…")
+        try:
+            result = await self._sync_contacts()
+            note = (
+                "\n\n✅ <b>Синхронізацію завершено.</b>"
+                if result is not None
+                else "\n\n⏳ <b>Синхронізація вже виконується.</b>"
+            )
+        except Exception:
+            logger.exception(self.strings["load_failed"])
+            note = "\n\n❌ <b>Помилка синхронізації.</b>"
+        await call.edit(
+            self._dashboard_text() + note,
+            reply_markup=self._inline_home_markup(),
+        )
+
+    async def _inline_toggle_autowatch(self, call):
+        enabled = not self.get("auto_watch_contacts", True)
+        self.set("auto_watch_contacts", enabled)
+        await call.answer(
+            "Автододавання увімкнено"
+            if enabled
+            else "Автододавання вимкнено"
+        )
+        if enabled:
+            try:
+                await self._sync_contacts()
+            except Exception:
+                logger.exception(self.strings["load_failed"])
+        await self._inline_home(call)
+
+    def _dashboard_text(self):
         profiles = self.get("contacts", {})
         watched = self._watched()
         contacts = {
@@ -2528,7 +3161,24 @@ class ContactStatusMod(loader.Module):
             "<code>.contactcompare @a @b 7</code> — порівняти\n"
             "<code>.contactsync</code> — синхронізувати зараз"
         )
-        await utils.answer(message, text)
+        return text
+
+    @loader.command(ru_doc="Відкрити inline-панель ContactStatus")
+    async def contactstatus(self, message):
+        """🎛 Зручна inline-панель модуля"""
+        inline = getattr(self, "inline", None)
+        if inline is not None and hasattr(inline, "form"):
+            try:
+                result = await inline.form(
+                    self._dashboard_text(),
+                    message,
+                    reply_markup=self._inline_home_markup(),
+                )
+                if result:
+                    return
+            except Exception:
+                logger.exception("ContactStatus: inline panel failed")
+        await utils.answer(message, self._dashboard_text())
 
     @loader.command(ru_doc="Показати список контактів і стан спостереження")
     async def contactlist(self, message):
@@ -2818,80 +3468,39 @@ class ContactStatusMod(loader.Module):
     @loader.command(ru_doc="Online-статистика за період")
     async def contactstats(self, message):
         """📊 .contactstats [today|yesterday|1–31] [@username / reply]"""
-        tokens = utils.get_args_raw(message).strip().split()
-        period_token = None
-        target_token = ""
-        for token in tokens:
-            lowered = token.lower()
-            is_period = (
-                lowered
-                in {"today", "сьогодні", "yesterday", "вчора"}
-                or (
-                    lowered.isdigit()
-                    and 1 <= int(lowered) <= self.RETENTION_DAYS
-                )
-            )
-            if is_period and period_token is None:
-                period_token = lowered
-            elif not is_period and not target_token:
-                target_token = token
-            else:
-                await utils.answer(message, self.strings["bad_period"])
-                return
-
-        period_token = period_token or "today"
-        if period_token in {"today", "сьогодні"}:
-            days_count, offset = 1, 0
-        elif period_token in {"yesterday", "вчора"}:
-            days_count, offset = 1, 1
-        elif (
-            period_token.isdigit()
-            and 1 <= int(period_token) <= self.RETENTION_DAYS
-        ):
-            days_count, offset = int(period_token), 0
-        else:
-            await utils.answer(message, self.strings["bad_period"])
-            return
-
-        user_id = None
-        if target_token:
-            user_id = await self._resolve_target_id(
-                message,
-                target_token,
-            )
-        elif tokens:
-            try:
-                reply = await message.get_reply_message()
-            except Exception:
-                reply = None
-            if reply:
-                user = await reply.get_sender()
-                user_id = (
-                    str(user.id)
-                    if user and getattr(user, "id", None)
-                    else None
-                )
-
-        if user_id is False:
-            await utils.answer(
-                message,
-                self.strings["user_not_found"].format(
-                    utils.escape_html(target_token)
-                ),
-            )
-            return
-        if user_id is not None and str(user_id) not in self._watched():
-            await utils.answer(message, self.strings["not_watched"])
-            return
-        await self._send_report_pages(
+        parsed = await self._parse_period_target(
             message,
-            self._report_pages(
-                self._now(),
-                days_count,
-                offset,
-                user_id,
-            ),
+            utils.get_args_raw(message).strip().split(),
+            self.strings["bad_period"],
         )
+        if parsed is None:
+            return
+        days_count, offset, user_id = parsed
+        pages = self._report_pages(
+            self._now(),
+            days_count,
+            offset,
+            user_id,
+        )
+        inline = getattr(self, "inline", None)
+        if inline is not None and hasattr(inline, "form"):
+            try:
+                result = await inline.form(
+                    pages[0],
+                    message,
+                    reply_markup=self._inline_stats_markup(
+                        days_count,
+                        offset,
+                        user_id,
+                        0,
+                        len(pages),
+                    ),
+                )
+                if result:
+                    return
+            except Exception:
+                logger.exception("ContactStatus: inline statistics failed")
+        await self._send_report_pages(message, pages)
 
     @loader.command(ru_doc="Створити PNG-графік online-активності")
     async def contactchart(self, message):
