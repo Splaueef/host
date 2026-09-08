@@ -58,7 +58,9 @@ def _load_module():
         }
     )
     path = pathlib.Path(__file__).parents[1] / "contactstatus.py"
-    spec = importlib.util.spec_from_file_location("testhost.modules.contactstatus", path)
+    spec = importlib.util.spec_from_file_location(
+        "testhost.modules.contactstatus", path
+    )
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -117,6 +119,41 @@ class ContactStatusTests(unittest.TestCase):
             [[day.replace(hour=7).timestamp(), day.replace(hour=8).timestamp()]],
         )
         self.assertIn("1", self.module.get("active"))
+
+    def test_adjacent_status_updates_are_coalesced(self):
+        day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
+        self.module._store_interval(1, day.replace(hour=8), day.replace(hour=9))
+        self.module._store_interval(1, day.replace(hour=9), day.replace(hour=10))
+
+        self.assertEqual(
+            self.module.get("days")["2026-09-08"]["1"],
+            [[day.replace(hour=8).timestamp(), day.replace(hour=10).timestamp()]],
+        )
+
+    def test_report_supports_multi_day_ranges_and_visual_summary(self):
+        now = datetime.datetime(2026, 9, 8, 12, tzinfo=UTC)
+        previous = now - datetime.timedelta(days=1)
+        self.module._store_interval(
+            1, previous.replace(hour=8), previous.replace(hour=9)
+        )
+        self.module._store_interval(2, now.replace(hour=9), now.replace(hour=10))
+
+        report = self.module._report(now, days_count=2)
+
+        self.assertIn("07.09.2026–08.09.2026", report)
+        self.assertIn("Рейтинг активності", report)
+        self.assertIn("██████████", report)
+        self.assertIn("Пік: <b>1</b>", report)
+
+    def test_old_history_is_pruned_to_retention_window(self):
+        self.module.set(
+            "days",
+            {"2026-08-01": {"1": [[1, 2]]}, "2026-09-08": {"1": [[3, 4]]}},
+        )
+
+        self.module._prune(datetime.date(2026, 9, 8))
+
+        self.assertEqual(list(self.module.get("days")), ["2026-09-08"])
 
 
 if __name__ == "__main__":
