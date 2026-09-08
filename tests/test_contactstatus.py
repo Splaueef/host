@@ -6,6 +6,7 @@ import pathlib
 import sys
 import types
 import unittest
+from zoneinfo import ZoneInfo
 
 
 class _Module:
@@ -308,6 +309,96 @@ class ContactStatusTests(unittest.TestCase):
             ],
         )
 
+    def test_out_of_order_intervals_are_sorted_and_merged(self):
+        day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
+        self.module._store_interval(
+            1,
+            day.replace(hour=10),
+            day.replace(hour=11),
+        )
+        self.module._store_interval(
+            1,
+            day.replace(hour=9),
+            day.replace(hour=10, minute=30),
+        )
+
+        self.assertEqual(
+            self.module.get("days")["2026-09-08"]["1"],
+            [
+                [
+                    day.replace(hour=9).timestamp(),
+                    day.replace(hour=11).timestamp(),
+                ]
+            ],
+        )
+
+    def test_history_can_be_rebucketed_for_another_timezone(self):
+        start = datetime.datetime(2026, 9, 7, 22, 30, tzinfo=UTC)
+        end = datetime.datetime(2026, 9, 7, 23, 30, tzinfo=UTC)
+        self.module._store_interval(1, start, end)
+
+        self.module._rebucket_history(ZoneInfo("Europe/Berlin"))
+
+        self.assertNotIn("2026-09-07", self.module.get("days"))
+        self.assertIn(
+            "1",
+            self.module.get("days")["2026-09-08"],
+        )
+
+    def test_top_pair_returns_exact_shared_periods(self):
+        day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
+        intervals = {
+            "1": [
+                [
+                    day.replace(hour=8).timestamp(),
+                    day.replace(hour=10).timestamp(),
+                ]
+            ],
+            "2": [
+                [
+                    day.replace(hour=9).timestamp(),
+                    day.replace(hour=11).timestamp(),
+                ]
+            ],
+            "3": [
+                [
+                    day.replace(hour=12).timestamp(),
+                    day.replace(hour=13).timestamp(),
+                ]
+            ],
+        }
+
+        pair, spans, total = self.module._top_pair(intervals)
+
+        self.assertEqual(pair, ("1", "2"))
+        self.assertEqual(total, 3600)
+        self.assertEqual(len(spans), 1)
+
+    def test_comparison_includes_all_shared_moments(self):
+        day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
+        self.module._store_interval(
+            1,
+            day.replace(hour=8),
+            day.replace(hour=10),
+        )
+        self.module._store_interval(
+            2,
+            day.replace(hour=9),
+            day.replace(hour=11),
+        )
+
+        report = "\n".join(
+            self.module._compare_report_pages(
+                day.replace(hour=12),
+                "1",
+                "2",
+            )
+        )
+
+        self.assertIn("ContactStatus · порівняння", report)
+        self.assertIn("Разом online: <b>1 год</b>", report)
+        self.assertIn("09:00:00–10:00:00", report)
+
     def test_restart_recovery_does_not_count_downtime(self):
         start = datetime.datetime(2026, 9, 8, 8, tzinfo=UTC)
         restart = start + datetime.timedelta(hours=4)
@@ -419,6 +510,40 @@ class ContactStatusAsyncTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("9", self.module.get("active"))
         self.assertIn("додано", message.answers[-1])
+
+    async def test_manual_profile_identity_is_refreshed(self):
+        self.module.set(
+            "contacts",
+            {
+                "9": {
+                    "name": "Old name",
+                    "username": "old_name",
+                    "is_contact": False,
+                    "manual": True,
+                }
+            },
+        )
+        self.module.set("watchlist", ["9"])
+        self.module._client = _Client(
+            entities={
+                "9": _user(
+                    9,
+                    "New name",
+                    "new_name",
+                    contact=False,
+                )
+            }
+        )
+
+        changed = await self.module._refresh_manual_profiles(
+            datetime.datetime(2026, 9, 8, 12, tzinfo=UTC)
+        )
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(
+            self.module.get("contacts")["9"]["username"],
+            "new_name",
+        )
 
     async def test_removing_contact_preserves_history_and_prevents_readd(self):
         user = _user(4, "Contact", "contact")
