@@ -22,12 +22,22 @@ The purpose of this repository is to maintain hosting-related files used by cust
 - повне приховування API-ключів та інших `Hidden`-параметрів;
 - підтвердження встановлення, видалення й інших небезпечних дій.
 
-Відкрити панель: `.modmenu` або `.hub`.
+Відкрити панель: `.modmenu`.
 
 Встановити окремо:
 
 ```text
 .dlmod https://raw.githubusercontent.com/Splaueef/host/main/modulehub.py
+```
+
+## SystemInfo
+
+`sysinfo.py` показує ОС, ядро, середовище, CPU, load average, RAM, диск,
+uptime та версії Python/Telethon. Команда модуля — `.sysinfo`; вона навмисно
+не використовує `.info`, оскільки це вбудована команда Hikka.
+
+```text
+.dlmod https://raw.githubusercontent.com/Splaueef/host/main/sysinfo.py
 ```
 
 Original projects that used these resources include:
