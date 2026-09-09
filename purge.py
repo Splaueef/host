@@ -14,9 +14,11 @@
 #    You should have received a copy of the GNU Affero General Public License
 #    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from .. import loader, utils
 import logging
+
 import telethon
+
+from .. import loader, utils
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +49,14 @@ class PurgeMod(loader.Module):
                 entity = await message.client.get_entity(arg)
                 if isinstance(entity, telethon.tl.types.User):
                     from_users.add(entity.id)
-            except ValueError:
-                pass
+            except (ValueError, telethon.errors.RPCError):
+                logger.debug("Unable to resolve purge filter %s", arg, exc_info=True)
 
-        msgs = []
+        client_is_bot = await message.client.is_bot()
+        # A sender filter must not leave the command itself behind.
+        msgs = [message.id] if from_users and not client_is_bot else []
         from_ids = set()
-        if await message.client.is_bot():
+        if client_is_bot:
             if not message.is_channel:
                 await utils.answer(message, self.strings("not_supergroup_bot", message))
                 return
@@ -68,8 +72,10 @@ class PurgeMod(loader.Module):
             ):
                 if from_users and msg.sender_id not in from_users:
                     continue
-                msgs.append(msg.id)
-                from_ids.add(msg.sender_id)
+                if msg.id not in msgs:
+                    msgs.append(msg.id)
+                if msg.sender_id is not None:
+                    from_ids.add(msg.sender_id)
                 if len(msgs) >= 99:
                     logger.debug(msgs)
                     await message.client.delete_messages(message.to_id, msgs)

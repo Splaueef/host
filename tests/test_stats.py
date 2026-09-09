@@ -33,7 +33,7 @@ def _load_module():
     loader.Module = _Module
     loader.tds = lambda value: value
     loader.command = lambda *args, **kwargs: (lambda value: value)
-    loader.ModuleConfig = lambda *args: {"top_count": 5}
+    loader.ModuleConfig = lambda *args: {"top_count": 5, "retention_days": 31}
     loader.ConfigValue = lambda *args, **kwargs: None
     loader.validators = types.SimpleNamespace(Integer=lambda **kwargs: None)
     utils.escape_html = lambda value: (
@@ -193,8 +193,10 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(scanned, 1)
         self.assertEqual((day["sent"], day["received"], day["media"]), (1, 1, 1))
-        self.assertEqual(day["users"]["1"]["sent_hours"][9], 1)
-        self.assertEqual(day["users"]["1"]["received_hours"][10], 1)
+        sent_hour = histories[1][0].date.astimezone().hour
+        received_hour = histories[1][1].date.astimezone().hour
+        self.assertEqual(day["users"]["1"]["sent_hours"][sent_hour], 1)
+        self.assertEqual(day["users"]["1"]["received_hours"][received_hour], 1)
         self.assertEqual(day["users"]["1"]["id"], 1)
         self.assertEqual(day["users"]["1"]["username"], "alice_user")
         self.assertIs(self.module._find_user(day, "@alice_user"), day["users"]["1"])
@@ -233,6 +235,26 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("&lt;Alice&gt;", rendered)
         self.assertIn("08:00", rendered)
         self.assertIn("21:00", rendered)
+
+    def test_old_days_are_pruned_but_unknown_storage_keys_survive(self):
+        today = datetime.date.today()
+        recent = (today - datetime.timedelta(days=30)).isoformat()
+        expired = (today - datetime.timedelta(days=31)).isoformat()
+        self.module.set(
+            "stats",
+            {
+                recent: {"sent": 1},
+                expired: {"sent": 2},
+                "migration_marker": {"value": True},
+            },
+        )
+
+        self.module._init_storage()
+
+        stored = self.module.get("stats")
+        self.assertIn(recent, stored)
+        self.assertNotIn(expired, stored)
+        self.assertIn("migration_marker", stored)
 
     async def test_scan_updates_message_returned_by_progress_answer(self):
         original = object()

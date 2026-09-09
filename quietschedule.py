@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 1.0.0
+# meta version: 1.1.0
 # meta description: Планувальник тиші: вимикає сповіщення та/або архівує чати за розкладом.
 
 import datetime
@@ -67,13 +67,15 @@ class QuietScheduleMod(loader.Module):
         if not self._client or time.time() < self._next_tick:
             return
         self._next_tick = time.time() + int(self.config["check_interval"])
-        await self._process_jobs()
+        try:
+            await self._process_jobs()
+        except ZoneInfoNotFoundError:
+            # Executing a Kyiv schedule as UTC is much worse than waiting for
+            # the owner to fix a typo in the configured timezone.
+            logger.error("QuietSchedule: unknown timezone %s", self.config["timezone"])
 
     def _tz(self):
-        try:
-            return ZoneInfo(self.config["timezone"])
-        except ZoneInfoNotFoundError:
-            return ZoneInfo("UTC")
+        return ZoneInfo(str(self.config["timezone"]).strip())
 
     def _now(self):
         return datetime.datetime.now(self._tz()).replace(second=0, microsecond=0)
@@ -90,13 +92,28 @@ class QuietScheduleMod(loader.Module):
     @staticmethod
     def _weekdays(value):
         names = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
-        return [names[item.strip().lower()] for item in value.split(",") if item.strip()]
+        values = [item.strip().lower() for item in value.split(",") if item.strip()]
+        if not values or any(item not in names for item in values):
+            raise ValueError("weekdays: mon,tue,wed,thu,fri,sat,sun")
+        return sorted({names[item] for item in values})
 
     def _actions(self, tokens):
         acts = {"mute": self.config["default_mute"], "archive": self.config["default_archive"]}
         if tokens:
-            acts = {"mute": "mute" in tokens, "archive": "archive" in tokens}
+            normalized = {str(token).strip().lower() for token in tokens}
+            unknown = normalized - {"mute", "archive"}
+            if unknown:
+                raise ValueError("unknown action: " + ", ".join(sorted(unknown)))
+            acts = {"mute": "mute" in normalized, "archive": "archive" in normalized}
+        if not any(acts.values()):
+            raise ValueError("select mute and/or archive")
         return acts
+
+    def _validate_times(self, start_value, end_value):
+        start = self._parse_time(start_value)
+        end = self._parse_time(end_value)
+        if start == end:
+            raise ValueError("start and end times must differ")
 
     async def _entity_id(self, message, token):
         entity = await message.client.get_entity(token)
@@ -132,18 +149,34 @@ class QuietScheduleMod(loader.Module):
             current = current and now.time() < end_t
         return current, False
 
-    async def _set_mute(self, peer, mute):
+    def _active_end(self, job, now):
+        if job["type"] == "once":
+            return datetime.datetime.fromisoformat(job["end"])
+
+        start_t = self._parse_time(job["start_time"])
+        end_t = self._parse_time(job["end_time"])
+        end_date = now.date()
+        if end_t <= start_t and now.time() >= start_t:
+            end_date += datetime.timedelta(days=1)
+        return datetime.datetime.combine(end_date, end_t, tzinfo=now.tzinfo)
+
+    async def _set_mute(self, peer, mute, until=None):
         entity = await self._client.get_entity(peer)
-        until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=366) if mute else None
+        until = until.astimezone(datetime.timezone.utc) if mute and until else None
         await self._client(UpdateNotifySettingsRequest(InputNotifyPeer(entity), InputPeerNotifySettings(mute_until=until)))
 
     async def _set_archive(self, peer, archive):
         entity = await self._client.get_entity(peer)
         await self._client.edit_folder(entity, folder=1 if archive else 0)
 
-    async def _apply(self, job, active):
+    async def _apply(self, job, active, now=None):
         if job.get("mute"):
-            await self._set_mute(job["peer"], active)
+            until = self._active_end(job, now or self._now()) if active else None
+            await self._set_mute(job["peer"], active, until)
+            if until:
+                job["active_until"] = until.isoformat()
+            else:
+                job.pop("active_until", None)
         if job.get("archive"):
             await self._set_archive(job["peer"], active)
         job["active"] = active
@@ -155,13 +188,25 @@ class QuietScheduleMod(loader.Module):
         for job in list(jobs):
             try:
                 active, expired = self._active_now(job, now)
-                if active != job.get("active", False):
-                    await self._apply(job, active)
+                expected_until = (
+                    self._active_end(job, now).isoformat()
+                    if active and job.get("mute")
+                    else None
+                )
+                if (
+                    active != job.get("active", False)
+                    or (
+                        active
+                        and job.get("mute")
+                        and job.get("active_until") != expected_until
+                    )
+                ):
+                    await self._apply(job, active, now)
                     changed = True
                 if expired and not active:
                     jobs.remove(job)
                     changed = True
-            except (ValueError, RPCError, TypeError) as e:
+            except (KeyError, ValueError, ZoneInfoNotFoundError, RPCError, TypeError) as e:
                 logger.warning("QuietSchedule job failed: %s", e)
         if changed:
             self.set("jobs", jobs)
@@ -181,7 +226,7 @@ class QuietScheduleMod(loader.Module):
     async def qaddcmd(self, message):
         """Додати розклад: .qadd @user ..."""
         args = utils.get_args(message)
-        if len(args) < 4:
+        if len(args) < 2:
             return await utils.answer(message, self.strings("bad_args", message).format(self.strings("help", message)))
         try:
             peer, entity = await self._entity_id(message, args[0])
@@ -189,10 +234,18 @@ class QuietScheduleMod(loader.Module):
             mode = args[1].lower()
             job = {"id": uuid.uuid4().hex[:8], "peer": peer, "active": False}
             if mode == "daily":
+                if len(args) < 4:
+                    raise ValueError("daily requires start and end time")
+                self._validate_times(args[2], args[3])
                 job.update({"type": "daily", "start_time": args[2], "end_time": args[3], **self._actions(args[4:])})
             elif mode == "weekly":
+                if len(args) < 5:
+                    raise ValueError("weekly requires weekdays, start and end time")
+                self._validate_times(args[3], args[4])
                 job.update({"type": "weekly", "weekdays": self._weekdays(args[2]), "start_time": args[3], "end_time": args[4], **self._actions(args[5:])})
             else:
+                if len(args) < 5:
+                    raise ValueError("one-time schedule requires start and end date/time")
                 start = self._parse_dt(args[1], args[2], tz)
                 end = self._parse_dt(args[3], args[4], tz)
                 if end <= start:

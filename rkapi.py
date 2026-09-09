@@ -1,7 +1,7 @@
 # meta developer: @Huai_Baike
 # meta syntax: .wwhelp | .я | .ти | .чат | .топ | .зв | .профіль | .нік | .переказ | .пет | .друзі | .графік
 
-__version__ = (9, 0, 0)
+__version__ = (9, 1, 0)
 
 import asyncio
 import html
@@ -142,7 +142,7 @@ def _fmt_user(data: dict) -> str:
 
     L = [head]
     if nickname:   L.append(f"    ╰ <i>{nickname}</i>")
-    L.append(f"    ╰ <code>id: {uid}</code>")
+    L.append(f"    ╰ <code>id: {_esc(uid)}</code>")
     if short_id:   L.append(f"    ╰ short_id: <code>{short_id}</code>")
     if first_seen: L.append(f"    ╰ з <b>{_esc(first_seen)}</b>")
 
@@ -399,7 +399,7 @@ def _fmt_group(data: dict) -> str:
     t_linked = f'<a href="{link}">{title}</a>' if link else title
 
     L = [f"👥 <b>{t_linked}</b>"]
-    L.append(f"    ╰ <code>{chat_id}</code>{'  🌐 ' + lang if lang else ''}")
+    L.append(f"    ╰ <code>{_esc(chat_id)}</code>{'  🌐 ' + lang if lang else ''}")
     L.append(f"    ╰ 👤 {members:,} учасників")
     if owner and owner.get("id"):
         oname = _esc(owner.get("display_name") or str(owner.get("id", "?")))
@@ -484,7 +484,7 @@ def _fmt_rel_user(data: dict, label: str) -> str:
 
 # ── Chart generator ───────────────────────────────────────────────────────────
 
-async def _make_chart(daily: list, title: str) -> bytes | None:
+def _chart_points(daily: list):
     valid = []
     for item in daily or []:
         try:
@@ -493,8 +493,11 @@ async def _make_chart(daily: list, title: str) -> bytes | None:
             )
         except (TypeError, ValueError, AttributeError):
             continue
-    if not valid:
-        return None
+    return valid
+
+
+def _render_chart(valid: list, title: str) -> bytes | None:
+    fig = None
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -532,13 +535,22 @@ async def _make_chart(daily: list, title: str) -> bytes | None:
 
         plt.tight_layout(pad=1.2)
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=130, facecolor="#111111")
-        plt.close(fig)
+        fig.savefig(buf, format="png", dpi=130, facecolor="#111111")
         buf.seek(0)
         return buf.read()
     except Exception as e:
         logger.error("Werwolf chart: %s", e)
         return None
+    finally:
+        if fig is not None:
+            plt.close(fig)
+
+
+async def _make_chart(daily: list, title: str) -> bytes | None:
+    valid = _chart_points(daily)
+    if not valid:
+        return None
+    return await asyncio.to_thread(_render_chart, valid, title)
 
 
 # ── Module ────────────────────────────────────────────────────────────────────
@@ -581,7 +593,7 @@ class WerwolfStatsMod(loader.Module):
             loader.ConfigValue(
                 "api_key", "",
                 "Особистий API-ключ (/api у боті → .wwkey YOUR_KEY)",
-                validator=loader.validators.String(),
+                validator=loader.validators.Hidden(loader.validators.String()),
             ),
         )
         self._session = None

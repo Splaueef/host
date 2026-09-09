@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 1.2.0
+# meta version: 1.3.0
 # meta description: 📊 Статистика вашої активності в Telegram — повідомлення, чати, піки по годинах.
 
 import datetime
@@ -48,6 +48,12 @@ class DailyStatMod(loader.Module):
                 "Кількість чатів у топі",
                 validator=loader.validators.Integer(minimum=1, maximum=20),
             ),
+            loader.ConfigValue(
+                "retention_days",
+                31,
+                "Скільки днів зберігати у локальній статистиці",
+                validator=loader.validators.Integer(minimum=7, maximum=366),
+            ),
         )
 
     async def client_ready(self, client, db):
@@ -57,8 +63,23 @@ class DailyStatMod(loader.Module):
     # ── Internal storage helpers ──────────────────────────────────────────
 
     def _init_storage(self):
-        if not self.get("stats"):
-            self.set("stats", {})
+        stats = self.get("stats")
+        if not isinstance(stats, dict):
+            stats = {}
+        self.set("stats", self._prune_stats(stats))
+
+    def _prune_stats(self, stats: dict) -> dict:
+        """Bound DB growth; commands only consume today and the last week."""
+        keep_days = int(self.config["retention_days"])
+        cutoff = datetime.date.today() - datetime.timedelta(days=keep_days - 1)
+        for key in list(stats):
+            try:
+                stored_day = datetime.date.fromisoformat(key)
+            except (TypeError, ValueError):
+                continue
+            if stored_day < cutoff:
+                stats.pop(key, None)
+        return stats
 
     def _today_key(self) -> str:
         return datetime.date.today().isoformat()
@@ -95,7 +116,7 @@ class DailyStatMod(loader.Module):
     def _save_day(self, key: str, data: dict):
         stats = self.get("stats", {})
         stats[key] = data
-        self.set("stats", stats)
+        self.set("stats", self._prune_stats(stats))
 
     @staticmethod
     def _coerce_user_id(user_id):
@@ -433,7 +454,7 @@ class DailyStatMod(loader.Module):
         stats = self.get("stats", {})
         stats[self._today_key()] = rebuilt
         stats.pop("__empty__", None)
-        self.set("stats", stats)
+        self.set("stats", self._prune_stats(stats))
         return rebuilt, scanned
 
     def _add_sent(self, day, user_id, name, has_media, hour, username=None):

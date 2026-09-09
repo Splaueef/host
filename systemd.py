@@ -24,6 +24,7 @@
 
 import asyncio
 import io
+import logging
 import subprocess
 from typing import Union
 
@@ -31,6 +32,8 @@ from telethon.tl.types import Message
 
 from .. import loader, utils
 from ..inline.types import InlineCall
+
+logger = logging.getLogger(__name__)
 
 
 def human_readable_size(size: float, decimal_places: int = 2) -> str:
@@ -80,6 +83,10 @@ class SystemdMod(loader.Module):
         "action_not_found": (
             "<emoji document_id=5312526098750252863>🚫</emoji> <b>Action"
             " </b><code>{}</code><b> not found</b>"
+        ),
+        "action_failed": (
+            "<emoji document_id=5312526098750252863>🚫</emoji> "
+            "<b>Systemd action failed:</b> <code>{}</code>"
         ),
         "unit_renamed": (
             "<emoji document_id=5314250708508220914>✅</emoji> <b>Unit"
@@ -311,81 +318,117 @@ class SystemdMod(loader.Module):
         "_cmd_doc_unit": "<birlik> - Birlikni boshqarish",
     }
 
-    def _get_unit_status_text(self, unit: str) -> str:
-        return (
-            subprocess.run(
-                [
-                    "sudo",
-                    "-S",
-                    "systemctl",
-                    "is-active",
-                    unit,
-                ],
-                check=False,
-                stdout=subprocess.PIPE,
-            )
-            .stdout.decode()
-            .strip()
+    @staticmethod
+    def _run_command(command, *, check=False, timeout=30):
+        """Run a bounded, non-interactive system command."""
+        return subprocess.run(
+            command,
+            check=check,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
         )
+
+    @staticmethod
+    def _sudo(*args):
+        # ``-n`` fails immediately when NOPASSWD is not configured instead of
+        # hanging Hikka while sudo waits for a password on stdin.
+        return ["sudo", "-n", *args]
+
+    def _get_unit_status_text(self, unit: str) -> str:
+        try:
+            result = self._run_command(
+                self._sudo("systemctl", "is-active", unit),
+                timeout=10,
+            )
+            return result.stdout.strip() or "unknown"
+        except (OSError, subprocess.SubprocessError):
+            logger.warning(
+                "Could not read status for systemd unit %s", unit, exc_info=True
+            )
+            return "unknown"
 
     def _is_running(self, unit: str) -> bool:
         return self._get_unit_status_text(unit) == "active"
 
     def _unit_exists(self, unit: str) -> bool:
-        return (
-            subprocess.run(
-                [
-                    "sudo",
-                    "-S",
-                    "systemctl",
-                    "cat",
-                    unit,
-                ],
-                check=False,
-                stdout=subprocess.PIPE,
-            ).returncode
-            == 0
-        )
+        try:
+            return self._run_command(
+                self._sudo("systemctl", "cat", unit),
+                timeout=10,
+            ).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            logger.warning("Could not inspect systemd unit %s", unit, exc_info=True)
+            return False
 
     async def _manage_unit(self, call: Union[InlineCall, int], unit: dict, action: str):
+        try:
+            return await self._manage_unit_impl(call, unit, action)
+        except (OSError, subprocess.SubprocessError) as error:
+            detail = (
+                getattr(error, "stderr", None)
+                or str(error)
+                or error.__class__.__name__
+            )
+            detail = detail.strip()[-1000:]
+            logger.warning(
+                "Could not perform %s on systemd unit %s: %s",
+                action,
+                unit["formal"],
+                detail,
+            )
+            if not isinstance(call, int):
+                await call.edit(
+                    self.strings("action_failed").format(
+                        utils.escape_html(detail)
+                    ),
+                    reply_markup=self._get_unit_markup(unit),
+                )
+            return False
+
+    async def _manage_unit_impl(
+        self, call: Union[InlineCall, int], unit: dict, action: str
+    ):
         if action == "start":
-            subprocess.run(
-                ["sudo", "-S", "systemctl", "start", unit["formal"]], check=True
+            await asyncio.to_thread(
+                self._run_command,
+                self._sudo("systemctl", "start", unit["formal"]),
+                check=True,
             )
         elif action == "stop":
-            subprocess.run(
-                ["sudo", "-S", "systemctl", "stop", unit["formal"]], check=True
+            await asyncio.to_thread(
+                self._run_command,
+                self._sudo("systemctl", "stop", unit["formal"]),
+                check=True,
             )
         elif action == "restart":
-            subprocess.run(
-                ["sudo", "-S", "systemctl", "restart", unit["formal"]], check=True
+            await asyncio.to_thread(
+                self._run_command,
+                self._sudo("systemctl", "restart", unit["formal"]),
+                check=True,
             )
         elif action in {"logs", "tail"}:
-            logs = (
-                subprocess.run(
-                    [
-                        "sudo",
-                        "-S",
-                        "journalctl",
-                        "-u",
-                        unit["formal"],
-                        "-n",
-                        "1000",
-                    ],
-                    check=True,
-                    stdout=subprocess.PIPE,
-                )
-                .stdout.decode()
-                .strip()
+            logs_result = await asyncio.to_thread(
+                self._run_command,
+                self._sudo(
+                    "journalctl", "-u", unit["formal"], "-n", "1000"
+                ),
+                check=True,
             )
+            logs = logs_result.stdout.strip()
 
-            hostname = (
-                subprocess.run(["hostname"], check=True, stdout=subprocess.PIPE)
-                .stdout.decode()
-                .strip()
+            hostname_result = await asyncio.to_thread(
+                self._run_command,
+                ["hostname"],
+                check=True,
+                timeout=10,
             )
+            hostname = hostname_result.stdout.strip()
             logs = logs.replace(f"{hostname} ", "")
-            logs = logs.replace("[" + str(self._get_unit_pid(unit["formal"])) + "]", "")
+            pid = await asyncio.to_thread(self._get_unit_pid, unit["formal"])
+            logs = logs.replace("[" + str(pid) + "]", "")
 
             if action == "logs":
                 logs = io.BytesIO(logs.encode())
@@ -410,21 +453,22 @@ class SystemdMod(loader.Module):
                         call,
                         reply_markup=self._get_unit_markup(unit),
                     )
-                    return
+                    return True
 
                 await call.edit(
                     f"<code>{utils.escape_html(actual_logs)}</code>",
                     reply_markup=self._get_unit_markup(unit),
                 )
                 await call.answer("Action complete")
-                return
+                return True
 
         if isinstance(call, int):
-            return
+            return True
 
         await call.answer("Action complete")
         await asyncio.sleep(2)
         await self._control_service(call, unit)
+        return True
 
     def _get_unit_markup(self, unit: dict) -> list:
         return [
@@ -471,113 +515,95 @@ class SystemdMod(loader.Module):
         ]
 
     async def _control_service(self, call: InlineCall, unit: dict):
+        status = await asyncio.to_thread(self._get_unit_status_text, unit["formal"])
         await call.edit(
             self.strings("unit_control").format(
-                unit["name"],
-                unit["formal"],
-                self._get_unit_status_emoji(unit["formal"]),
-                self._get_unit_status_text(unit["formal"]),
+                utils.escape_html(unit["name"]),
+                utils.escape_html(unit["formal"]),
+                self._status_emoji(status),
+                utils.escape_html(status),
             ),
             reply_markup=self._get_unit_markup(unit),
         )
 
     def _get_unit_pid(self, unit: str) -> str:
-        return (
-            subprocess.run(
-                [
-                    "sudo",
-                    "-S",
+        try:
+            return self._run_command(
+                self._sudo(
                     "systemctl",
                     "show",
                     unit,
                     "--property=MainPID",
                     "--value",
-                ],
-                check=False,
-                stdout=subprocess.PIPE,
-            )
-            .stdout.decode()
-            .strip()
-        )
+                ),
+                timeout=10,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return "0"
 
     def _get_unit_resources_consumption(self, unit: str) -> str:
         if not self._is_running(unit):
             return ""
 
         pid = self._get_unit_pid(unit)
-        ram = human_readable_size(
-            int(
-                subprocess.run(
-                    [
-                        "ps",
-                        "-p",
-                        pid,
-                        "-o",
-                        "rss",
-                    ],
-                    check=False,
-                    stdout=subprocess.PIPE,
-                )
-                .stdout.decode()
-                .strip()
-                .split("\n")[1]
-            )
-            * 1024
-        )
-
-        cpu = (
-            subprocess.run(
-                [
-                    "ps",
-                    "-p",
-                    pid,
-                    "-o",
-                    r"%cpu",
-                ],
-                check=False,
-                stdout=subprocess.PIPE,
-            )
-            .stdout.decode()
-            .strip()
-            .split("\n")[1]
-            + "%"
-        )
-
-        return f"📟 <code>{ram}</code> | 🗃 <code>{cpu}</code>"
+        if not pid.isdigit() or int(pid) <= 0:
+            return ""
+        try:
+            ram_lines = self._run_command(
+                ["ps", "-p", pid, "-o", "rss="], timeout=10
+            ).stdout.splitlines()
+            cpu_lines = self._run_command(
+                ["ps", "-p", pid, "-o", "%cpu="], timeout=10
+            ).stdout.splitlines()
+            if not ram_lines or not cpu_lines:
+                return ""
+            ram = human_readable_size(int(ram_lines[0].strip()) * 1024)
+            cpu = cpu_lines[0].strip() + "%"
+            return f"📟 <code>{ram}</code> | 🗃 <code>{utils.escape_html(cpu)}</code>"
+        except (OSError, ValueError, subprocess.SubprocessError):
+            logger.debug("Could not read resources for %s", unit, exc_info=True)
+            return ""
 
     def _get_panel(self):
         return self.strings("panel").format(
             "\n".join(
                 [
-                    f"{self._get_unit_status_emoji(unit['formal'])} <b>{unit['name']}</b>"
-                    f" (<code>{unit['formal']}</code>):"
-                    f" {self._get_unit_status_text(unit['formal'])} {self._get_unit_resources_consumption(unit['formal'])}"
+                    f"{self._get_unit_status_emoji(unit['formal'])} "
+                    f"<b>{utils.escape_html(unit['name'])}</b>"
+                    f" (<code>{utils.escape_html(unit['formal'])}</code>): "
+                    f"{utils.escape_html(self._get_unit_status_text(unit['formal']))} "
+                    f"{self._get_unit_resources_consumption(unit['formal'])}"
                     for unit in self.get("services", [])
                 ]
             )
         )
 
     async def _control_services(self, call: InlineCall, refresh: bool = False):
+        panel, markup = await asyncio.to_thread(
+            lambda: (self._get_panel(), self._get_services_markup())
+        )
         await call.edit(
-            self._get_panel(),
-            reply_markup=self._get_services_markup(),
+            panel,
+            reply_markup=markup,
         )
 
         if refresh:
             await call.answer("Information updated!")
 
-    def _get_unit_status_emoji(self, unit: str) -> str:
-        status = self._get_unit_status_text(unit)
+    @staticmethod
+    def _status_emoji(status: str) -> str:
         if status == "active":
             return "🍏"
-        elif status == "inactive":
+        if status == "inactive":
             return "🍎"
-        elif status == "failed":
+        if status == "failed":
             return "🚫"
-        elif status == "activating":
+        if status == "activating":
             return "🔄"
-        else:
-            return "❓"
+        return "❓"
+
+    def _get_unit_status_emoji(self, unit: str) -> str:
+        return self._status_emoji(self._get_unit_status_text(unit))
 
     def _get_services_markup(self) -> list:
         return utils.chunks(
@@ -607,10 +633,13 @@ class SystemdMod(loader.Module):
 
     async def unitscmd(self, message: Message):
         """Open control panel"""
-        form = await self.inline.form(
-            self._get_panel(),
+        panel, markup = await asyncio.to_thread(
+            lambda: (self._get_panel(), self._get_services_markup())
+        )
+        await self.inline.form(
+            panel,
             message,
-            reply_markup=self._get_services_markup(),
+            reply_markup=markup,
         )
 
     async def addunitcmd(self, message: Message):
@@ -626,15 +655,23 @@ class SystemdMod(loader.Module):
             unit = args
             name = args
 
-        if not self._unit_exists(unit):
-            await utils.answer(message, self.strings("unit_doesnt_exist").format(unit))
+        if not await asyncio.to_thread(self._unit_exists, unit):
+            await utils.answer(
+                message,
+                self.strings("unit_doesnt_exist").format(utils.escape_html(unit)),
+            )
             return
 
         self.set(
             "services",
             self.get("services", []) + [{"name": name, "formal": unit}],
         )
-        await utils.answer(message, self.strings("unit_added").format(unit, name))
+        await utils.answer(
+            message,
+            self.strings("unit_added").format(
+                utils.escape_html(unit), utils.escape_html(name)
+            ),
+        )
 
     async def delunitcmd(self, message: Message):
         """<unit> - Delete unit"""
@@ -644,7 +681,10 @@ class SystemdMod(loader.Module):
             return
 
         if not any(unit["formal"] == args for unit in self.get("services", [])):
-            await utils.answer(message, self.strings("unit_doesnt_exist").format(args))
+            await utils.answer(
+                message,
+                self.strings("unit_doesnt_exist").format(utils.escape_html(args)),
+            )
             return
 
         self.set(
@@ -655,7 +695,10 @@ class SystemdMod(loader.Module):
                 if service["formal"] != args
             ],
         )
-        await utils.answer(message, self.strings("unit_removed").format(args))
+        await utils.answer(
+            message,
+            self.strings("unit_removed").format(utils.escape_html(args)),
+        )
 
     async def unitcmd(self, message: Message):
         """<unit> <start|stop|restart|logs|tail> - Perform specific action on unit bypassing main menu"""
@@ -665,29 +708,44 @@ class SystemdMod(loader.Module):
             return
 
         unit, action = args.split(maxsplit=1)
-        if not self._unit_exists(unit):
-            await utils.answer(message, self.strings("unit_doesnt_exist").format(unit))
+        if not await asyncio.to_thread(self._unit_exists, unit):
+            await utils.answer(
+                message,
+                self.strings("unit_doesnt_exist").format(utils.escape_html(unit)),
+            )
             return
 
         if action in {"start", "stop", "restart", "logs"}:
-            await self._manage_unit(
+            succeeded = await self._manage_unit(
                 utils.get_chat_id(message),
                 {"formal": unit, "name": unit},
                 action,
             )
         elif action == "tail":
-            await self._manage_unit(
+            succeeded = await self._manage_unit(
                 utils.get_chat_id(message),
                 {"formal": unit, "name": unit},
                 "tail",
             )
         else:
-            await utils.answer(message, self.strings("action_not_found").format(action))
+            await utils.answer(
+                message,
+                self.strings("action_not_found").format(utils.escape_html(action)),
+            )
+            return
+
+        if not succeeded:
+            await utils.answer(
+                message,
+                self.strings("action_failed").format(utils.escape_html(action)),
+            )
             return
 
         await utils.answer(
             message,
-            self.strings("unit_action_done").format(action, unit),
+            self.strings("unit_action_done").format(
+                utils.escape_html(action), utils.escape_html(unit)
+            ),
         )
 
     async def nameunitcmd(self, message: Message):
@@ -699,7 +757,10 @@ class SystemdMod(loader.Module):
 
         unit, name = args.split(maxsplit=1)
         if not any(unit_["formal"] == unit for unit_ in self.get("services", [])):
-            await utils.answer(message, self.strings("unit_doesnt_exist").format(unit))
+            await utils.answer(
+                message,
+                self.strings("unit_doesnt_exist").format(utils.escape_html(unit)),
+            )
             return
 
         self.set(
@@ -711,4 +772,9 @@ class SystemdMod(loader.Module):
             ]
             + [{"name": name, "formal": unit}],
         )
-        await utils.answer(message, self.strings("unit_renamed").format(unit, name))
+        await utils.answer(
+            message,
+            self.strings("unit_renamed").format(
+                utils.escape_html(unit), utils.escape_html(name)
+            ),
+        )
