@@ -1,12 +1,14 @@
 # meta developer: @Huai_Baike
-# meta version: 1.0.0
-# meta description: 🧭 Єдине inline-меню для основних модулів Hikka.
+# meta version: 2.0.0
+# meta description: 🧭 Центр команд, конфігурації та встановлення модулів Hikka.
 # scope: inline
 # scope: hikka_only
 
 import contextlib
 import inspect
 import logging
+import re
+from urllib.parse import urlparse
 
 from .. import loader, utils
 
@@ -16,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 @loader.tds
 class ModuleHubMod(loader.Module):
-    """🧭 Єдина зручна панель для всіх основних модулів"""
+    """🧭 Центр команд, налаштувань і встановлення модулів"""
 
     strings = {
         "name": "ModuleHub",
@@ -27,6 +29,34 @@ class ModuleHubMod(loader.Module):
     }
 
     PAGE_SIZE = 6
+    CONFIG_PAGE_SIZE = 8
+    REPO_BASE = "https://github.com/Splaueef/host/raw/main"
+    TRUSTED_INSTALL_HOSTS = {
+        "github.com",
+        "raw.githubusercontent.com",
+        "gitlab.com",
+    }
+
+    REPO_FILES = {
+        "contactstatus": "contactstatus.py",
+        "stats": "stats.py",
+        "analysis": "analysis.py",
+        "nekospy": "nekospy.py",
+        "vdlt": "vdlt.py",
+        "dailynews": "dailynews.py",
+        "mistral": "mistralAI.py",
+        "gemma": "gemmaself.py",
+        "math": "math.py",
+        "werwolf": "rkapi.py",
+        "systemd": "systemd.py",
+        "backup": "backup.py",
+        "quiet": "quietschedule.py",
+        "sysinfo": "sysinfo.py",
+        "timeinfo": "timeinfo.py",
+        "teledocs": "teledocs.py",
+        "purge": "purge.py",
+        "eval": "eval.py",
+    }
 
     MODULES = {
         "contactstatus": {
@@ -321,14 +351,58 @@ class ModuleHubMod(loader.Module):
         spec = self.MODULES.get(key)
         if not spec:
             return None
+        return self._find_module_by_class(spec["class"])
+
+    def _find_module_by_class(self, class_name):
         return next(
             (
                 module
                 for module in getattr(self.allmodules, "modules", [])
-                if module.__class__.__name__ == spec["class"]
+                if module.__class__.__name__ == class_name
             ),
             None,
         )
+
+    def _module_key(self, module):
+        class_name = module.__class__.__name__
+        return next(
+            (
+                key
+                for key, spec in self.MODULES.items()
+                if spec["class"] == class_name
+            ),
+            None,
+        )
+
+    def _module_name(self, module):
+        key = self._module_key(module)
+        if key:
+            return self.MODULES[key]["name"]
+        strings = getattr(module, "strings", None)
+        try:
+            value = strings("name") if callable(strings) else strings["name"]
+            if value:
+                return str(value)
+        except Exception:
+            pass
+        name = module.__class__.__name__
+        return name[:-3] if name.endswith("Mod") else name
+
+    def _module_icon(self, module):
+        key = self._module_key(module)
+        return self.MODULES[key]["icon"] if key else "🧩"
+
+    @staticmethod
+    def _is_core_module(module):
+        return str(getattr(module, "__origin__", "")).startswith("<core")
+
+    @staticmethod
+    def _has_config(module):
+        config = getattr(module, "config", None)
+        try:
+            return config is not None and len(config) > 0
+        except TypeError:
+            return False
 
     def _module_commands(self, key):
         if key == "analysis":
@@ -356,6 +430,8 @@ class ModuleHubMod(loader.Module):
             "🧭 <b>ModuleHub · головне меню</b>\n\n"
             f"✅ Активно: <b>{self._loaded_count()}</b> із "
             f"<b>{len(self.MODULES)}</b> основних модулів.\n"
+            "📦 Каталог дозволяє встановлювати й оновлювати модулі.\n"
+            "⚙️ Налаштування працюють і для інших модулів Hikka.\n"
             "🔐 Кнопки доступні лише власнику Hikka.\n\n"
             "<i>Оберіть розділ. Меню автоматично бере актуальні "
             "команди зі всіх завантажених модулів.</i>"
@@ -376,9 +452,29 @@ class ModuleHubMod(loader.Module):
             [
                 [
                     {
+                        "text": "📦 Каталог модулів",
+                        "callback": self._catalog_page,
+                        "args": (0, reply_id),
+                    },
+                    {
+                        "text": "⚙️ Усі налаштування",
+                        "callback": self._configs_page,
+                        "args": (0, "external", reply_id),
+                    },
+                ],
+                [
+                    {
                         "text": "🔎 Знайти команду",
                         "input": "Назва команди або ключове слово",
                         "handler": self._search_input,
+                        "args": (reply_id,),
+                    }
+                ],
+                [
+                    {
+                        "text": "➕ Встановити за назвою / URL",
+                        "input": "Назва з репозиторію або HTTPS-посилання на .py",
+                        "handler": self._custom_install_input,
                         "args": (reply_id,),
                     }
                 ],
@@ -507,6 +603,809 @@ class ModuleHubMod(loader.Module):
             reply_markup=self._home_markup(reply_id),
         )
 
+    def _catalog_source(self, key):
+        filename = self.REPO_FILES[key]
+        return f"{self.REPO_BASE}/{filename}"
+
+    async def _catalog_page(self, call, page=0, reply_id=None, note=None):
+        keys = list(self.MODULES)
+        page_count = max(1, (len(keys) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        page = max(0, min(int(page), page_count - 1))
+        shown = keys[page * self.PAGE_SIZE : (page + 1) * self.PAGE_SIZE]
+        lines = [
+            "📦 <b>Каталог модулів</b>",
+            f"Сторінка <b>{page + 1}/{page_count}</b> · "
+            f"встановлено <b>{self._loaded_count()}/{len(keys)}</b>",
+        ]
+        if note:
+            lines.append(f"\n✅ <i>{utils.escape_html(note)}</i>")
+        for key in shown:
+            spec = self.MODULES[key]
+            loaded = self._find_module(key) is not None
+            lines.append(
+                f"\n{'✅' if loaded else '⬇️'} {spec['icon']} "
+                f"<b>{spec['name']}</b>\n"
+                f"└ {'завантажено · можна оновити' if loaded else 'не встановлено'}"
+            )
+        markup = self._chunks(
+            [
+                {
+                    "text": (
+                        "✅" if self._find_module(key) is not None else "⬇️"
+                    )
+                    + f" {self.MODULES[key]['icon']} {self.MODULES[key]['name']}",
+                    "callback": self._module_page,
+                    "args": (key, 0, reply_id),
+                }
+                for key in shown
+            ]
+        )
+        if page_count > 1:
+            markup.append(
+                [
+                    {
+                        "text": "◀️",
+                        "callback": self._catalog_page,
+                        "args": ((page - 1) % page_count, reply_id),
+                    },
+                    {
+                        "text": f"{page + 1}/{page_count}",
+                        "action": "answer",
+                        "message": f"Сторінка {page + 1} з {page_count}",
+                    },
+                    {
+                        "text": "▶️",
+                        "callback": self._catalog_page,
+                        "args": ((page + 1) % page_count, reply_id),
+                    },
+                ]
+            )
+        markup.extend(
+            [
+                [
+                    {
+                        "text": "➕ Встановити за назвою / URL",
+                        "input": "Назва з репозиторію або HTTPS-посилання на .py",
+                        "handler": self._custom_install_input,
+                        "args": (reply_id,),
+                    }
+                ],
+                [
+                    {
+                        "text": "🏠 Головна",
+                        "callback": self._home,
+                        "args": (reply_id,),
+                    },
+                    {"text": "✖️", "action": "close"},
+                ],
+            ]
+        )
+        await call.edit("\n".join(lines), reply_markup=markup)
+
+    async def _missing_module_page(self, call, key, reply_id=None, note=None):
+        spec = self.MODULES[key]
+        text = (
+            f"⬇️ {spec['icon']} <b>{spec['name']}</b>\n\n"
+            f"{spec['description']}\n\n"
+            "Модуль зараз <b>не встановлено</b>. Його можна безпосередньо "
+            "завантажити з перевіреного репозиторію <code>Splaueef/host</code>."
+        )
+        if note:
+            text += f"\n\n⚠️ <i>{utils.escape_html(note)}</i>"
+        await call.edit(
+            text,
+            reply_markup=[
+                [
+                    {
+                        "text": "⬇️ Встановити",
+                        "callback": self._confirm_catalog_action,
+                        "args": (key, "install", reply_id),
+                    }
+                ],
+                [
+                    {
+                        "text": "↩️ До каталогу",
+                        "callback": self._catalog_page,
+                        "args": (0, reply_id),
+                    },
+                    {
+                        "text": "🏠 Головна",
+                        "callback": self._home,
+                        "args": (reply_id,),
+                    },
+                ],
+            ],
+        )
+
+    async def _confirm_catalog_action(self, call, key, action, reply_id=None):
+        if key not in self.MODULES or key not in self.REPO_FILES:
+            await call.answer("Невідомий модуль", show_alert=True)
+            return
+        spec = self.MODULES[key]
+        verb = "оновити" if action == "update" else "встановити"
+        source = self._catalog_source(key)
+        await call.edit(
+            "⚠️ <b>Підтвердження завантаження коду</b>\n\n"
+            f"Ви справді хочете <b>{verb}</b> {spec['icon']} "
+            f"<b>{spec['name']}</b>?\n\n"
+            f"Джерело: <code>{utils.escape_html(source)}</code>\n"
+            "<i>Модулі мають доступ до акаунта Hikka. Встановлюйте код "
+            "лише з джерел, яким довіряєте.</i>",
+            reply_markup=[
+                [
+                    {
+                        "text": f"✅ Так, {verb}",
+                        "callback": self._run_catalog_action,
+                        "args": (key, action, reply_id),
+                    },
+                    {
+                        "text": "❌ Скасувати",
+                        "callback": self._module_page,
+                        "args": (key, 0, reply_id),
+                    },
+                ]
+            ],
+        )
+
+    async def _run_catalog_action(self, call, key, action, reply_id=None):
+        chat_id = self._chat_id(call)
+        if chat_id is None:
+            await call.answer("Не вдалося визначити чат", show_alert=True)
+            return
+        spec = self.MODULES[key]
+        await call.answer(
+            f"{'Оновлюю' if action == 'update' else 'Встановлюю'} "
+            f"{spec['name']}…"
+        )
+        try:
+            await self.invoke("dlmod", self._catalog_source(key), peer=chat_id)
+        except Exception as error:
+            logger.exception("ModuleHub: catalog action failed for %s", key)
+            await self._missing_module_page(
+                call,
+                key,
+                reply_id,
+                f"Loader повернув помилку: {str(error)[:300]}",
+            )
+            return
+        if self._find_module(key) is None:
+            await self._missing_module_page(
+                call,
+                key,
+                reply_id,
+                "Loader не підтвердив завантаження. Деталі є в повідомленні команди.",
+            )
+            return
+        await self._module_page(
+            call,
+            key,
+            0,
+            reply_id,
+            "Модуль оновлено" if action == "update" else "Модуль встановлено",
+        )
+
+    async def _confirm_uninstall(self, call, key, page=0, reply_id=None):
+        spec = self.MODULES[key]
+        await call.edit(
+            "🗑 <b>Видалити модуль?</b>\n\n"
+            f"{spec['icon']} <b>{spec['name']}</b> буде вивантажено й "
+            "прибрано зі списку автозапуску. Збережені дані модуля "
+            "залишаться в базі Hikka.",
+            reply_markup=[
+                [
+                    {
+                        "text": "🗑 Так, видалити",
+                        "callback": self._run_uninstall,
+                        "args": (key, reply_id),
+                    },
+                    {
+                        "text": "❌ Скасувати",
+                        "callback": self._module_page,
+                        "args": (key, page, reply_id),
+                    },
+                ]
+            ],
+        )
+
+    async def _run_uninstall(self, call, key, reply_id=None):
+        chat_id = self._chat_id(call)
+        module = self._find_module(key)
+        if chat_id is None or module is None:
+            await call.answer("Модуль уже не завантажено", show_alert=True)
+            return
+        spec = self.MODULES[key]
+        await call.answer(f"Видаляю {spec['name']}…")
+        try:
+            await self.invoke("unloadmod", spec["class"], peer=chat_id)
+        except Exception as error:
+            logger.exception("ModuleHub: unable to unload %s", key)
+            await call.answer(str(error)[:200], show_alert=True)
+            return
+        if self._find_module(key) is not None:
+            await self._module_page(
+                call,
+                key,
+                0,
+                reply_id,
+                "Loader не зміг видалити модуль",
+            )
+            return
+        await self._missing_module_page(call, key, reply_id, "Модуль видалено")
+
+    @classmethod
+    def _normalize_install_source(cls, value):
+        source = str(value or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,64}(?:\.py)?", source):
+            return source, None
+        parsed = urlparse(source)
+        host = (parsed.hostname or "").lower()
+        if (
+            parsed.scheme != "https"
+            or host not in cls.TRUSTED_INSTALL_HOSTS
+            or not parsed.path.lower().endswith(".py")
+        ):
+            return None, (
+                "Вкажіть коротку назву модуля або HTTPS-посилання на .py "
+                "з GitHub чи GitLab."
+            )
+        return source, None
+
+    async def _custom_install_input(self, call, query, reply_id=None):
+        source, error = self._normalize_install_source(query)
+        if error:
+            await call.edit(
+                f"❌ <b>Некоректне джерело</b>\n\n{utils.escape_html(error)}",
+                reply_markup=[
+                    [
+                        {
+                            "text": "🔁 Спробувати ще",
+                            "input": "Назва або HTTPS-посилання на .py",
+                            "handler": self._custom_install_input,
+                            "args": (reply_id,),
+                        }
+                    ],
+                    [
+                        {
+                            "text": "🏠 Головна",
+                            "callback": self._home,
+                            "args": (reply_id,),
+                        }
+                    ],
+                ],
+            )
+            return
+        await call.edit(
+            "⚠️ <b>Встановлення стороннього модуля</b>\n\n"
+            f"Джерело: <code>{utils.escape_html(source)}</code>\n\n"
+            "<i>Модуль отримає доступ до Hikka та Telegram-акаунта. "
+            "Переконайтеся, що довіряєте автору коду.</i>",
+            reply_markup=[
+                [
+                    {
+                        "text": "✅ Встановити",
+                        "callback": self._run_custom_install,
+                        "args": (source, reply_id),
+                    },
+                    {
+                        "text": "❌ Скасувати",
+                        "callback": self._home,
+                        "args": (reply_id,),
+                    },
+                ]
+            ],
+        )
+
+    async def _run_custom_install(self, call, source, reply_id=None):
+        chat_id = self._chat_id(call)
+        if chat_id is None:
+            await call.answer("Не вдалося визначити чат", show_alert=True)
+            return
+        await call.answer("Встановлюю модуль…")
+        try:
+            await self.invoke("dlmod", source, peer=chat_id)
+        except Exception as error:
+            logger.exception("ModuleHub: custom install failed")
+            await call.edit(
+                "❌ <b>Не вдалося запустити Loader</b>\n\n"
+                f"<code>{utils.escape_html(str(error))[:500]}</code>",
+                reply_markup=[
+                    [
+                        {
+                            "text": "🏠 Головна",
+                            "callback": self._home,
+                            "args": (reply_id,),
+                        }
+                    ]
+                ],
+            )
+            return
+        await call.edit(
+            "✅ <b>Loader завершив встановлення</b>\n\n"
+            "Перевірте службове повідомлення в чаті: там буде точний "
+            "результат завантаження та можливі попередження залежностей.",
+            reply_markup=[
+                [
+                    {
+                        "text": "📦 Каталог",
+                        "callback": self._catalog_page,
+                        "args": (0, reply_id),
+                    },
+                    {
+                        "text": "🏠 Головна",
+                        "callback": self._home,
+                        "args": (reply_id,),
+                    },
+                ]
+            ],
+        )
+
+    def _config_modules(self, scope="external"):
+        result = []
+        for module in getattr(self.allmodules, "modules", []):
+            config = getattr(module, "config", None)
+            try:
+                has_options = config is not None and bool(list(config))
+            except Exception:
+                has_options = False
+            if not has_options:
+                continue
+            is_core = self._is_core_module(module)
+            if scope == "core" and not is_core:
+                continue
+            if scope != "core" and is_core:
+                continue
+            result.append(module)
+        result.sort(key=lambda module: self._module_name(module).casefold())
+        return result
+
+    @staticmethod
+    def _config_validator(module, option):
+        try:
+            return module.config._config[option].validator
+        except Exception:
+            return None
+
+    def _config_is_hidden(self, module, option):
+        validator = self._config_validator(module, option)
+        return getattr(validator, "internal_id", None) == "Hidden"
+
+    def _config_is_bool(self, module, option):
+        if self._config_is_hidden(module, option):
+            return False
+        validator = self._config_validator(module, option)
+        return (
+            getattr(validator, "internal_id", None) == "Boolean"
+            or isinstance(module.config[option], bool)
+        )
+
+    def _format_config_value(self, module, option, value, limit=72):
+        if self._config_is_hidden(module, option):
+            return "••••••" if value not in (None, "", []) else "не задано"
+        if value is None:
+            text = "None"
+        elif isinstance(value, bool):
+            text = "увімкнено" if value else "вимкнено"
+        elif isinstance(value, (list, tuple, set)):
+            text = "[" + ", ".join(map(str, value)) + "]"
+        else:
+            text = str(value)
+        text = " ".join(text.splitlines())
+        return text if len(text) <= limit else text[: limit - 1] + "…"
+
+    async def _configs_page(
+        self,
+        call,
+        page=0,
+        scope="external",
+        reply_id=None,
+    ):
+        scope = "core" if scope == "core" else "external"
+        modules = self._config_modules(scope)
+        page_count = max(
+            1,
+            (len(modules) + self.CONFIG_PAGE_SIZE - 1) // self.CONFIG_PAGE_SIZE,
+        )
+        page = max(0, min(int(page), page_count - 1))
+        shown = modules[
+            page * self.CONFIG_PAGE_SIZE : (page + 1) * self.CONFIG_PAGE_SIZE
+        ]
+        label = "системні" if scope == "core" else "встановлені"
+        text = (
+            "⚙️ <b>Налаштування модулів</b>\n"
+            f"Розділ: <b>{label}</b> · знайдено <b>{len(modules)}</b> · "
+            f"сторінка <b>{page + 1}/{page_count}</b>\n\n"
+            "<i>Секретні поля приховані. Нові значення перевіряються "
+            "валідаторами самого модуля.</i>"
+        )
+        if not shown:
+            text += "\n\n<i>У цьому розділі немає доступних конфігурацій.</i>"
+        markup = self._chunks(
+            [
+                {
+                    "text": (
+                        f"{self._module_icon(module)} "
+                        f"{self._module_name(module)[:26]} "
+                        f"({len(list(module.config))})"
+                    ),
+                    "callback": self._config_page,
+                    "args": (module.__class__.__name__, 0, scope, reply_id),
+                }
+                for module in shown
+            ]
+        )
+        if page_count > 1:
+            markup.append(
+                [
+                    {
+                        "text": "◀️",
+                        "callback": self._configs_page,
+                        "args": ((page - 1) % page_count, scope, reply_id),
+                    },
+                    {
+                        "text": f"{page + 1}/{page_count}",
+                        "action": "answer",
+                        "message": f"Сторінка {page + 1} з {page_count}",
+                    },
+                    {
+                        "text": "▶️",
+                        "callback": self._configs_page,
+                        "args": ((page + 1) % page_count, scope, reply_id),
+                    },
+                ]
+            )
+        markup.extend(
+            [
+                [
+                    {
+                        "text": "🔌 Встановлені",
+                        "callback": self._configs_page,
+                        "args": (0, "external", reply_id),
+                    },
+                    {
+                        "text": "🧠 Системні",
+                        "callback": self._configs_page,
+                        "args": (0, "core", reply_id),
+                    },
+                ],
+                [
+                    {
+                        "text": "🏠 Головна",
+                        "callback": self._home,
+                        "args": (reply_id,),
+                    },
+                    {"text": "✖️", "action": "close"},
+                ],
+            ]
+        )
+        await call.edit(text, reply_markup=markup)
+
+    async def _config_page(
+        self,
+        call,
+        class_name,
+        page=0,
+        scope="external",
+        reply_id=None,
+        note=None,
+    ):
+        module = self._find_module_by_class(class_name)
+        if module is None or not hasattr(module, "config"):
+            await call.answer("Модуль або його конфігурація недоступні", show_alert=True)
+            return
+        options = list(module.config)
+        page_count = max(
+            1,
+            (len(options) + self.PAGE_SIZE - 1) // self.PAGE_SIZE,
+        )
+        page = max(0, min(int(page), page_count - 1))
+        shown = options[page * self.PAGE_SIZE : (page + 1) * self.PAGE_SIZE]
+        lines = [
+            f"⚙️ <b>{utils.escape_html(self._module_name(module))}</b>",
+            f"Параметрів: <b>{len(options)}</b> · "
+            f"сторінка <b>{page + 1}/{page_count}</b>",
+        ]
+        if note:
+            lines.append(f"\n✅ <i>{utils.escape_html(note)}</i>")
+        for option in shown:
+            value = module.config[option]
+            lock = "🔒 " if self._config_is_hidden(module, option) else ""
+            lines.append(
+                f"\n{lock}<code>{utils.escape_html(option)}</code>\n"
+                f"└ {utils.escape_html(self._format_config_value(module, option, value))}"
+            )
+        buttons = [
+            {
+                "text": (
+                    ("🔒 " if self._config_is_hidden(module, option) else "")
+                    + option[:28]
+                ),
+                "callback": self._config_option_page,
+                "args": (class_name, option, page, scope, reply_id),
+            }
+            for option in shown
+        ]
+        markup = self._chunks(buttons)
+        if page_count > 1:
+            markup.append(
+                [
+                    {
+                        "text": "◀️",
+                        "callback": self._config_page,
+                        "args": (
+                            class_name,
+                            (page - 1) % page_count,
+                            scope,
+                            reply_id,
+                        ),
+                    },
+                    {
+                        "text": f"{page + 1}/{page_count}",
+                        "action": "answer",
+                        "message": f"Сторінка {page + 1} з {page_count}",
+                    },
+                    {
+                        "text": "▶️",
+                        "callback": self._config_page,
+                        "args": (
+                            class_name,
+                            (page + 1) % page_count,
+                            scope,
+                            reply_id,
+                        ),
+                    },
+                ]
+            )
+        key = self._module_key(module)
+        back_callback = self._module_page if key else self._configs_page
+        back_args = (key, 0, reply_id) if key else (0, scope, reply_id)
+        markup.append(
+            [
+                {
+                    "text": "↩️ Назад",
+                    "callback": back_callback,
+                    "args": back_args,
+                },
+                {
+                    "text": "⚙️ Усі конфіги",
+                    "callback": self._configs_page,
+                    "args": (0, scope, reply_id),
+                },
+            ]
+        )
+        await call.edit("\n".join(lines), reply_markup=markup)
+
+    async def _config_option_page(
+        self,
+        call,
+        class_name,
+        option,
+        page=0,
+        scope="external",
+        reply_id=None,
+        note=None,
+    ):
+        module = self._find_module_by_class(class_name)
+        if module is None or option not in getattr(module, "config", {}):
+            await call.answer("Параметр більше недоступний", show_alert=True)
+            return
+        config = module.config
+        try:
+            doc = config.getdoc(option)
+        except Exception:
+            doc = "Опис відсутній"
+        try:
+            default = config.getdef(option)
+        except Exception:
+            default = None
+        current = config[option]
+        validator = self._config_validator(module, option)
+        validator_name = getattr(validator, "internal_id", None) or type(current).__name__
+        text = (
+            f"⚙️ <b>{utils.escape_html(self._module_name(module))}</b>\n"
+            f"Параметр: <code>{utils.escape_html(option)}</code>\n\n"
+            f"{utils.escape_html(str(doc))[:1800]}\n\n"
+            f"Поточне: <code>{utils.escape_html(self._format_config_value(module, option, current, 700))}</code>\n"
+            f"Тип: <code>{utils.escape_html(validator_name)}</code>\n"
+            f"Типове: <code>{utils.escape_html(self._format_config_value(module, option, default, 500))}</code>"
+        )
+        if self._config_is_hidden(module, option):
+            text += "\n\n🔒 <i>Значення приховано й не може бути показане через меню.</i>"
+        if note:
+            text += f"\n\n✅ <i>{utils.escape_html(note)}</i>"
+        markup = []
+        if self._config_is_bool(module, option):
+            markup.append(
+                [
+                    {
+                        "text": "🔴 Вимкнути" if current else "🟢 Увімкнути",
+                        "callback": self._set_config_bool,
+                        "args": (
+                            class_name,
+                            option,
+                            not current,
+                            page,
+                            scope,
+                            reply_id,
+                        ),
+                    }
+                ]
+            )
+        else:
+            markup.append(
+                [
+                    {
+                        "text": "⌨️ Змінити значення",
+                        "input": f"Нове значення для {option}",
+                        "handler": self._set_config_value,
+                        "args": (class_name, option, page, scope, reply_id),
+                    }
+                ]
+            )
+        markup.extend(
+            [
+                [
+                    {
+                        "text": "♻️ Скинути до типового",
+                        "callback": self._confirm_config_reset,
+                        "args": (class_name, option, page, scope, reply_id),
+                    }
+                ],
+                [
+                    {
+                        "text": "↩️ До параметрів",
+                        "callback": self._config_page,
+                        "args": (class_name, page, scope, reply_id),
+                    },
+                    {
+                        "text": "🏠 Головна",
+                        "callback": self._home,
+                        "args": (reply_id,),
+                    },
+                ],
+            ]
+        )
+        await call.edit(text, reply_markup=markup)
+
+    async def _set_config_value(
+        self,
+        call,
+        query,
+        class_name,
+        option,
+        page=0,
+        scope="external",
+        reply_id=None,
+    ):
+        module = self._find_module_by_class(class_name)
+        if module is None or option not in getattr(module, "config", {}):
+            await call.answer("Параметр більше недоступний", show_alert=True)
+            return
+        try:
+            module.config[option] = str(query or "").strip()[:4000]
+        except Exception as error:
+            await call.edit(
+                "❌ <b>Значення не пройшло перевірку</b>\n\n"
+                f"<code>{utils.escape_html(str(error))[:700]}</code>",
+                reply_markup=[
+                    [
+                        {
+                            "text": "🔁 Ввести ще раз",
+                            "input": f"Нове значення для {option}",
+                            "handler": self._set_config_value,
+                            "args": (class_name, option, page, scope, reply_id),
+                        }
+                    ],
+                    [
+                        {
+                            "text": "↩️ Назад",
+                            "callback": self._config_option_page,
+                            "args": (class_name, option, page, scope, reply_id),
+                        }
+                    ],
+                ],
+            )
+            return
+        await self._config_option_page(
+            call,
+            class_name,
+            option,
+            page,
+            scope,
+            reply_id,
+            "Значення збережено",
+        )
+
+    async def _set_config_bool(
+        self,
+        call,
+        class_name,
+        option,
+        value,
+        page=0,
+        scope="external",
+        reply_id=None,
+    ):
+        module = self._find_module_by_class(class_name)
+        if module is None or option not in getattr(module, "config", {}):
+            await call.answer("Параметр більше недоступний", show_alert=True)
+            return
+        try:
+            module.config[option] = bool(value)
+        except Exception as error:
+            await call.answer(str(error)[:200], show_alert=True)
+            return
+        await self._config_option_page(
+            call,
+            class_name,
+            option,
+            page,
+            scope,
+            reply_id,
+            "Налаштування змінено",
+        )
+
+    async def _confirm_config_reset(
+        self,
+        call,
+        class_name,
+        option,
+        page=0,
+        scope="external",
+        reply_id=None,
+    ):
+        module = self._find_module_by_class(class_name)
+        if module is None:
+            await call.answer("Модуль більше недоступний", show_alert=True)
+            return
+        await call.edit(
+            "♻️ <b>Скинути параметр?</b>\n\n"
+            f"Модуль: <b>{utils.escape_html(self._module_name(module))}</b>\n"
+            f"Параметр: <code>{utils.escape_html(option)}</code>\n\n"
+            "Поточне значення буде замінено типовим.",
+            reply_markup=[
+                [
+                    {
+                        "text": "✅ Скинути",
+                        "callback": self._reset_config,
+                        "args": (class_name, option, page, scope, reply_id),
+                    },
+                    {
+                        "text": "❌ Скасувати",
+                        "callback": self._config_option_page,
+                        "args": (class_name, option, page, scope, reply_id),
+                    },
+                ]
+            ],
+        )
+
+    async def _reset_config(
+        self,
+        call,
+        class_name,
+        option,
+        page=0,
+        scope="external",
+        reply_id=None,
+    ):
+        module = self._find_module_by_class(class_name)
+        if module is None or option not in getattr(module, "config", {}):
+            await call.answer("Параметр більше недоступний", show_alert=True)
+            return
+        try:
+            module.config[option] = module.config.getdef(option)
+        except Exception as error:
+            await call.answer(str(error)[:200], show_alert=True)
+            return
+        await self._config_option_page(
+            call,
+            class_name,
+            option,
+            page,
+            scope,
+            reply_id,
+            "Відновлено типове значення",
+        )
+
     async def _section_page(self, call, section_index, reply_id=None):
         section_index = max(0, min(int(section_index), len(self.SECTIONS) - 1))
         title, keys = self.SECTIONS[section_index]
@@ -559,10 +1458,7 @@ class ModuleHubMod(loader.Module):
             return
         module = self._find_module(key)
         if module is None:
-            await call.answer(
-                f"Модуль {spec['name']} не завантажено",
-                show_alert=True,
-            )
+            await self._missing_module_page(call, key, reply_id, note)
             return
         commands = self._module_commands(key)
         page_count = max(1, (len(commands) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
@@ -612,6 +1508,36 @@ class ModuleHubMod(loader.Module):
                     },
                 ]
             )
+        management = []
+        try:
+            has_config = hasattr(module, "config") and bool(list(module.config))
+        except Exception:
+            has_config = False
+        if has_config:
+            management.append(
+                {
+                    "text": "⚙️ Налаштувати",
+                    "callback": self._config_page,
+                    "args": (spec["class"], 0, "external", reply_id),
+                }
+            )
+        management.append(
+            {
+                "text": "🔄 Оновити",
+                "callback": self._confirm_catalog_action,
+                "args": (key, "update", reply_id),
+            }
+        )
+        markup.append(management)
+        markup.append(
+            [
+                {
+                    "text": "🗑 Видалити модуль",
+                    "callback": self._confirm_uninstall,
+                    "args": (key, page, reply_id),
+                }
+            ]
+        )
         section_index = next(
             index
             for index, (_, keys) in enumerate(self.SECTIONS)
