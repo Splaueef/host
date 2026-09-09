@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 2.0.0
+# meta version: 2.0.1
 # meta description: 🧭 Центр команд, конфігурації та встановлення модулів Hikka.
 # scope: inline
 # scope: hikka_only
@@ -240,7 +240,7 @@ class ModuleHubMod(loader.Module):
         "qnow",
         "qhelp",
         "qlist",
-        "info",
+        "sysinfo",
         "time",
         "timezone",
         "timestamp",
@@ -1794,9 +1794,4 @@ class ModuleHubMod(loader.Module):
     @loader.command(ru_doc="Відкрити меню основних модулів")
     async def modmenu(self, message):
         """🧭 Єдине inline-меню всіх основних модулів"""
-        await self._open_menu(message)
-
-    @loader.command(ru_doc="Коротка команда меню модулів")
-    async def hub(self, message):
-        """🧭 Аліас для .modmenu"""
         await self._open_menu(message)
