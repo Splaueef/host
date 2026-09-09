@@ -14,7 +14,11 @@ class _Module:
 
 
 def _decorator(*args, **kwargs):
-    return lambda value: value
+    def decorator(value):
+        value.is_command = True
+        return value
+
+    return decorator
 
 
 def _load_module():
@@ -141,10 +145,30 @@ def _buttons(markup):
     return [button for row in markup for button in row]
 
 
+def _registered_commands(instance):
+    return {
+        (name.rsplit("cmd", 1)[0] if name.endswith("cmd") else name).lower()
+        for name in dir(instance)
+        if not isinstance(getattr(type(instance), name, None), property)
+        and callable(getattr(instance, name))
+        and (
+            name.endswith("cmd")
+            or getattr(getattr(instance, name), "is_command", False)
+        )
+    }
+
+
 class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.module = modulehub.ModuleHubMod()
         self.module.allmodules = types.SimpleNamespace(modules=[], commands={})
+
+    def test_commands_do_not_collide_with_core_hub_alias(self):
+        commands = _registered_commands(self.module)
+
+        self.assertEqual(commands, {"modmenu"})
+        self.assertNotIn("", commands)
+        self.assertNotIn("hub", commands)
 
     async def test_menu_is_owner_only_and_contains_search(self):
         self.module.inline = _Inline()
