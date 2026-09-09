@@ -59,6 +59,35 @@ def _loaded(class_name, commands):
     return instance
 
 
+class _Validator:
+    def __init__(self, internal_id):
+        self.internal_id = internal_id
+
+
+class _ConfigEntry:
+    def __init__(self, default, validator=None):
+        self.default = default
+        self.validator = validator
+
+
+class _Config(dict):
+    def __init__(self, values, docs=None, validators=None):
+        super().__init__(values)
+        docs = docs or {}
+        validators = validators or {}
+        self._docs = docs
+        self._config = {
+            key: _ConfigEntry(value, validators.get(key))
+            for key, value in values.items()
+        }
+
+    def getdoc(self, key):
+        return self._docs.get(key, "Опис параметра")
+
+    def getdef(self, key):
+        return self._config[key].default
+
+
 def _handler(doc, sink=None, label=None):
     async def command(message):
         if sink is not None:
@@ -225,14 +254,94 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent.text, ".wwkey token")
         self.assertEqual(sent.kwargs, {"reply_to": 55})
 
-    async def test_missing_module_is_reported_without_editing(self):
+    async def test_missing_module_offers_safe_catalog_install(self):
         call = _Call()
 
         await self.module._module_page(call, "math", 0)
 
-        self.assertFalse(call.edits)
-        self.assertTrue(call.answers[-1]["show_alert"])
-        self.assertIn("не завантажено", call.answers[-1]["text"])
+        view = call.edits[-1]
+        self.assertIn("не встановлено", view["text"])
+        install = _buttons(view["reply_markup"])[0]
+        self.assertEqual(install["callback"], self.module._confirm_catalog_action)
+        self.assertEqual(install["args"], ("math", "install", None))
+
+    async def test_catalog_install_runs_loader_and_refreshes_module(self):
+        invoked = []
+
+        async def invoke(command, args=None, peer=None):
+            invoked.append((command, args, peer))
+            self.module.allmodules.modules.append(_loaded("MathSolverMod", {}))
+
+        self.module.invoke = invoke
+        call = _Call(chat=555)
+
+        await self.module._run_catalog_action(call, "math", "install")
+
+        self.assertEqual(invoked[0][0], "dlmod")
+        self.assertEqual(invoked[0][2], 555)
+        self.assertTrue(invoked[0][1].endswith("/math.py"))
+        self.assertIn("Модуль встановлено", call.edits[-1]["text"])
+
+    async def test_config_menu_masks_hidden_values_and_toggles_bool(self):
+        module = _loaded("ContactStatusMod", {})
+        module.__origin__ = "https://example.test/contactstatus.py"
+        module.config = _Config(
+            {"enabled": True, "api_key": "top-secret", "limit": 10},
+            docs={"enabled": "Увімкнути збір", "api_key": "Ключ API"},
+            validators={
+                "enabled": _Validator("Boolean"),
+                "api_key": _Validator("Hidden"),
+                "limit": _Validator("Integer"),
+            },
+        )
+        self.module.allmodules.modules = [module]
+        call = _Call()
+
+        await self.module._config_page(call, "ContactStatusMod")
+
+        self.assertNotIn("top-secret", call.edits[-1]["text"])
+        self.assertIn("••••••", call.edits[-1]["text"])
+
+        await self.module._set_config_bool(
+            call, "ContactStatusMod", "enabled", False
+        )
+        self.assertFalse(module.config["enabled"])
+        self.assertIn("Налаштування змінено", call.edits[-1]["text"])
+
+    async def test_hidden_option_never_reveals_current_or_default(self):
+        module = _loaded("MistralModule", {})
+        module.__origin__ = "https://example.test/mistral.py"
+        module.config = _Config(
+            {"api_key": "secret-value"},
+            validators={"api_key": _Validator("Hidden")},
+        )
+        self.module.allmodules.modules = [module]
+        call = _Call()
+
+        await self.module._config_option_page(
+            call, "MistralModule", "api_key"
+        )
+
+        text = call.edits[-1]["text"]
+        self.assertNotIn("secret-value", text)
+        self.assertIn("Значення приховано", text)
+
+    def test_custom_install_source_is_restricted(self):
+        good, error = self.module._normalize_install_source("contactstatus")
+        self.assertEqual(good, "contactstatus")
+        self.assertIsNone(error)
+
+        good, error = self.module._normalize_install_source(
+            "https://evil.example/module.py"
+        )
+        self.assertIsNone(good)
+        self.assertIsNotNone(error)
+
+        good, error = self.module._normalize_install_source(
+            "http://github.com/user/repo/module.py"
+        )
+        self.assertIsNone(good)
+        self.assertIsNotNone(error)
 
 
 if __name__ == "__main__":
