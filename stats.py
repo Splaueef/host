@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 1.3.0
+# meta version: 1.4.0
 # meta description: 📊 Статистика вашої активності в Telegram — повідомлення, чати, піки по годинах.
 
 import datetime
@@ -66,6 +66,10 @@ class DailyStatMod(loader.Module):
     def _week_keys(self) -> list:
         today = datetime.date.today()
         return [(today - datetime.timedelta(days=i)).isoformat() for i in range(7)]
+
+    def _month_keys(self) -> list:
+        today = datetime.date.today()
+        return [(today - datetime.timedelta(days=i)).isoformat() for i in range(30)]
 
     def _get_day(self, key: str) -> dict:
         stats = self.get("stats", {})
@@ -474,13 +478,15 @@ class DailyStatMod(loader.Module):
 
     @loader.command(ru_doc="Статистика за сьогодні")
     async def ds(self, message):
-        """📊 Статистика | .ds [scan|week|top|peak [користувач]|reset]"""
+        """📊 Статистика | .ds [scan|week|month|top|peak [користувач]|reset]"""
         args = utils.get_args_raw(message).strip().lower()
 
         if args == "reset":
             await self._ds_reset(message)
         elif args == "week":
             await self._ds_week(message)
+        elif args == "month":
+            await self._ds_month(message)
         elif args == "top":
             await self._ds_top(message)
         elif args == "scan":
@@ -506,6 +512,16 @@ class DailyStatMod(loader.Module):
             return await utils.answer(message, self.strings["no_data"])
 
         text = self._format_stat(data, "останні 7 днів")
+        text += self._format_senders(data, self.config["top_count"])
+        text += self._format_top(data, self.config["top_count"])
+        await utils.answer(message, text)
+
+    async def _ds_month(self, message):
+        data = self._merge_days(self._month_keys())
+        if data["sent"] == 0 and data["received"] == 0:
+            return await utils.answer(message, self.strings["no_data"])
+
+        text = self._format_stat(data, "останні 30 днів")
         text += self._format_senders(data, self.config["top_count"])
         text += self._format_top(data, self.config["top_count"])
         await utils.answer(message, text)
