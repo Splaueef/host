@@ -32,23 +32,23 @@ The purpose of this repository is to maintain hosting-related files used by cust
 
 ## MessageScheduler
 
-\`messagescheduler.py\` надсилає повідомлення від акаунта Hikka в окремі чати,
+`messagescheduler.py` надсилає повідомлення від акаунта Hikka в окремі чати,
 групи або канали за разовим, щоденним чи щотижневим розкладом. Кожне завдання
 має власні чат, текст і час; доступні список, редагування, пауза, ручний запуск
 і повторні спроби після тимчасових помилок.
 
-\`\`\`text
+```text
 .ms add @chat once 2026-09-12 18:30 | Разове повідомлення
 .ms add тут daily 09:00 | Доброго ранку!
 .ms add @chat weekly пн,ср,пт 20:00 | Щотижневе повідомлення
 .ms help
-\`\`\`
+```
 
 Встановити окремо:
 
-\`\`\`text
+```text
 .dlmod https://raw.githubusercontent.com/Splaueef/host/main/messagescheduler.py
-\`\`\`
+```
 
 ## SystemInfo
 
