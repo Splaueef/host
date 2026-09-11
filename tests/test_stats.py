@@ -1,4 +1,4 @@
-"""Regression tests for DailyStat incoming-message accounting."""
+"""Regression tests for DailyStat message accounting."""
 
 import datetime
 import importlib.util
@@ -65,10 +65,10 @@ stats = _load_module()
 
 class _Message:
     def __init__(self, *, outgoing=False, private=False, sender=None, date=None,
-                 text="hello", media=None):
+                 text="hello", media=None, chat_id=100):
         self.out = outgoing
         self.is_private = private
-        self.chat_id = 100
+        self.chat_id = chat_id
         self.text = text
         self.media = media
         self.date = date
@@ -118,9 +118,11 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(day["users"]["1"]["id"], 1)
         self.assertEqual(day["users"]["1"]["username"], "alice")
 
-    async def test_group_and_channel_messages_are_ignored(self):
-        sender = types.SimpleNamespace(id=1, first_name="Alice")
-        await self.module.watcher(_Message(private=False, sender=sender))
+    async def test_group_and_channel_outgoing_messages_are_counted(self):
+        alice = types.SimpleNamespace(id=1, first_name="Alice")
+        group = types.SimpleNamespace(id=200, title="Study Group")
+        channel = types.SimpleNamespace(id=300, title="News Channel")
+        await self.module.watcher(_Message(private=False, sender=alice))
 
         day = self.module._get_day(self.module._today_key())
         self.assertEqual(day["received"], 0)
@@ -128,9 +130,23 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(day["users"], {})
 
         await self.module.watcher(
-            _Message(outgoing=True, private=False, sender=sender)
+            _Message(
+                outgoing=True, private=False, sender=group,
+                chat_id=-200, media=object(),
+            )
         )
-        self.assertEqual(day["sent"], 0)
+        await self.module.watcher(
+            _Message(
+                outgoing=True, private=False, sender=channel,
+                chat_id=-100300,
+            )
+        )
+        day = self.module._get_day(self.module._today_key())
+        self.assertEqual(day["sent"], 2)
+        self.assertEqual(day["media"], 1)
+        self.assertEqual(day["chats"]["-200"]["count"], 1)
+        self.assertEqual(day["chats"]["-100300"]["count"], 1)
+        self.assertEqual(day["users"], {})
 
     async def test_private_outgoing_tracks_per_user_hour(self):
         alice = types.SimpleNamespace(id=1, first_name="Alice")
@@ -167,15 +183,17 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(migrated["username"])
         self.assertEqual(len(migrated["sent_hours"]), 24)
 
-    async def test_scan_rebuilds_today_from_private_dialogs_with_outgoing(self):
-        now = datetime.datetime.now(datetime.timezone.utc)
+    async def test_scan_rebuilds_today_from_users_groups_and_channels(self):
+        now = datetime.datetime.now().astimezone()
         alice = types.SimpleNamespace(id=1, first_name="Alice", username="alice_user")
         bob = types.SimpleNamespace(id=2, first_name="Bob")
         group = types.SimpleNamespace(id=3, title="Group")
+        channel = types.SimpleNamespace(id=4, title="Channel")
         dialogs = [
             types.SimpleNamespace(is_user=True, entity=alice),
             types.SimpleNamespace(is_user=True, entity=bob),
-            types.SimpleNamespace(is_user=False, entity=group),
+            types.SimpleNamespace(is_user=False, entity=group, name="Group"),
+            types.SimpleNamespace(is_user=False, entity=channel, name="Channel"),
         ]
         histories = {
             1: [
@@ -185,20 +203,31 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
             ],
             # Bob wrote to us, but we did not write to Bob today: skip the dialog.
             2: [_Message(outgoing=False, date=now.replace(hour=12))],
+            3: [
+                _Message(outgoing=True, date=now.replace(hour=13)),
+                _Message(outgoing=False, date=now.replace(hour=14)),
+            ],
+            4: [
+                _Message(outgoing=True, date=now.replace(hour=15), media=object()),
+            ],
         }
         self.module._client = _HistoryClient(dialogs, histories)
         self.module.set("stats", {self.module._today_key(): {"sent": 99}})
 
         day, scanned = await self.module._scan_today()
 
-        self.assertEqual(scanned, 1)
-        self.assertEqual((day["sent"], day["received"], day["media"]), (1, 1, 1))
+        self.assertEqual(scanned, 3)
+        self.assertEqual((day["sent"], day["received"], day["media"]), (3, 1, 2))
         self.assertEqual(day["users"]["1"]["sent_hours"][9], 1)
         self.assertEqual(day["users"]["1"]["received_hours"][10], 1)
         self.assertEqual(day["users"]["1"]["id"], 1)
         self.assertEqual(day["users"]["1"]["username"], "alice_user")
         self.assertIs(self.module._find_user(day, "@alice_user"), day["users"]["1"])
         self.assertNotIn("2", day["users"])
+        self.assertNotIn("3", day["users"])
+        self.assertNotIn("4", day["users"])
+        self.assertEqual(day["chats"]["3"]["name"], "Group")
+        self.assertEqual(day["chats"]["4"]["name"], "Channel")
 
     async def test_scan_uses_dialog_input_entity_for_history(self):
         now = datetime.datetime.now(datetime.timezone.utc)

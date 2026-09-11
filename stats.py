@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 1.2.0
+# meta version: 1.3.0
 # meta description: 📊 Статистика вашої активності в Telegram — повідомлення, чати, піки по годинах.
 
 import datetime
@@ -32,9 +32,9 @@ class DailyStatMod(loader.Module):
         "peak_header": "\n📈 <b>Активність по годинах:</b>\n",
         "scan_done": (
             "✅ <b>Статистику за сьогодні відновлено.</b>\n"
-            "Перевірено особистих діалогів: <b>{chats}</b>"
+            "Перевірено активних чатів: <b>{chats}</b>"
         ),
-        "scan_progress": "⏳ <b>Аналізую особисті діалоги за сьогодні…</b>",
+        "scan_progress": "⏳ <b>Аналізую всі чати за сьогодні…</b>",
         "scan_failed": "❌ <b>Не вдалося відновити статистику:</b> <code>{}</code>",
         "user_not_found": "🔎 <b>Користувача не знайдено у статистиці за сьогодні.</b>",
         "users_peak_header": "📊 <b>DailyStat</b> — піки співрозмовників сьогодні\n\n",
@@ -124,7 +124,8 @@ class DailyStatMod(loader.Module):
         return user
 
     def _record_message(self, chat_id: int, chat_name: str, has_media: bool,
-                        hour: int = None, username: str = None):
+                        hour: int = None, username: str = None,
+                        is_private: bool = True):
         key = self._today_key()
         day = self._get_day(key)
         hour = datetime.datetime.now().hour if hour is None else hour
@@ -144,9 +145,12 @@ class DailyStatMod(loader.Module):
             }
         chats[str(chat_id)]["username"] = username or chats[str(chat_id)].get("username")
         chats[str(chat_id)]["count"] += 1
-        user = self._ensure_user(day, chat_id, chat_name, username)
-        user["sent"] += 1
-        user["sent_hours"][hour] += 1
+        # Per-user peaks only make sense for private dialogs. Groups and
+        # channels still contribute to totals, media, hours and top chats.
+        if is_private:
+            user = self._ensure_user(day, chat_id, chat_name, username)
+            user["sent"] += 1
+            user["sent_hours"][hour] += 1
 
         self._save_day(key, day)
 
@@ -210,11 +214,6 @@ class DailyStatMod(loader.Module):
         if message.text and message.text.startswith(self.get_prefix()):
             return
 
-        # DailyStat призначений для особистого спілкування: вихідні
-        # повідомлення у групах і каналах також не враховуємо.
-        if not getattr(message, "is_private", False):
-            return
-
         try:
             chat = await message.get_chat()
             chat_name = (
@@ -231,6 +230,7 @@ class DailyStatMod(loader.Module):
             chat_name,
             has_media=bool(message.media),
             username=getattr(chat, "username", None),
+            is_private=bool(getattr(message, "is_private", False)),
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────
@@ -375,18 +375,19 @@ class DailyStatMod(loader.Module):
         return matches[0] if len(matches) == 1 else None
 
     async def _scan_today(self) -> tuple:
-        """Rebuild today's counters from Telegram private-dialog history."""
+        """Rebuild today's counters from all Telegram dialog history."""
         now = datetime.datetime.now().astimezone()
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         rebuilt = self._get_day("__empty__")
         scanned = 0
 
         async for dialog in self._client.iter_dialogs():
-            if not getattr(dialog, "is_user", False):
-                continue
+            is_private = bool(getattr(dialog, "is_user", False))
             entity = getattr(dialog, "entity", None)
-            user_id = getattr(entity, "id", None)
-            if user_id is None:
+            chat_id = getattr(dialog, "id", None)
+            if chat_id is None:
+                chat_id = getattr(entity, "id", None)
+            if chat_id is None:
                 continue
             # ``entity`` can be a partially populated ``User`` (for example for
             # deleted accounts) whose username/access hash is ``None``.  Asking
@@ -417,7 +418,9 @@ class DailyStatMod(loader.Module):
 
             scanned += 1
             name = (
-                getattr(entity, "first_name", None)
+                getattr(dialog, "name", None)
+                or getattr(dialog, "title", None)
+                or getattr(entity, "first_name", None)
                 or getattr(entity, "title", None)
                 or "Unknown"
             )
@@ -425,10 +428,11 @@ class DailyStatMod(loader.Module):
             for item, hour in messages:
                 if item.out:
                     self._add_sent(
-                        rebuilt, user_id, name, bool(item.media), hour, username
+                        rebuilt, chat_id, name, bool(item.media), hour, username,
+                        is_private=is_private,
                     )
-                else:
-                    self._add_received(rebuilt, user_id, name, hour, username)
+                elif is_private:
+                    self._add_received(rebuilt, chat_id, name, hour, username)
 
         stats = self.get("stats", {})
         stats[self._today_key()] = rebuilt
@@ -436,20 +440,22 @@ class DailyStatMod(loader.Module):
         self.set("stats", stats)
         return rebuilt, scanned
 
-    def _add_sent(self, day, user_id, name, has_media, hour, username=None):
+    def _add_sent(self, day, chat_id, name, has_media, hour, username=None,
+                  is_private=True):
         day["sent"] += 1
         day["media"] += int(has_media)
         day["hours"][hour] += 1
         chat = day["chats"].setdefault(
-            str(user_id),
-            {"id": self._coerce_user_id(user_id), "username": username,
+            str(chat_id),
+            {"id": self._coerce_user_id(chat_id), "username": username,
              "name": name, "count": 0},
         )
         chat["username"] = username or chat.get("username")
         chat["count"] += 1
-        user = self._ensure_user(day, user_id, name, username)
-        user["sent"] += 1
-        user["sent_hours"][hour] += 1
+        if is_private:
+            user = self._ensure_user(day, chat_id, name, username)
+            user["sent"] += 1
+            user["sent_hours"][hour] += 1
 
     def _add_received(self, day, user_id, name, hour, username=None):
         day["received"] += 1
