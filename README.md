@@ -40,6 +40,18 @@ uptime та версії Python/Telethon. Команда модуля — `.sysi
 .dlmod https://raw.githubusercontent.com/Splaueef/host/main/sysinfo.py
 ```
 
+## AlwaysOnline
+
+`alwaysonline.py` підтримує статус Telegram «онлайн», доки працює Hikka.
+Модуль надсилає штатний MTProto-запит оновлення статусу з безпечним
+налаштовуваним інтервалом та обробляє FloodWait і мережеві помилки.
+
+Команди: `.onlineon`, `.onlineoff`, `.onlinestatus`.
+
+```text
+.dlmod https://raw.githubusercontent.com/Splaueef/host/main/alwaysonline.py
+```
+
 Original projects that used these resources include:
 
 - https://github.com/hikariatama/Hikka
