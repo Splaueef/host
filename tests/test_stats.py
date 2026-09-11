@@ -65,9 +65,12 @@ stats = _load_module()
 
 class _Message:
     def __init__(self, *, outgoing=False, private=False, sender=None, date=None,
-                 text="hello", media=None, chat_id=100):
+                 text="hello", media=None, chat_id=100, group=False,
+                 channel=False):
         self.out = outgoing
         self.is_private = private
+        self.is_group = group
+        self.is_channel = channel
         self.chat_id = chat_id
         self.text = text
         self.media = media
@@ -100,6 +103,9 @@ class _HistoryClient:
 
 class DailyStatTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        stats.utils.answer.reset_mock()
+        stats.utils.answer.side_effect = None
+        stats.utils.answer.return_value = None
         self.module = stats.DailyStatMod()
         self.module._init_storage()
 
@@ -132,13 +138,13 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         await self.module.watcher(
             _Message(
                 outgoing=True, private=False, sender=group,
-                chat_id=-200, media=object(),
+                chat_id=-200, media=object(), group=True,
             )
         )
         await self.module.watcher(
             _Message(
                 outgoing=True, private=False, sender=channel,
-                chat_id=-100300,
+                chat_id=-100300, channel=True,
             )
         )
         day = self.module._get_day(self.module._today_key())
@@ -146,7 +152,13 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(day["media"], 1)
         self.assertEqual(day["chats"]["-200"]["count"], 1)
         self.assertEqual(day["chats"]["-100300"]["count"], 1)
+        self.assertEqual(day["chats"]["-200"]["kind"], "group")
+        self.assertEqual(day["chats"]["-100300"]["kind"], "channel")
         self.assertEqual(day["users"], {})
+
+        rendered = self.module._format_top(day, 5)
+        self.assertIn("👥", rendered)
+        self.assertIn("📢", rendered)
 
     async def test_private_outgoing_tracks_per_user_hour(self):
         alice = types.SimpleNamespace(id=1, first_name="Alice")
@@ -161,6 +173,26 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(day["media"], 1)
         self.assertEqual(day["hours"][14], 1)
         self.assertEqual(day["users"]["100"]["sent_hours"][14], 1)
+
+    async def test_month_stat_uses_last_30_days(self):
+        today = datetime.date.today()
+        stats.utils.answer.reset_mock()
+        self.module.set(
+            "stats",
+            {
+                today.isoformat(): {"sent": 2},
+                (today - datetime.timedelta(days=29)).isoformat(): {"sent": 3},
+                (today - datetime.timedelta(days=30)).isoformat(): {"sent": 100},
+            },
+        )
+
+        message = object()
+        await self.module._ds_month(message)
+
+        target, rendered = stats.utils.answer.await_args.args
+        self.assertIs(target, message)
+        self.assertIn("останні 30 днів", rendered)
+        self.assertIn("Надіслано: <b>5</b>", rendered)
 
     def test_old_storage_is_migrated_and_sender_names_are_escaped(self):
         key = self.module._today_key()
@@ -178,10 +210,99 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<Alice>", rendered)
 
         day["users"]["7"] = {"name": "Alice"}
+        self.module._save_day(key, day)
         migrated = self.module._get_day(key)["users"]["7"]
         self.assertEqual(migrated["id"], 7)
         self.assertIsNone(migrated["username"])
         self.assertEqual(len(migrated["sent_hours"]), 24)
+
+    def test_malformed_storage_is_normalized_safely(self):
+        key = self.module._today_key()
+        self.module.set(
+            "stats",
+            {
+                key: {
+                    "sent": "4",
+                    "received": None,
+                    "media": -3,
+                    "hours": [2, "bad"] + [1] * 30,
+                    "chats": {
+                        "100": {"name": None, "count": "3"},
+                        "broken": None,
+                    },
+                    "senders": [],
+                    "users": {
+                        "7": {"name": "Alice", "sent": "2", "sent_hours": [1]},
+                        "broken": "invalid",
+                    },
+                }
+            },
+        )
+
+        day = self.module._get_day(key)
+
+        self.assertEqual(day["sent"], 4)
+        self.assertEqual(day["received"], 0)
+        self.assertEqual(day["media"], 0)
+        self.assertEqual(len(day["hours"]), 24)
+        self.assertEqual(day["hours"][:2], [2, 0])
+        self.assertEqual(day["chats"]["100"]["count"], 3)
+        self.assertEqual(day["chats"]["100"]["kind"], "chat")
+        self.assertNotIn("broken", day["chats"])
+        self.assertEqual(day["users"]["7"]["sent"], 2)
+        self.assertEqual(len(day["users"]["7"]["sent_hours"]), 24)
+        self.module._format_stat(day, "тест")
+
+    def test_visual_summary_counts_incoming_only_chat_and_small_bar(self):
+        day = self.module._empty_day()
+        self.module._add_received(day, 7, "Alice", 12)
+
+        rendered = self.module._format_stat(day, "сьогодні")
+
+        self.assertIn("Разом: <b>1</b>", rendered)
+        self.assertIn("Активних чатів: <b>1</b>", rendered)
+        self.assertIn("█", self.module._bar(1, 100))
+
+    async def test_unknown_subcommand_shows_help(self):
+        message = object()
+        stats.utils.answer.reset_mock()
+        with mock.patch.object(stats.utils, "get_args_raw", return_value="oops"):
+            await self.module.ds(message)
+
+        target, rendered = stats.utils.answer.await_args.args
+        self.assertIs(target, message)
+        self.assertIn("Невідома підкоманда", rendered)
+        self.assertIn(".ds month", rendered)
+
+    async def test_help_uses_current_command_prefix(self):
+        message = object()
+        self.module.get_prefix = lambda: "*"
+        with mock.patch.object(stats.utils, "get_args_raw", return_value="help"):
+            await self.module.ds(message)
+
+        _, rendered = stats.utils.answer.await_args.args
+        self.assertIn("*ds month", rendered)
+        self.assertNotIn(".ds month", rendered)
+
+    async def test_reset_requires_confirmation(self):
+        key = self.module._today_key()
+        self.module.set("stats", {key: {"sent": 5}})
+        message = object()
+
+        await self.module._ds_reset(message)
+
+        self.assertIn(key, self.module.get("stats"))
+        self.assertIn("reset confirm", stats.utils.answer.await_args.args[1])
+
+        await self.module._ds_reset(message, confirmed=True)
+        self.assertEqual(self.module.get("stats"), {})
+
+    def test_long_names_are_shortened_and_escaped(self):
+        rendered = self.module._format_name({"name": "<" * 80})
+
+        self.assertIn("…", rendered)
+        self.assertNotIn("<", rendered)
+        self.assertLess(len(rendered), 200)
 
     async def test_scan_rebuilds_today_from_users_groups_and_channels(self):
         now = datetime.datetime.now().astimezone()
@@ -230,7 +351,7 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(day["chats"]["4"]["name"], "Channel")
 
     async def test_scan_uses_dialog_input_entity_for_history(self):
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now().astimezone()
         partial_user = types.SimpleNamespace(id=1, first_name=None, username=None)
         input_peer = types.SimpleNamespace(id=1, access_hash=123)
         dialog = types.SimpleNamespace(
