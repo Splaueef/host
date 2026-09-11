@@ -1,13 +1,16 @@
 # meta developer: @Huang_Baike
-# meta version: 1.0.0
+# meta version: 1.1.0
 # meta description: Постійно підтримує статус акаунта Telegram «онлайн».
 
+import asyncio
+import contextlib
 import datetime
 import logging
 import time
 
 from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.functions.account import UpdateStatusRequest
+from telethon.tl.types import UpdateUserStatus, UserStatusOffline
 
 from .. import loader, utils
 
@@ -22,14 +25,20 @@ class AlwaysOnlineMod(loader.Module):
         "name": "AlwaysOnline",
         "cfg_enabled": "Постійно підтримувати статус Telegram «онлайн»",
         "cfg_interval": (
-            "Інтервал між оновленнями статусу в секундах (від 60 до 300)"
+            "Резервний інтервал між оновленнями статусу в секундах "
+            "(від 10 до 300)"
+        ),
+        "cfg_reassert_delay": (
+            "Затримка перед відновленням онлайн після отримання статусу «офлайн» "
+            "(від 0 до 15 секунд)"
         ),
         "cfg_offline_on_unload": (
             "Надіслати статус «офлайн» під час вимкнення або видалення модуля"
         ),
         "enabled": (
             "🟢 <b>AlwaysOnline увімкнено.</b>\n"
-            "Статус оновлюватиметься кожні <code>{}</code> с."
+            "Резервне оновлення кожні <code>{interval}</code> с.; відновлення "
+            "після статусу «офлайн» — через <code>{delay}</code> с."
         ),
         "enabled_with_error": (
             "⚠️ <b>AlwaysOnline увімкнено, але перший запит не виконано.</b>\n"
@@ -44,7 +53,9 @@ class AlwaysOnlineMod(loader.Module):
         "status": (
             "👤 <b>AlwaysOnline</b>\n\n"
             "Стан: {state}\n"
-            "Інтервал: <code>{interval}</code> с.\n"
+            "Резервний інтервал: <code>{interval}</code> с.\n"
+            "Затримка відновлення: <code>{delay}</code> с.\n"
+            "Автовідновлень: <code>{reassertions}</code>\n"
             "Останнє успішне оновлення: <code>{last_success}</code>\n"
             "Остання помилка: <code>{last_error}</code>"
         ),
@@ -60,9 +71,15 @@ class AlwaysOnlineMod(loader.Module):
             ),
             loader.ConfigValue(
                 "interval",
-                240,
+                30,
                 lambda: self.strings("cfg_interval"),
-                validator=loader.validators.Integer(minimum=60, maximum=300),
+                validator=loader.validators.Integer(minimum=10, maximum=300),
+            ),
+            loader.ConfigValue(
+                "reassert_delay",
+                2,
+                lambda: self.strings("cfg_reassert_delay"),
+                validator=loader.validators.Integer(minimum=0, maximum=15),
             ),
             loader.ConfigValue(
                 "offline_on_unload",
@@ -77,16 +94,35 @@ class AlwaysOnlineMod(loader.Module):
         self._last_error = None
         self._was_enabled = False
         self._unloading = False
+        self._me_id = None
+        self._reassert_task = None
+        self._reassertions = 0
+        self._status_lock = asyncio.Lock()
 
     async def client_ready(self, client, db):
         self._client = client
         self._unloading = False
+        self._me_id = getattr(client, "tg_id", None)
+        if self._me_id is None:
+            try:
+                self._me_id = (await client.get_me()).id
+            except (RPCError, ConnectionError, OSError):
+                logger.warning("AlwaysOnline could not resolve the current user id")
+
+        # Version 1.0 used 240 seconds by default. Shorten only that old default;
+        # preserve every interval the owner selected manually.
+        if not self.get("interval_v1_1_migrated", False):
+            if int(self.config["interval"]) == 240:
+                self.config["interval"] = 30
+            self.set("interval_v1_1_migrated", True)
+
         self._was_enabled = bool(self.config["enabled"])
         if self._was_enabled:
             await self._set_status(offline=False)
 
     async def on_unload(self):
         self._unloading = True
+        await self._cancel_reassert_task()
         if self._client and self.config["offline_on_unload"]:
             await self._set_status(offline=True)
 
@@ -94,29 +130,69 @@ class AlwaysOnlineMod(loader.Module):
         return max(60, int(self.config["interval"]))
 
     async def _set_status(self, offline):
-        try:
-            await self._client(UpdateStatusRequest(offline=offline))
-        except FloodWaitError as error:
-            seconds = max(1, int(getattr(error, "seconds", 0)))
-            self._last_error = f"FloodWaitError: зачекайте {seconds} с."
-            self._next_refresh = time.monotonic() + seconds + 1
-            logger.warning("AlwaysOnline flood wait: %s seconds", seconds)
-            return False
-        except (RPCError, ConnectionError, OSError) as error:
-            self._last_error = f"{type(error).__name__}: {error}"
-            self._next_refresh = time.monotonic() + self._retry_delay()
-            logger.warning("AlwaysOnline status update failed: %s", error)
-            return False
-        except Exception as error:
-            self._last_error = f"{type(error).__name__}: {error}"
-            self._next_refresh = time.monotonic() + self._retry_delay()
-            logger.exception("Unexpected AlwaysOnline status update failure")
-            return False
+        async with self._status_lock:
+            try:
+                await self._client(UpdateStatusRequest(offline=offline))
+            except FloodWaitError as error:
+                seconds = max(1, int(getattr(error, "seconds", 0)))
+                self._last_error = f"FloodWaitError: зачекайте {seconds} с."
+                self._next_refresh = time.monotonic() + seconds + 1
+                logger.warning("AlwaysOnline flood wait: %s seconds", seconds)
+                return False
+            except (RPCError, ConnectionError, OSError) as error:
+                self._last_error = f"{type(error).__name__}: {error}"
+                self._next_refresh = time.monotonic() + self._retry_delay()
+                logger.warning("AlwaysOnline status update failed: %s", error)
+                return False
+            except Exception as error:
+                self._last_error = f"{type(error).__name__}: {error}"
+                self._next_refresh = time.monotonic() + self._retry_delay()
+                logger.exception("Unexpected AlwaysOnline status update failure")
+                return False
 
         self._last_error = None
-        self._last_success = datetime.datetime.now(datetime.timezone.utc)
+        if not offline:
+            self._last_success = datetime.datetime.now(datetime.timezone.utc)
         self._next_refresh = time.monotonic() + int(self.config["interval"])
         return True
+
+    async def _cancel_reassert_task(self):
+        task = self._reassert_task
+        self._reassert_task = None
+        if task and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def _restore_online(self):
+        try:
+            await asyncio.sleep(int(self.config["reassert_delay"]))
+            if self._unloading or not self.config["enabled"]:
+                return
+            self._next_refresh = 0.0
+            if await self._set_status(offline=False):
+                self._reassertions += 1
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._reassert_task is asyncio.current_task():
+                self._reassert_task = None
+
+    @loader.raw_handler(UpdateUserStatus)
+    async def status_update_handler(self, update):
+        """Immediately restore online when another Telegram session sets us offline."""
+        if (
+            self._unloading
+            or not self._client
+            or not self.config["enabled"]
+            or update.user_id != self._me_id
+            or not isinstance(update.status, UserStatusOffline)
+        ):
+            return
+
+        if self._reassert_task and not self._reassert_task.done():
+            return
+        self._reassert_task = asyncio.create_task(self._restore_online())
 
     @loader.loop(interval=10, autostart=True)
     async def presence_loop(self):
@@ -126,6 +202,7 @@ class AlwaysOnlineMod(loader.Module):
         enabled = bool(self.config["enabled"])
         if not enabled:
             if self._was_enabled:
+                await self._cancel_reassert_task()
                 await self._set_status(offline=True)
             self._was_enabled = False
             self._next_refresh = 0.0
@@ -142,7 +219,10 @@ class AlwaysOnlineMod(loader.Module):
         self._next_refresh = 0.0
         success = await self._set_status(offline=False)
         if success:
-            text = self.strings("enabled", message).format(self.config["interval"])
+            text = self.strings("enabled", message).format(
+                interval=self.config["interval"],
+                delay=self.config["reassert_delay"],
+            )
         else:
             text = self.strings("enabled_with_error", message).format(
                 utils.escape_html(self._last_error or "невідома помилка")
@@ -154,6 +234,7 @@ class AlwaysOnlineMod(loader.Module):
         self.config["enabled"] = False
         self._was_enabled = False
         self._next_refresh = 0.0
+        await self._cancel_reassert_task()
         success = await self._set_status(offline=True)
         if success:
             text = self.strings("disabled", message)
@@ -179,6 +260,8 @@ class AlwaysOnlineMod(loader.Module):
                     else "⚫ <b>вимкнено</b>"
                 ),
                 interval=self.config["interval"],
+                delay=self.config["reassert_delay"],
+                reassertions=self._reassertions,
                 last_success=last_success,
                 last_error=utils.escape_html(self._last_error or "немає"),
             ),

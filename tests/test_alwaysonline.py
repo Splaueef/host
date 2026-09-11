@@ -1,5 +1,6 @@
 """Tests for the AlwaysOnline Hikka module."""
 
+import asyncio
 import datetime  # Load stdlib math before the repository's math.py can shadow it.
 import importlib.util
 import pathlib
@@ -12,6 +13,16 @@ from unittest import mock
 class _Config(dict):
     def __init__(self, *values):
         super().__init__(values)
+
+
+class _Module:
+    def get(self, key, default=None):
+        return getattr(self, "_storage", {}).get(key, default)
+
+    def set(self, key, value):
+        if not hasattr(self, "_storage"):
+            self._storage = {}
+        self._storage[key] = value
 
 
 class _Validators:
@@ -34,6 +45,16 @@ class _UpdateStatusRequest:
         self.offline = offline
 
 
+class _UserStatusOffline:
+    pass
+
+
+class _UpdateUserStatus:
+    def __init__(self, user_id, status):
+        self.user_id = user_id
+        self.status = status
+
+
 def _load_module():
     package = types.ModuleType("testhost")
     package.__path__ = []
@@ -41,7 +62,7 @@ def _load_module():
     modules.__path__ = []
     loader = types.ModuleType("testhost.loader")
     utils = types.ModuleType("testhost.utils")
-    loader.Module = object
+    loader.Module = _Module
     loader.validators = _Validators
 
     def tds(cls):
@@ -51,6 +72,7 @@ def _load_module():
 
     loader.tds = tds
     loader.loop = lambda **kwargs: lambda function: function
+    loader.raw_handler = lambda *args, **kwargs: lambda function: function
     loader.ConfigValue = lambda name, default, *args, **kwargs: (name, default)
     loader.ModuleConfig = _Config
     utils.escape_html = lambda value: value
@@ -63,9 +85,12 @@ def _load_module():
     tl = types.ModuleType("telethon.tl")
     functions = types.ModuleType("telethon.tl.functions")
     account = types.ModuleType("telethon.tl.functions.account")
+    tl_types = types.ModuleType("telethon.tl.types")
     errors.FloodWaitError = _FloodWaitError
     errors.RPCError = _RPCError
     account.UpdateStatusRequest = _UpdateStatusRequest
+    tl_types.UpdateUserStatus = _UpdateUserStatus
+    tl_types.UserStatusOffline = _UserStatusOffline
 
     sys.modules.update(
         {
@@ -78,6 +103,7 @@ def _load_module():
             "telethon.tl": tl,
             "telethon.tl.functions": functions,
             "telethon.tl.functions.account": account,
+            "telethon.tl.types": tl_types,
         }
     )
     path = pathlib.Path(__file__).parent / "alwaysonline.py"
@@ -95,6 +121,7 @@ class _Client:
     def __init__(self, error=None):
         self.calls = []
         self.error = error
+        self.tg_id = 123
 
     async def __call__(self, request):
         self.calls.append(request)
@@ -112,6 +139,11 @@ class AlwaysOnlineTests(unittest.IsolatedAsyncioTestCase):
         await self.module.client_ready(client, None)
         self.assertFalse(client.calls[-1].offline)
         self.assertIsNotNone(self.module._last_success)
+
+    async def test_old_default_interval_is_migrated(self):
+        self.module.config["interval"] = 240
+        await self.module.client_ready(_Client(), None)
+        self.assertEqual(self.module.config["interval"], 30)
 
     async def test_onlineoff_disables_loop_and_publishes_offline(self):
         client = _Client()
@@ -143,6 +175,35 @@ class AlwaysOnlineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("90", self.module._last_error)
         self.assertGreaterEqual(self.module._next_refresh, before + 90)
+
+    async def test_own_offline_update_schedules_fast_reassertion(self):
+        client = _Client()
+        await self.module.client_ready(client, None)
+        client.calls.clear()
+        self.module.config["reassert_delay"] = 0
+
+        await self.module.status_update_handler(
+            _UpdateUserStatus(client.tg_id, _UserStatusOffline())
+        )
+        task = self.module._reassert_task
+        await task
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertFalse(client.calls[0].offline)
+        self.assertEqual(self.module._reassertions, 1)
+
+    async def test_other_users_offline_update_is_ignored(self):
+        client = _Client()
+        await self.module.client_ready(client, None)
+        client.calls.clear()
+
+        await self.module.status_update_handler(
+            _UpdateUserStatus(999, _UserStatusOffline())
+        )
+        await asyncio.sleep(0)
+
+        self.assertEqual(client.calls, [])
+        self.assertIsNone(self.module._reassert_task)
 
 
 if __name__ == "__main__":
