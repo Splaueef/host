@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 2.0.1
+# meta version: 2.1.0
 # meta description: 🧭 Центр команд, конфігурації та встановлення модулів Hikka.
 # scope: inline
 # scope: hikka_only
@@ -51,6 +51,7 @@ class ModuleHubMod(loader.Module):
         "systemd": "systemd.py",
         "backup": "backup.py",
         "quiet": "quietschedule.py",
+        "scheduler": "messagescheduler.py",
         "sysinfo": "sysinfo.py",
         "timeinfo": "timeinfo.py",
         "teledocs": "teledocs.py",
@@ -69,7 +70,7 @@ class ModuleHubMod(loader.Module):
             "class": "DailyStatMod",
             "name": "DailyStat",
             "icon": "📊",
-            "description": "Ваша денна і тижнева Telegram-активність.",
+            "description": "Ваша денна, тижнева й місячна Telegram-активність.",
         },
         "analysis": {
             "class": "ChatAnalysisMod",
@@ -137,6 +138,12 @@ class ModuleHubMod(loader.Module):
             "icon": "🌙",
             "description": "Розклад тихого режиму для чатів.",
         },
+        "scheduler": {
+            "class": "MessageSchedulerMod",
+            "name": "MessageScheduler",
+            "icon": "📨",
+            "description": "Різні повідомлення у вибрані чати за розкладом.",
+        },
         "sysinfo": {
             "class": "InfoMod",
             "name": "SysInfo",
@@ -174,7 +181,7 @@ class ModuleHubMod(loader.Module):
         ("🤖 AI та медіа", ("vdlt", "dailynews", "mistral", "gemma", "math")),
         ("🐺 RotKranz", ("werwolf",)),
         ("🛠 Система", ("nekospy", "systemd", "backup", "quiet", "sysinfo")),
-        ("🧰 Інструменти", ("timeinfo", "teledocs", "purge", "eval")),
+        ("🧰 Інструменти", ("scheduler", "timeinfo", "teledocs", "purge", "eval")),
     )
 
     SAFE_EMPTY = {
@@ -240,6 +247,7 @@ class ModuleHubMod(loader.Module):
         "qnow",
         "qhelp",
         "qlist",
+        "ms",
         "sysinfo",
         "time",
         "timezone",
@@ -306,6 +314,7 @@ class ModuleHubMod(loader.Module):
         "nameunit",
         "qadd",
         "qdel",
+        "ms",
         "backupall",
         "restoreall",
         "gmclear",
@@ -338,6 +347,7 @@ class ModuleHubMod(loader.Module):
         "нік",
         "чатнік",
         "mistralmode",
+        "ms",
     }
 
     async def client_ready(self, client, db):
