@@ -162,6 +162,26 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(day["hours"][14], 1)
         self.assertEqual(day["users"]["100"]["sent_hours"][14], 1)
 
+    async def test_month_stat_uses_last_30_days(self):
+        today = datetime.date.today()
+        stats.utils.answer.reset_mock()
+        self.module.set(
+            "stats",
+            {
+                today.isoformat(): {"sent": 2},
+                (today - datetime.timedelta(days=29)).isoformat(): {"sent": 3},
+                (today - datetime.timedelta(days=30)).isoformat(): {"sent": 100},
+            },
+        )
+
+        message = object()
+        await self.module._ds_month(message)
+
+        target, rendered = stats.utils.answer.await_args.args
+        self.assertIs(target, message)
+        self.assertIn("останні 30 днів", rendered)
+        self.assertIn("Надіслано: <b>5</b>", rendered)
+
     def test_old_storage_is_migrated_and_sender_names_are_escaped(self):
         key = self.module._today_key()
         self.module.set(
