@@ -170,6 +170,29 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("", commands)
         self.assertNotIn("hub", commands)
 
+
+    def test_catalog_contains_message_scheduler(self):
+        self.assertEqual(
+            self.module.REPO_FILES["scheduler"], "messagescheduler.py"
+        )
+        self.assertEqual(
+            self.module.MODULES["scheduler"]["class"], "MessageSchedulerMod"
+        )
+        self.assertTrue(
+            any("scheduler" in keys for _, keys in self.module.SECTIONS)
+        )
+        self.assertIn("ms", self.module.SAFE_EMPTY)
+        self.assertIn("ms", self.module.MUTATING)
+        self.assertIn("ms", self.module.READONLY_WHEN_EMPTY)
+        self.assertFalse(self.module._is_dangerous("ms"))
+        self.assertTrue(
+            self.module._is_dangerous("ms", "run abcd1234")
+        )
+        self.assertIn(
+            "місячна",
+            self.module.MODULES["stats"]["description"],
+        )
+
     async def test_menu_is_owner_only_and_contains_search(self):
         self.module.inline = _Inline()
         message = _Message(reply_to_msg_id=77)
