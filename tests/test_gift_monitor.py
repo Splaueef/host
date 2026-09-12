@@ -45,6 +45,7 @@ def _load_module():
     loader.ConfigValue = _ConfigValue
     loader.tds = lambda value: value
     loader.command = _command
+    loader.loop = _command
     loader.validators = types.SimpleNamespace(
         Integer=lambda **kwargs: object(),
         Boolean=lambda **kwargs: object(),
@@ -122,14 +123,21 @@ class _Catalog:
         self.hash = hash
 
 
+class _NotModified:
+    pass
+
+
 class _Client:
     def __init__(self, responses):
         self.responses = list(responses)
         self.sent_files = []
         self.sent_messages = []
         self.fail_preview = False
+        self.fail_message = False
+        self.request_hashes = []
 
     async def __call__(self, request):
+        self.request_hashes.append(request.hash)
         return self.responses.pop(0)
 
     async def send_file(self, target, file, **kwargs):
@@ -138,6 +146,8 @@ class _Client:
         self.sent_files.append((target, file, kwargs))
 
     async def send_message(self, target, text, **kwargs):
+        if self.fail_message:
+            raise RuntimeError("message delivery failed")
         self.sent_messages.append((target, text, kwargs))
 
 
@@ -203,6 +213,112 @@ class GiftMonitorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sent, 0)
         self.assertEqual(client.sent_files, [])
+
+    async def test_not_modified_response_still_updates_check_statistics(self):
+        gift = _gift(1, 50)
+        client = _Client([_Catalog([gift], hash=123), _NotModified()])
+        await self.module.client_ready(client, {})
+
+        await self.module._check_gifts()
+        await self.module._check_gifts()
+
+        self.assertEqual(client.request_hashes, [0, 123])
+        self.assertEqual(self.module._checks_count, 2)
+        self.assertEqual(self.module._successful_checks, 2)
+        self.assertEqual(self.module._unchanged_checks, 1)
+        self.assertIsNotNone(self.module._last_check)
+        self.assertIsNotNone(self.module._last_success)
+
+    async def test_force_check_bypasses_catalog_hash(self):
+        gift = _gift(1, 50)
+        client = _Client(
+            [_Catalog([gift], hash=123), _NotModified(), _Catalog([gift], hash=123)]
+        )
+        await self.module.client_ready(client, {})
+
+        await self.module._check_gifts()
+        await self.module._check_gifts()
+        await self.module._check_gifts(force=True)
+
+        self.assertEqual(client.request_hashes, [0, 123, 0])
+
+    async def test_unexpected_not_modified_on_full_refresh_is_an_error(self):
+        client = _Client([_NotModified()])
+        await self.module.client_ready(client, {})
+
+        with self.assertRaisesRegex(RuntimeError, "NotModified"):
+            await self.module._check_gifts(force=True)
+
+        self.assertEqual(self.module._checks_count, 1)
+        self.assertEqual(self.module._successful_checks, 0)
+        self.assertEqual(self.module._failed_checks, 1)
+        self.assertEqual(self.module._catalog_hash, 0)
+        self.assertIsNotNone(self.module._last_error)
+
+    async def test_hikka_loop_runs_due_check_and_keeps_runtime_statistics(self):
+        gift = _gift(1, 50)
+        client = _Client([_Catalog([gift], hash=11)])
+        await self.module.client_ready(client, {})
+        self.module.set("enabled", True)
+        self.module._next_check_at = 0.0
+
+        await self.module.gift_monitor_loop()
+
+        self.assertEqual(client.request_hashes, [0])
+        self.assertEqual(self.module._checks_count, 1)
+        self.assertEqual(self.module._catalog_count, 1)
+        self.assertGreater(self.module._next_check_at, 0.0)
+
+    async def test_failed_notification_is_retried_and_not_lost(self):
+        old = _gift(1, 50)
+        new = _gift(2, 25, "Retry me")
+        client = _Client(
+            [
+                _Catalog([old], hash=1),
+                _Catalog([old, new], hash=2),
+                _Catalog([old, new], hash=2),
+            ]
+        )
+        await self.module.client_ready(client, {})
+        await self.module._check_gifts()
+
+        client.fail_preview = True
+        client.fail_message = True
+        sent = await self.module._check_gifts()
+
+        self.assertEqual(sent, 0)
+        self.assertNotIn(2, self.module._known_gifts)
+        self.assertEqual(self.module._catalog_hash, 0)
+
+        client.fail_preview = False
+        client.fail_message = False
+        sent = await self.module._check_gifts()
+
+        self.assertEqual(sent, 1)
+        self.assertIn(2, self.module._known_gifts)
+        self.assertEqual(client.request_hashes, [0, 1, 0])
+
+    async def test_catalog_statistics_follow_gift_state_changes(self):
+        available = _gift(1, 50)
+        sold_out = _gift(
+            1,
+            50,
+            sold_out=True,
+            availability_remains=0,
+        )
+        client = _Client(
+            [_Catalog([available], hash=1), _Catalog([sold_out], hash=2)]
+        )
+        await self.module.client_ready(client, {})
+
+        await self.module._check_gifts()
+        self.assertEqual(self.module._available_count, 1)
+        self.assertEqual(self.module._sold_out_count, 0)
+
+        await self.module._check_gifts()
+        self.assertEqual(self.module._catalog_count, 1)
+        self.assertEqual(self.module._available_count, 0)
+        self.assertEqual(self.module._sold_out_count, 1)
 
     def test_only_auction_slug_gets_a_valid_deep_link(self):
         regular = self.module._format_gift(_gift(10, 15, "Regular"), 15)
