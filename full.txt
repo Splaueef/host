@@ -18,3 +18,4 @@ teledocs
 timeinfo
 vdlt
 gift_monitor
+messagescheduler
