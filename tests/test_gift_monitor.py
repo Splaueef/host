@@ -1,4 +1,4 @@
-"""Regression tests for GiftMonitor catalog state and previews."""
+"""Regression tests for GiftMonitor's official NFT resale scanner."""
 
 import importlib.util
 import pathlib
@@ -28,7 +28,7 @@ class _ModuleConfig(dict):
         super().__init__((value.key, value.default) for value in values)
 
 
-def _command(*args, **kwargs):
+def _decorator(*args, **kwargs):
     return lambda value: value
 
 
@@ -44,8 +44,8 @@ def _load_module():
     loader.ModuleConfig = _ModuleConfig
     loader.ConfigValue = _ConfigValue
     loader.tds = lambda value: value
-    loader.command = _command
-    loader.loop = _command
+    loader.command = _decorator
+    loader.loop = _decorator
     loader.validators = types.SimpleNamespace(
         Integer=lambda **kwargs: object(),
         Boolean=lambda **kwargs: object(),
@@ -55,6 +55,7 @@ def _load_module():
         message.answers.append(text)
 
     utils.answer = answer
+    utils.get_args_raw = lambda message: message.args
     package.loader, package.utils = loader, utils
 
     telethon = types.ModuleType("telethon")
@@ -66,7 +67,23 @@ def _load_module():
         def __init__(self, hash):
             self.hash = hash
 
+    class GetResaleStarGiftsRequest:
+        def __init__(
+            self,
+            gift_id,
+            offset,
+            limit,
+            sort_by_price=None,
+            **kwargs,
+        ):
+            self.gift_id = gift_id
+            self.offset = offset
+            self.limit = limit
+            self.sort_by_price = sort_by_price
+            self.extra = kwargs
+
     telethon_payments.GetStarGiftsRequest = GetStarGiftsRequest
+    telethon_payments.GetResaleStarGiftsRequest = GetResaleStarGiftsRequest
     sys.modules.update(
         {
             "gifthost": package,
@@ -93,52 +110,102 @@ def _load_module():
 gift_monitor = _load_module()
 
 
-def _gift(gift_id, stars, title=None, **kwargs):
-    sticker = types.SimpleNamespace(
-        attributes=[types.SimpleNamespace(alt="🎁")]
+class _StarsAmount:
+    def __init__(self, amount, nanos=0):
+        self.amount = amount
+        self.nanos = nanos
+
+
+class _StarsTonAmount:
+    def __init__(self, amount):
+        self.amount = amount
+
+
+class _StarGiftAttributeModel:
+    def __init__(self, name="Plush", document=None):
+        self.name = name
+        self.document = document or object()
+
+
+class _StarGiftAttributePattern:
+    def __init__(self, name="Stars", document=None):
+        self.name = name
+        self.document = document or object()
+
+
+class _StarGiftAttributeBackdrop:
+    def __init__(self, name="Midnight"):
+        self.name = name
+
+
+def _base(gift_id, *, resale=10, minimum=1, title="Collection"):
+    return types.SimpleNamespace(
+        id=gift_id,
+        availability_resale=resale,
+        resell_min_stars=minimum,
+        title=title,
     )
-    values = {
-        "id": gift_id,
-        "stars": stars,
-        "title": title,
-        "sticker": sticker,
-        "limited": True,
-        "sold_out": False,
-        "availability_total": 10_000,
-        "availability_remains": 9_999,
-        "availability_resale": None,
-        "upgrade_stars": None,
-        "auction": False,
-        "auction_slug": None,
-        "require_premium": False,
-        "locked_until_date": None,
-    }
-    values.update(kwargs)
-    return types.SimpleNamespace(**values)
+
+
+def _nft(
+    nft_id,
+    *,
+    collection_id=1,
+    slug=None,
+    title="Plush Pepe",
+    number=7,
+    stars=None,
+    nanos=0,
+    ton=None,
+    model="Plush",
+):
+    amounts = []
+    if stars is not None:
+        amounts.append(_StarsAmount(stars, nanos))
+    if ton is not None:
+        amounts.append(_StarsTonAmount(ton))
+    return types.SimpleNamespace(
+        id=nft_id,
+        gift_id=collection_id,
+        slug=slug or f"PlushPepe-{nft_id}",
+        title=title,
+        num=number,
+        resell_amount=amounts,
+        attributes=[
+            _StarGiftAttributeModel(model),
+            _StarGiftAttributePattern(),
+            _StarGiftAttributeBackdrop(),
+        ],
+    )
 
 
 class _Catalog:
-    def __init__(self, gifts, hash=1):
+    def __init__(self, gifts):
         self.gifts = gifts
-        self.hash = hash
 
 
-class _NotModified:
-    pass
+class _Resale:
+    def __init__(self, gifts, count=None):
+        self.gifts = gifts
+        self.count = len(gifts) if count is None else count
+        self.next_offset = None
 
 
 class _Client:
     def __init__(self, responses):
         self.responses = list(responses)
+        self.requests = []
         self.sent_files = []
         self.sent_messages = []
         self.fail_preview = False
         self.fail_message = False
-        self.request_hashes = []
 
     async def __call__(self, request):
-        self.request_hashes.append(request.hash)
-        return self.responses.pop(0)
+        self.requests.append(request)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
     async def send_file(self, target, file, **kwargs):
         if self.fail_preview:
@@ -151,191 +218,233 @@ class _Client:
         self.sent_messages.append((target, text, kwargs))
 
 
+class _Message:
+    def __init__(self, args=""):
+        self.args = args
+        self.answers = []
+
+
 class GiftMonitorTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.module = gift_monitor.GiftMonitorMod()
+        self.module.config["request_delay_ms"] = 0
 
-    async def test_first_check_creates_silent_baseline(self):
-        old_in_range = _gift(1, 50, "Old gift")
-        old_out_of_range = _gift(2, 500, "Expensive old gift")
-        client = _Client([_Catalog([old_in_range, old_out_of_range])])
+    async def _ready(self, responses):
+        client = _Client(responses)
         await self.module.client_ready(client, {})
+        return client
 
-        sent = await self.module._check_gifts()
+    async def test_first_collection_scan_creates_silent_nft_baseline(self):
+        old = _nft(101, stars=50)
+        client = await self._ready([_Catalog([_base(1)]), _Resale([old])])
+
+        sent = await self.module._check_market(
+            force_catalog=True,
+            scan_all=True,
+        )
 
         self.assertEqual(sent, 0)
-        self.assertEqual(self.module._known_gifts, {1, 2})
-        self.assertEqual(self.module.get("known_gift_ids"), [1, 2])
-        self.assertTrue(self.module.get("catalog_initialized"))
+        self.assertIn(old.slug, self.module._known_listings)
+        self.assertEqual(self.module.get("initialized_nft_collections"), [1])
         self.assertEqual(client.sent_files, [])
         self.assertEqual(client.sent_messages, [])
 
-    async def test_only_new_gift_is_sent_with_sticker_preview(self):
-        old = _gift(1, 50, "Old gift")
-        new = _gift(2, 25, "Scared Cat")
-        client = _Client([_Catalog([old]), _Catalog([old, new], hash=2)])
-        await self.module.client_ready(client, {})
-        await self.module._check_gifts()
+    async def test_new_in_range_listing_sends_model_preview(self):
+        old = _nft(101, stars=50)
+        new = _nft(102, stars=25, title="Scared Cat")
+        client = await self._ready(
+            [
+                _Catalog([_base(1)]),
+                _Resale([old]),
+                _Resale([new, old]),
+            ]
+        )
+        await self.module._check_market(force_catalog=True, scan_all=True)
 
-        sent = await self.module._check_gifts()
+        sent = await self.module._check_market(scan_all=True)
 
         self.assertEqual(sent, 1)
         self.assertEqual(len(client.sent_files), 1)
-        target, sticker, kwargs = client.sent_files[0]
+        target, preview, kwargs = client.sent_files[0]
         self.assertEqual(target, "me")
-        self.assertIs(sticker, new.sticker)
-        self.assertIn("Scared Cat", kwargs["caption"])
-        self.assertNotIn("t.me/nft/2", kwargs["caption"])
-        self.assertEqual(self.module.get("known_gift_ids"), [1, 2])
+        self.assertIs(preview, new.attributes[0].document)
+        self.assertIn("Scared Cat #7", kwargs["caption"])
+        self.assertIn(f"https://t.me/nft/{new.slug}", kwargs["caption"])
+        self.assertIn(new.slug, self.module._known_listings)
 
-    async def test_preview_error_falls_back_to_text_notification(self):
-        old = _gift(1, 50)
-        new = _gift(2, 50)
-        client = _Client([_Catalog([old]), _Catalog([old, new], hash=2)])
-        client.fail_preview = True
-        await self.module.client_ready(client, {})
-        await self.module._check_gifts()
+    async def test_price_change_into_range_is_announced(self):
+        listing = _nft(201, stars=500)
+        cheaper = _nft(201, slug=listing.slug, stars=100)
+        client = await self._ready(
+            [
+                _Catalog([_base(1, minimum=500)]),
+                _Resale([listing]),
+                _Resale([cheaper]),
+            ]
+        )
+        await self.module._check_market(force_catalog=True, scan_all=True)
 
-        sent = await self.module._check_gifts()
+        sent = await self.module._check_market(scan_all=True)
 
         self.assertEqual(sent, 1)
-        self.assertEqual(len(client.sent_messages), 1)
-        self.assertIn("Подарунок 🎁", client.sent_messages[0][1])
-
-    async def test_price_change_does_not_reannounce_known_gift(self):
-        gift = _gift(7, 500, "Existing")
-        client = _Client([_Catalog([gift]), _Catalog([gift], hash=2)])
-        await self.module.client_ready(client, {})
-        await self.module._check_gifts()
-        self.module.config["max_stars"] = 1_000
-
-        sent = await self.module._check_gifts()
-
-        self.assertEqual(sent, 0)
-        self.assertEqual(client.sent_files, [])
-
-    async def test_not_modified_response_still_updates_check_statistics(self):
-        gift = _gift(1, 50)
-        client = _Client([_Catalog([gift], hash=123), _NotModified()])
-        await self.module.client_ready(client, {})
-
-        await self.module._check_gifts()
-        await self.module._check_gifts()
-
-        self.assertEqual(client.request_hashes, [0, 123])
-        self.assertEqual(self.module._checks_count, 2)
-        self.assertEqual(self.module._successful_checks, 2)
-        self.assertEqual(self.module._unchanged_checks, 1)
-        self.assertIsNotNone(self.module._last_check)
-        self.assertIsNotNone(self.module._last_success)
-
-    async def test_force_check_bypasses_catalog_hash(self):
-        gift = _gift(1, 50)
-        client = _Client(
-            [_Catalog([gift], hash=123), _NotModified(), _Catalog([gift], hash=123)]
+        self.assertIn(
+            "Ціна NFT увійшла",
+            client.sent_files[0][2]["caption"],
         )
-        await self.module.client_ready(client, {})
 
-        await self.module._check_gifts()
-        await self.module._check_gifts()
-        await self.module._check_gifts(force=True)
+    async def test_failed_notification_is_not_remembered_and_is_retried(self):
+        old = _nft(301, stars=50)
+        new = _nft(302, stars=40)
+        client = await self._ready(
+            [
+                _Catalog([_base(1)]),
+                _Resale([old]),
+                _Resale([new, old]),
+                _Resale([new, old]),
+            ]
+        )
+        await self.module._check_market(force_catalog=True, scan_all=True)
 
-        self.assertEqual(client.request_hashes, [0, 123, 0])
+        client.fail_preview = True
+        client.fail_message = True
+        sent = await self.module._check_market(scan_all=True)
+        self.assertEqual(sent, 0)
+        self.assertNotIn(new.slug, self.module._known_listings)
 
-    async def test_unexpected_not_modified_on_full_refresh_is_an_error(self):
-        client = _Client([_NotModified()])
-        await self.module.client_ready(client, {})
+        client.fail_preview = False
+        client.fail_message = False
+        sent = await self.module._check_market(scan_all=True)
+        self.assertEqual(sent, 1)
+        self.assertIn(new.slug, self.module._known_listings)
 
-        with self.assertRaisesRegex(RuntimeError, "NotModified"):
-            await self.module._check_gifts(force=True)
+    async def test_all_resale_collections_are_scanned_for_future_price_drops(self):
+        catalog = [
+            _base(1, resale=0, minimum=1),
+            _base(2, resale=5, minimum=500),
+            _base(3, resale=7, minimum=10),
+        ]
+        client = await self._ready(
+            [_Catalog(catalog), _Resale([]), _Resale([])]
+        )
 
-        self.assertEqual(self.module._checks_count, 1)
-        self.assertEqual(self.module._successful_checks, 0)
-        self.assertEqual(self.module._failed_checks, 1)
-        self.assertEqual(self.module._catalog_hash, 0)
-        self.assertIsNotNone(self.module._last_error)
+        await self.module._check_market(force_catalog=True, scan_all=True)
 
-    async def test_hikka_loop_runs_due_check_and_keeps_runtime_statistics(self):
-        gift = _gift(1, 50)
-        client = _Client([_Catalog([gift], hash=11)])
-        await self.module.client_ready(client, {})
+        resale_requests = [
+            request
+            for request in client.requests
+            if hasattr(request, "gift_id")
+        ]
+        self.assertEqual([request.gift_id for request in resale_requests], [2, 3])
+        self.assertEqual(self.module._catalog_count, 3)
+        self.assertEqual(self.module._resale_collections_count, 2)
+        self.assertEqual(self.module._eligible_collections_count, 1)
+
+    def test_collection_batches_rotate_without_skipping(self):
+        collections = [_base(value) for value in range(1, 6)]
+        self.module.config["collections_per_check"] = 2
+
+        first = self.module._select_collection_batch(collections)
+        second = self.module._select_collection_batch(collections)
+        third = self.module._select_collection_batch(collections)
+
+        self.assertEqual([item.id for item in first], [1, 2])
+        self.assertEqual([item.id for item in second], [3, 4])
+        self.assertEqual([item.id for item in third], [5, 1])
+
+    def test_stars_and_ton_prices_are_parsed_and_formatted(self):
+        listing = _nft(
+            401,
+            stars=12,
+            nanos=500_000_000,
+            ton=1_250_000_000,
+        )
+
+        stars, ton = self.module._extract_prices(listing)
+
+        self.assertEqual(stars, 12_500_000_000)
+        self.assertEqual(ton, 1_250_000_000)
+        self.assertEqual(self.module._format_price(listing), "12.5 ⭐ / 1.25 TON")
+
+    def test_market_item_escapes_text_and_uses_official_nft_link(self):
+        listing = _nft(
+            501,
+            slug="Gift Name/5",
+            title="<Rare & Gift>",
+            stars=10,
+            model="<Gold>",
+        )
+
+        text = self.module._format_market_item(listing, 1)
+
+        self.assertIn("https://t.me/nft/Gift%20Name%2F5", text)
+        self.assertIn("&lt;Rare &amp; Gift&gt;", text)
+        self.assertIn("&lt;Gold&gt;", text)
+        self.assertNotIn("<Rare & Gift>", text)
+
+    async def test_market_command_supports_range_and_all_modes(self):
+        stars_listing = _nft(601, stars=50)
+        ton_listing = _nft(602, stars=None, ton=2_000_000_000)
+        client = await self._ready(
+            [
+                _Catalog([_base(1)]),
+                _Resale([stars_listing, ton_listing], count=2),
+                _Catalog([_base(1)]),
+                _Resale([stars_listing, ton_listing], count=2),
+            ]
+        )
+
+        range_message = _Message()
+        await self.module.gmarket(range_message)
+        all_message = _Message("all")
+        await self.module.gmarket(all_message)
+
+        self.assertIn("ціна 1–150 ⭐", range_message.answers[-1])
+        self.assertIn(stars_listing.slug, range_message.answers[-1])
+        self.assertNotIn(ton_listing.slug, range_message.answers[-1])
+        self.assertIn("усі ціни та валюти", all_message.answers[-1])
+        self.assertIn(ton_listing.slug, all_message.answers[-1])
+        resale_requests = [
+            request
+            for request in client.requests
+            if hasattr(request, "sort_by_price")
+        ]
+        self.assertTrue(all(request.sort_by_price for request in resale_requests))
+
+    async def test_hikka_loop_runs_due_round_robin_scan(self):
+        listing = _nft(701, stars=50)
+        client = await self._ready(
+            [_Catalog([_base(1)]), _Resale([listing])]
+        )
         self.module.set("enabled", True)
         self.module._next_check_at = 0.0
 
         await self.module.gift_monitor_loop()
 
-        self.assertEqual(client.request_hashes, [0])
         self.assertEqual(self.module._checks_count, 1)
-        self.assertEqual(self.module._catalog_count, 1)
+        self.assertEqual(self.module._last_scanned_collections, 1)
         self.assertGreater(self.module._next_check_at, 0.0)
+        self.assertEqual(len(client.requests), 2)
 
-    async def test_failed_notification_is_retried_and_not_lost(self):
-        old = _gift(1, 50)
-        new = _gift(2, 25, "Retry me")
-        client = _Client(
+    async def test_one_failed_collection_does_not_hide_successful_results(self):
+        catalog = [_base(1), _base(2)]
+        listing = _nft(801, collection_id=2, stars=50)
+        client = await self._ready(
             [
-                _Catalog([old], hash=1),
-                _Catalog([old, new], hash=2),
-                _Catalog([old, new], hash=2),
+                _Catalog(catalog),
+                RuntimeError("temporary flood wait"),
+                _Resale([listing]),
             ]
         )
-        await self.module.client_ready(client, {})
-        await self.module._check_gifts()
 
-        client.fail_preview = True
-        client.fail_message = True
-        sent = await self.module._check_gifts()
+        sent = await self.module._check_market(
+            force_catalog=True,
+            scan_all=True,
+        )
 
         self.assertEqual(sent, 0)
-        self.assertNotIn(2, self.module._known_gifts)
-        self.assertEqual(self.module._catalog_hash, 0)
-
-        client.fail_preview = False
-        client.fail_message = False
-        sent = await self.module._check_gifts()
-
-        self.assertEqual(sent, 1)
-        self.assertIn(2, self.module._known_gifts)
-        self.assertEqual(client.request_hashes, [0, 1, 0])
-
-    async def test_catalog_statistics_follow_gift_state_changes(self):
-        available = _gift(1, 50)
-        sold_out = _gift(
-            1,
-            50,
-            sold_out=True,
-            availability_remains=0,
-        )
-        client = _Client(
-            [_Catalog([available], hash=1), _Catalog([sold_out], hash=2)]
-        )
-        await self.module.client_ready(client, {})
-
-        await self.module._check_gifts()
-        self.assertEqual(self.module._available_count, 1)
-        self.assertEqual(self.module._sold_out_count, 0)
-
-        await self.module._check_gifts()
-        self.assertEqual(self.module._catalog_count, 1)
-        self.assertEqual(self.module._available_count, 0)
-        self.assertEqual(self.module._sold_out_count, 1)
-
-    def test_only_auction_slug_gets_a_valid_deep_link(self):
-        regular = self.module._format_gift(_gift(10, 15, "Regular"), 15)
-        auction = self.module._format_gift(
-            _gift(
-                11,
-                100,
-                "Auction",
-                auction=True,
-                auction_slug="special drop",
-            ),
-            100,
-        )
-
-        self.assertNotIn("t.me/nft", regular)
-        self.assertNotIn("href=", regular)
-        self.assertIn("https://t.me/auction/special%20drop", auction)
+        self.assertEqual(self.module._last_scanned_collections, 1)
+        self.assertEqual(self.module._request_errors, 1)
+        self.assertIn("1 колекцій не перевірено", self.module._last_error)
 
 
 if __name__ == "__main__":
