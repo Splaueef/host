@@ -48,7 +48,9 @@ def _load_module():
     loader.ModuleConfig = _ModuleConfig
     loader.tds = lambda value: value
     loader.command = _decorator
-    loader.validators = types.SimpleNamespace(Integer=lambda **kwargs: object())
+    loader.validators = types.SimpleNamespace(
+        Integer=lambda **kwargs: object(), Boolean=lambda **kwargs: object()
+    )
     utils.get_chat_id = lambda message: message.chat_id
     utils.get_args_raw = lambda message: getattr(message, "args", "")
 
@@ -108,6 +110,65 @@ class _Message:
 
     async def get_reply_message(self):
         return None
+
+
+class _Network:
+    def __init__(self):
+        self.config = {"instance_id": "hikka-one"}
+        self.moves = []
+
+    def _configured(self):
+        return True
+
+    async def api_game_create(self, kind, opponent_instance_id=None):
+        return {}
+
+    async def api_games(self, **kwargs):
+        return {"games": []}
+
+    async def api_game_get(self, game_id):
+        return {}
+
+    async def api_game_join(self, game_id):
+        return {}
+
+    async def api_game_move(self, game_id, revision, action):
+        self.moves.append((game_id, revision, action))
+        board = [None] * 9
+        board[int(action["position"])] = 0
+        return {
+            "game_id": game_id,
+            "kind": "ttt",
+            "status": "active",
+            "my_slot": 0,
+            "revision": revision + 1,
+            "players": [
+                {"slot": 0, "instance_id": "hikka-one", "display_name": "Host"},
+                {"slot": 1, "instance_id": "hikka-two", "display_name": "Guest"},
+            ],
+            "state": {
+                "board": board,
+                "turn": 1,
+                "winner": None,
+                "draw": False,
+                "finished": False,
+                "finish_reason": None,
+                "move_number": 1,
+                "last_action": "1:1",
+            },
+        }
+
+    async def api_game_leaderboard(self, **kwargs):
+        return {"ranking": []}
+
+    async def api_game_resign(self, game_id):
+        return {}
+
+    async def api_game_cancel(self, game_id):
+        return {}
+
+    async def api_game_profile(self, **kwargs):
+        return {"games": []}
 
 
 class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
@@ -602,6 +663,57 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Guest", top)
         self.assertIn("1</b> перемог", top)
         self.assertIn("Host", top)
+
+    async def test_hikkanet_move_uses_server_revision_and_updates_remote_view(self):
+        network = _Network()
+        self.module.lookup = lambda name: network if name == "HikkaNet" else None
+        game = {
+            "game_id": "ng_0123456789abcdef",
+            "kind": "ttt",
+            "status": "active",
+            "my_slot": 0,
+            "revision": 4,
+            "players": [
+                {"slot": 0, "instance_id": "hikka-one", "display_name": "Host"},
+                {"slot": 1, "instance_id": "hikka-two", "display_name": "Guest"},
+            ],
+            "state": {
+                "board": [None] * 9,
+                "turn": 0,
+                "winner": None,
+                "draw": False,
+                "finished": False,
+                "finish_reason": None,
+                "move_number": 0,
+                "last_action": None,
+            },
+        }
+        token = self.module._new_network_view(game)
+        call = _Call(1, "Host")
+
+        await self.module._net_ttt_move(call, token, 0)
+
+        self.assertEqual(
+            network.moves,
+            [("ng_0123456789abcdef", 4, {"type": "place", "position": 0})],
+        )
+        self.assertEqual(self.module._network_view(token)["game"]["revision"], 5)
+        self.assertIn("Хід", call.edits[-1]["text"])
+
+    def test_games_menu_offers_local_and_hikkanet_modes(self):
+        token = self.module._new_session("menu", -100)
+
+        text = self.module._render(token)
+        markup = self.module._markup(token)
+
+        self.assertIn("HikkaNet", text)
+        self.assertTrue(
+            any(
+                "HikkaNet" in button["text"]
+                for row in markup
+                for button in row
+            )
+        )
 
 
 if __name__ == "__main__":

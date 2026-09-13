@@ -112,6 +112,19 @@ class HikkaNetHelperTests(unittest.TestCase):
         )
         self.assertEqual(hikkanet._find_sensitive_field({"version": 1}), "")
 
+    def test_game_and_room_identifiers_are_strict(self):
+        self.assertEqual(
+            hikkanet._game_id("NG_0123456789ABCDEF"),
+            "ng_0123456789abcdef",
+        )
+        self.assertEqual(hikkanet._room_identifier(" Main_Room "), "main_room")
+        for invalid in ("ng_0123456789abcdeg", "ng_short", "room.with.dot"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                if invalid.startswith("ng_"):
+                    hikkanet._game_id(invalid)
+                else:
+                    hikkanet._room_identifier(invalid)
+
     def test_module_has_hidden_secret_and_expected_defaults(self):
         module = hikkanet.HikkaNetMod()
         self.assertEqual(module.config["server_url"], "http://127.0.0.1:8765")
@@ -122,6 +135,19 @@ class HikkaNetHelperTests(unittest.TestCase):
             "api_events",
             "api_instances",
             "api_module_versions",
+            "api_game_create",
+            "api_games",
+            "api_game_get",
+            "api_game_join",
+            "api_game_move",
+            "api_game_resign",
+            "api_game_cancel",
+            "api_game_leaderboard",
+            "api_game_profile",
+            "api_chat_presence",
+            "api_chat_leave",
+            "api_chat_rooms",
+            "api_chat_members",
             "api_get",
             "api_put",
             "api_delete",
@@ -130,6 +156,40 @@ class HikkaNetHelperTests(unittest.TestCase):
             "api_stats",
         ):
             self.assertTrue(callable(getattr(module, method)))
+
+
+class HikkaNetApiWrapperTests(unittest.IsolatedAsyncioTestCase):
+    async def test_game_and_chat_wrappers_build_versioned_routes(self):
+        module = hikkanet.HikkaNetMod()
+        calls = []
+
+        async def request(method, path, params=None, payload=None):
+            calls.append((method, path, params, payload))
+            return {"ok": True}
+
+        module._request = request
+
+        await module.api_game_create("chess", "hikka-two")
+        await module.api_game_move(
+            "ng_0123456789abcdef",
+            7,
+            {"type": "move", "source": 52, "target": 36},
+        )
+        await module.api_chat_presence("lobby", "Owner")
+        await module.api_chat_members("lobby")
+
+        self.assertEqual(calls[0][0:2], ("POST", "/v1/games"))
+        self.assertEqual(calls[0][3]["opponent_instance_id"], "hikka-two")
+        self.assertEqual(
+            calls[1][0:2],
+            ("POST", "/v1/games/ng_0123456789abcdef/move"),
+        )
+        self.assertEqual(calls[1][3]["if_revision"], 7)
+        self.assertEqual(calls[2][0:2], ("POST", "/v1/chat/presence"))
+        self.assertEqual(
+            calls[3][0:2],
+            ("GET", "/v1/chat/rooms/lobby/members"),
+        )
 
 
 if __name__ == "__main__":

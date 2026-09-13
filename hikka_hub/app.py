@@ -21,6 +21,7 @@ from aiohttp import web
 
 from . import __version__
 from .config import Settings
+from .game_engine import GameRuleError, SUPPORTED_GAMES
 from .security import (
     IDENTIFIER_RE,
     INSTANCE_ID_RE,
@@ -43,6 +44,20 @@ MODULE_UPDATE_TOPIC = "system.module_updates"
 MODULE_MANIFEST_LIMIT = 131072
 MODULE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_]+\.py$")
 MODULE_VERSION_RE = re.compile(r"^\d+(?:\.\d+){1,3}$")
+ROOM_RE = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
+GAME_ID_RE = re.compile(r"^ng_[0-9a-f]{16}$")
+GAME_STATUSES = {"waiting", "invited", "active", "finished", "cancelled"}
+SERVER_CAPABILITIES = [
+    "events",
+    "event_history",
+    "kv",
+    "metrics",
+    "metrics_batch",
+    "module_updates",
+    "network_games",
+    "game_leaderboard",
+    "chat_presence",
+]
 
 
 class ApiError(Exception):
@@ -407,13 +422,23 @@ async def root(request: web.Request) -> web.Response:
         {
             "service": "Hikka Hub",
             "version": __version__,
+            "api_version": 2,
+            "capabilities": SERVER_CAPABILITIES,
             "message": "Authenticated Hikka clients only",
         }
     )
 
 
 async def health(request: web.Request) -> web.Response:
-    return _response({"status": "ok", "version": __version__, "time": int(time.time())})
+    return _response(
+        {
+            "status": "ok",
+            "version": __version__,
+            "api_version": 2,
+            "capabilities": SERVER_CAPABILITIES,
+            "time": int(time.time()),
+        }
+    )
 
 
 async def me(request: web.Request) -> web.Response:
@@ -425,6 +450,9 @@ async def me(request: web.Request) -> web.Response:
             "owner_id": credential["owner_id"],
             "created_at": credential["created_at"],
             "last_seen": credential["last_seen"],
+            "server_version": __version__,
+            "api_version": 2,
+            "server_capabilities": SERVER_CAPABILITIES,
         }
     )
 
@@ -496,6 +524,237 @@ async def module_versions(request: web.Request) -> web.Response:
             "modules": modules,
             "updated_at": int(state["updated_at"]),
         }
+    )
+
+
+def _game_kind(value: Any, allow_empty: bool = False) -> Optional[str]:
+    if allow_empty and value in (None, ""):
+        return None
+    kind = _identifier(value, "kind")
+    if kind not in SUPPORTED_GAMES:
+        raise ApiError(400, "unsupported_game", "Unsupported game type")
+    return kind
+
+
+def _game_id(value: Any) -> str:
+    game_id = _identifier(value, "game_id")
+    if not GAME_ID_RE.fullmatch(game_id):
+        raise ApiError(400, "invalid_game_id", "Invalid game ID")
+    return game_id
+
+
+def _instance_id(value: Any, field: str = "instance_id") -> str:
+    value = _bounded_text(value, field, 64, allow_empty=False)
+    if not INSTANCE_ID_RE.fullmatch(value):
+        raise ApiError(400, "invalid_instance_id", f"Invalid {field}")
+    return value
+
+
+def _unwrap_game_result(result: dict[str, Any]) -> dict[str, Any]:
+    code = result.get("error") if isinstance(result, dict) else "internal_error"
+    if not code:
+        return result
+    revision = result.get("revision") if isinstance(result, dict) else None
+    errors = {
+        "opponent_not_found": (404, "Opponent HikkaNet node was not found"),
+        "self_game": (400, "You cannot play against your own HikkaNet identity"),
+        "game_not_found": (404, "Game was not found or has expired"),
+        "game_forbidden": (403, "This game is not available to this HikkaNet node"),
+        "game_unavailable": (409, "Game is no longer available for this action"),
+        "not_your_turn": (409, "It is not your turn"),
+        "revision_conflict": (
+            409,
+            f"Game changed; current revision is {revision}",
+        ),
+    }
+    status, message = errors.get(str(code), (500, "Game operation failed"))
+    raise ApiError(status, str(code), message)
+
+
+async def create_game(request: web.Request) -> web.Response:
+    payload = await _json_object(request)
+    kind = _game_kind(payload.get("kind"))
+    opponent_raw = payload.get("opponent_instance_id")
+    opponent = (
+        _instance_id(opponent_raw, "opponent_instance_id")
+        if opponent_raw not in (None, "")
+        else None
+    )
+    settings = request.app[SETTINGS_KEY]
+    result = await request.app[STORE_KEY].create_game(
+        kind,
+        request["credential"],
+        opponent,
+        settings.game_wait_ttl_seconds,
+    )
+    return _response(_unwrap_game_result(result), status=201)
+
+
+async def list_games(request: web.Request) -> web.Response:
+    scope = str(request.query.get("scope", "mine")).strip().lower()
+    if scope not in {"mine", "open", "all"}:
+        raise ApiError(400, "invalid_query", "scope must be mine, open or all")
+    kind = _game_kind(request.query.get("kind"), allow_empty=True)
+    status = str(request.query.get("status", "")).strip().lower() or None
+    if status and status not in GAME_STATUSES:
+        raise ApiError(400, "invalid_query", "Invalid game status")
+    updated_after = _query_int(request, "updated_after", 0, 0, 2**63 - 1)
+    limit = _query_int(request, "limit", 30, 1, 100)
+    games = await request.app[STORE_KEY].list_games(
+        request["credential"]["instance_id"],
+        scope,
+        kind,
+        status,
+        updated_after,
+        limit,
+    )
+    return _response({"games": games, "server_time": int(time.time())})
+
+
+async def get_game(request: web.Request) -> web.Response:
+    game_id = _game_id(request.match_info["game_id"])
+    result = await request.app[STORE_KEY].get_game(
+        game_id, request["credential"]["instance_id"]
+    )
+    if result is None:
+        raise ApiError(404, "game_not_found", "Game was not found or has expired")
+    return _response(_unwrap_game_result(result))
+
+
+async def join_game(request: web.Request) -> web.Response:
+    game_id = _game_id(request.match_info["game_id"])
+    # Consume and validate an optional empty object so signed clients use one
+    # consistent JSON request shape.
+    if request.content_length:
+        await _json_object(request)
+    result = await request.app[STORE_KEY].join_game(
+        game_id,
+        request["credential"],
+        request.app[SETTINGS_KEY].game_active_ttl_seconds,
+    )
+    return _response(_unwrap_game_result(result))
+
+
+async def move_game(request: web.Request) -> web.Response:
+    game_id = _game_id(request.match_info["game_id"])
+    payload = await _json_object(request)
+    try:
+        expected_revision = int(payload["if_revision"])
+    except (KeyError, TypeError, ValueError):
+        raise ApiError(400, "invalid_field", "if_revision must be an integer") from None
+    if expected_revision < 1:
+        raise ApiError(400, "invalid_field", "if_revision must be positive")
+    action = payload.get("action")
+    if not isinstance(action, dict) or not 1 <= len(action) <= 8:
+        raise ApiError(400, "invalid_field", "action must be a small JSON object")
+    try:
+        result = await request.app[STORE_KEY].move_game(
+            game_id,
+            request["credential"]["instance_id"],
+            expected_revision,
+            action,
+            request.app[SETTINGS_KEY].game_active_ttl_seconds,
+        )
+    except GameRuleError as error:
+        raise ApiError(409, error.code, error.message) from None
+    return _response(_unwrap_game_result(result))
+
+
+async def resign_game(request: web.Request) -> web.Response:
+    game_id = _game_id(request.match_info["game_id"])
+    if request.content_length:
+        await _json_object(request)
+    result = await request.app[STORE_KEY].resign_game(
+        game_id, request["credential"]["instance_id"]
+    )
+    return _response(_unwrap_game_result(result))
+
+
+async def cancel_game(request: web.Request) -> web.Response:
+    game_id = _game_id(request.match_info["game_id"])
+    result = await request.app[STORE_KEY].cancel_game(
+        game_id, request["credential"]["instance_id"]
+    )
+    return _response(_unwrap_game_result(result))
+
+
+async def game_leaderboard(request: web.Request) -> web.Response:
+    kind = _game_kind(request.query.get("kind"), allow_empty=True)
+    order_by = str(request.query.get("sort", "wins")).strip().lower()
+    if order_by not in {"wins", "played", "rating"}:
+        raise ApiError(400, "invalid_query", "sort must be wins, played or rating")
+    limit = _query_int(request, "limit", 20, 1, 100)
+    return _response(
+        await request.app[STORE_KEY].game_leaderboard(kind, order_by, limit)
+    )
+
+
+async def game_profile(request: web.Request) -> web.Response:
+    return _response(
+        await request.app[STORE_KEY].game_profile(
+            int(request["credential"]["owner_id"])
+        )
+    )
+
+
+def _room(value: Any) -> str:
+    room = _bounded_text(value, "room", 48, allow_empty=False).lower()
+    if not ROOM_RE.fullmatch(room):
+        raise ApiError(400, "invalid_room", "Invalid chat room")
+    return room
+
+
+async def touch_chat_presence(request: web.Request) -> web.Response:
+    payload = await _json_object(request)
+    room = _room(payload.get("room"))
+    nickname = _bounded_text(payload.get("nickname", ""), "nickname", 40)
+    if not nickname:
+        nickname = str(request["credential"]["display_name"])[:40]
+    result = await request.app[STORE_KEY].touch_chat_presence(
+        room,
+        request["credential"]["instance_id"],
+        nickname,
+        request.app[SETTINGS_KEY].chat_presence_ttl_seconds,
+    )
+    return _response({"room": room, **result})
+
+
+async def leave_chat_presence(request: web.Request) -> web.Response:
+    room = _room(request.match_info["room"])
+    removed = await request.app[STORE_KEY].leave_chat_presence(
+        room, request["credential"]["instance_id"]
+    )
+    return _response({"room": room, "left": removed})
+
+
+async def list_chat_rooms(request: web.Request) -> web.Response:
+    active_within = _query_int(
+        request,
+        "active_within",
+        request.app[SETTINGS_KEY].offline_after_seconds,
+        30,
+        3600,
+    )
+    limit = _query_int(request, "limit", 50, 1, 100)
+    rooms = await request.app[STORE_KEY].chat_rooms(active_within, limit)
+    return _response({"rooms": rooms, "active_within": active_within})
+
+
+async def list_chat_members(request: web.Request) -> web.Response:
+    room = _room(request.match_info["room"])
+    active_within = _query_int(
+        request,
+        "active_within",
+        request.app[SETTINGS_KEY].offline_after_seconds,
+        30,
+        3600,
+    )
+    limit = _query_int(request, "limit", 100, 1, 200)
+    members = await request.app[STORE_KEY].chat_room_members(
+        room, active_within, limit
+    )
+    return _response(
+        {"room": room, "members": members, "active_within": active_within}
     )
 
 
@@ -732,6 +991,19 @@ def create_app(
             web.post("/v1/heartbeat", heartbeat),
             web.get("/v1/instances", instances),
             web.get("/v1/modules/versions", module_versions),
+            web.get("/v1/games/leaderboard", game_leaderboard),
+            web.get("/v1/games/profile", game_profile),
+            web.post("/v1/games", create_game),
+            web.get("/v1/games", list_games),
+            web.get("/v1/games/{game_id}", get_game),
+            web.post("/v1/games/{game_id}/join", join_game),
+            web.post("/v1/games/{game_id}/move", move_game),
+            web.post("/v1/games/{game_id}/resign", resign_game),
+            web.delete("/v1/games/{game_id}", cancel_game),
+            web.post("/v1/chat/presence", touch_chat_presence),
+            web.delete("/v1/chat/presence/{room}", leave_chat_presence),
+            web.get("/v1/chat/rooms", list_chat_rooms),
+            web.get("/v1/chat/rooms/{room}/members", list_chat_members),
             web.post("/v1/events", publish_event),
             web.get("/v1/events", get_events),
             web.put("/v1/kv/{namespace}/{item_key}", put_item),

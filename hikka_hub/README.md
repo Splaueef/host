@@ -16,6 +16,10 @@
 - запис може змінити або видалити лише Hikka, яка створила ключ;
 - власні числові метрики та рейтинги між Hikka;
 - атомарне пакетне додавання до 100 метрик за один запит;
+- серверні міжчатові партії з відкритим матчмейкінгом і приватними запрошеннями;
+- авторитетна перевірка ходів у хрестиках-нуликах, шашках, шахах і ґо 9×9/13×13;
+- глобальні wins/losses/draws, окремий Elo для кожної гри та профіль гравця;
+- короткожива присутність у HikkaNetChat, список кімнат і online-учасників;
 - автоматична статистика запитів, heartbeat, подій і записів;
 - локальна CLI для створення, відкликання, повторного ввімкнення й ротації ключів;
 - SQLite WAL, очищення прострочених даних, ліміти запитів і розміру body.
@@ -65,6 +69,21 @@ HIKKA_HUB_LISTEN_IP=0.0.0.0 HIKKA_HUB_PUBLIC_PORT=8765 docker compose up -d
 ```
 
 Не відкривай порт у весь Інтернет без firewall та TLS/VPN.
+
+## Оновлення з Hikka Hub 1.x
+
+Схема SQLite доповнюється автоматично й наявні ключі, події та метрики не
+видаляються. Після отримання нового коду перебудуй і перезапусти сервіс:
+
+```bash
+git pull --ff-only
+docker compose up -d --build
+curl http://127.0.0.1:8765/health
+```
+
+У відповіді `/health` має бути версія `2.0.0`. Далі один раз онови в Hikka
+`hikkanet.py`, потім `minigames.py`, `hikkanetchat.py` і `modulehub.py`.
+Клієнтські модулі показують зрозумілу помилку, якщо сервер або HikkaNet ще старі.
 
 ## Запуск як systemd-сервіс
 
@@ -118,6 +137,11 @@ HIKKA_HUB_DATABASE=./data/hikka-hub.sqlite3 \
 | `HIKKA_HUB_BODY_LIMIT` | `131072` | максимум body у байтах |
 | `HIKKA_HUB_EVENT_RETENTION_HOURS` | `168` | максимальний TTL події |
 | `HIKKA_HUB_OFFLINE_AFTER` | `120` | коли вузол вважати offline, сек |
+| `HIKKA_HUB_GAME_WAIT_TTL` | `3600` | скільки живе неприйнята партія, сек |
+| `HIKKA_HUB_GAME_ACTIVE_TTL` | `604800` | TTL активної партії без ходів, сек |
+| `HIKKA_HUB_CHAT_PRESENCE_TTL` | `120` | TTL online-присутності в кімнаті, сек |
+| `HIKKA_HUB_MODULE_UPDATES` | `true` | сервер перевіряє manifest оновлень |
+| `HIKKA_HUB_MODULE_UPDATE_INTERVAL` | `300` | інтервал перевірки manifest, сек |
 
 ## Випуск ключа для окремої Hikka
 
@@ -222,10 +246,23 @@ events = await hub.api_events(after_id=0, topic="deploy", limit=50)
 latest = await hub.api_events(topic="chat.lobby", limit=20, latest=True)
 stats = await hub.api_stats("jobs.completed")
 nodes = await hub.api_instances()
+
+game = await hub.api_game_create("chess", "hikka-friend")
+game = await hub.api_game_join(game["game_id"])
+game = await hub.api_game_move(
+    game["game_id"], game["revision"],
+    {"type": "move", "source": 52, "target": 36},
+)
+leaders = await hub.api_game_leaderboard("chess", sort="rating")
+
+await hub.api_chat_presence("lobby", "Мій нік")
+rooms = await hub.api_chat_rooms()
+members = await hub.api_chat_members("lobby")
 ```
 
 Доступні методи: `api_publish`, `api_events`, `api_instances`, `api_get`,
-`api_put`, `api_delete`, `api_increment`, `api_increment_many` та `api_stats`.
+`api_put`, `api_delete`, `api_increment`, `api_increment_many`, `api_stats`,
+`api_game_*` та `api_chat_*`.
 Вони проходять ту саму валідацію, перевірку чутливих полів і захищений підпис,
 що й команди модуля.
 
@@ -242,11 +279,12 @@ def modulehub_stats(self):
     return {"completed": 42, "queued": 3}  # тільки агрегати, без ID/текстів
 ```
 
-Окремий `hikkanetchat.py` використовує event-теми `chat.<room>` для кімнат.
+Окремий `hikkanetchat.py` використовує event-теми `chat.<room>` для повідомлень
+і `/v1/chat/*` для короткоживої online-присутності.
 Команди: `.hkchat`, `.hkjoin`, `.hkroom`, `.hkleave`, `.hknick`, `.hksay` та
-`.hkhistory`.
+`.hkhistory`, `.hkrooms`, `.hkmembers`.
 
-## API v1
+## HTTP API (`/v1`, можливості сервера v2)
 
 Усі `/v1/*` маршрути потребують підпису. Публічними є тільки `/` і `/health`.
 
@@ -255,6 +293,18 @@ def modulehub_stats(self):
 | `GET /v1/me` | перевірити поточний ключ |
 | `POST /v1/heartbeat` | оновити присутність та capabilities |
 | `GET /v1/instances` | список вузлів |
+| `POST/GET /v1/games` | створити партію або отримати лобі/свої матчі |
+| `GET /v1/games/{id}` | актуальний стан доступної партії |
+| `POST /v1/games/{id}/join` | атомарно прийняти відкриту гру/запрошення |
+| `POST /v1/games/{id}/move` | серверно перевірити хід із `if_revision` |
+| `POST /v1/games/{id}/resign` | здатися й один раз записати результат |
+| `DELETE /v1/games/{id}` | скасувати очікування або відхилити запрошення |
+| `GET /v1/games/leaderboard` | глобальний рейтинг за wins/played/Elo |
+| `GET /v1/games/profile` | статистика власника поточного ключа |
+| `POST /v1/chat/presence` | heartbeat участі в кімнаті |
+| `DELETE /v1/chat/presence/{room}` | вийти з кімнати |
+| `GET /v1/chat/rooms` | активні кімнати й активність за 24 години |
+| `GET /v1/chat/rooms/{room}/members` | online-учасники кімнати |
 | `POST /v1/events` | опублікувати подію |
 | `GET /v1/events` | події після cursor або останні з `latest=1` |
 | `PUT/GET/DELETE /v1/kv/{namespace}/{key}` | спільний запис |

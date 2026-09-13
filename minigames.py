@@ -1,14 +1,15 @@
 # meta developer: @Huai_Baike
-# meta version: 1.4.0
-# meta description: Інтерактивні мініігри для чатів із кнопками та рейтингом
+# meta version: 2.0.0
+# meta description: Локальні та глобальні HikkaNet-ігри з рейтингом і матчмейкінгом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (1, 4, 0)
+__version__ = (2, 0, 0)
 
 import asyncio
 import contextlib
 import html
+import logging
 import random
 import secrets
 import time
@@ -16,7 +17,17 @@ import time
 from .. import loader, utils
 
 
+logger = logging.getLogger(__name__)
 SESSION_TTL = 30 * 60
+NETWORK_VIEW_TTL = 7 * 86400
+NETWORK_KINDS = ("ttt", "checkers", "chess", "go9", "go13")
+NETWORK_LABELS = {
+    "ttt": "❌⭕ Хрестики-нулики",
+    "checkers": "⚪⚫ Шашки",
+    "chess": "♟ Шахи",
+    "go9": "⚫⚪ Ґо 9×9",
+    "go13": "⚫⚪ Ґо 13×13",
+}
 WIN_LINES = (
     (0, 1, 2),
     (3, 4, 5),
@@ -118,6 +129,18 @@ class MiniGamesMod(loader.Module):
                 lambda: "Кількість запитань в одній вікторині",
                 validator=loader.validators.Integer(minimum=3, maximum=10),
             ),
+            loader.ConfigValue(
+                "network_poll_interval",
+                12,
+                lambda: "Інтервал автооновлення відкритих HikkaNet-партій",
+                validator=loader.validators.Integer(minimum=5, maximum=120),
+            ),
+            loader.ConfigValue(
+                "network_notifications",
+                True,
+                lambda: "Сповіщати у Збережених про запрошення та свій хід",
+                validator=loader.validators.Boolean(),
+            ),
         )
         self._client = None
         self._me_id = None
@@ -125,12 +148,167 @@ class MiniGamesMod(loader.Module):
         self._sessions = {}
         self._locks = {}
         self._rng = random.SystemRandom()
+        self._network_views = {}
+        self._network_task = None
+        self._network_stop = asyncio.Event()
 
     async def client_ready(self, client, db):
         self._client = client
         me = await client.get_me()
         self._me_id = int(me.id)
         self._me_name = self._display_name(me)
+        self._network_stop.clear()
+        if not self._network_task or self._network_task.done():
+            self._network_task = asyncio.create_task(
+                self._network_worker(), name="minigames-hikkanet-refresh"
+            )
+
+    async def on_unload(self):
+        self._network_stop.set()
+        if self._network_task:
+            self._network_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._network_task
+        self._network_task = None
+
+    def _network(self):
+        network = None
+        with contextlib.suppress(Exception):
+            network = self.lookup("HikkaNet")
+        if network is None:
+            network = next(
+                (
+                    module
+                    for module in getattr(
+                        getattr(self, "allmodules", None), "modules", []
+                    )
+                    if module.__class__.__name__ == "HikkaNetMod"
+                ),
+                None,
+            )
+        configured = getattr(network, "_configured", None) if network else None
+        if network is None or (callable(configured) and not configured()):
+            return None
+        required = (
+            "api_game_create",
+            "api_games",
+            "api_game_get",
+            "api_game_join",
+            "api_game_move",
+            "api_game_resign",
+            "api_game_cancel",
+            "api_game_leaderboard",
+            "api_game_profile",
+        )
+        return (
+            network
+            if all(callable(getattr(network, name, None)) for name in required)
+            else None
+        )
+
+    async def _network_wait(self, seconds):
+        try:
+            await asyncio.wait_for(
+                self._network_stop.wait(), timeout=max(1, int(seconds))
+            )
+        except asyncio.TimeoutError:
+            pass
+
+    async def _network_worker(self):
+        await self._network_wait(8)
+        while not self._network_stop.is_set():
+            network = self._network()
+            if network is not None:
+                if self.config["network_notifications"]:
+                    with contextlib.suppress(Exception):
+                        await self._poll_network_notifications(network)
+                now = time.monotonic()
+                views = sorted(
+                    self._network_views.items(),
+                    key=lambda item: float(item[1].get("created_at", 0)),
+                    reverse=True,
+                )[:12]
+                for token, view in views:
+                    if now - float(view.get("created_at", now)) > NETWORK_VIEW_TTL:
+                        self._network_views.pop(token, None)
+                        self._locks.pop(token, None)
+                        continue
+                    game = view.get("game", {})
+                    if game.get("status") not in {"waiting", "invited", "active"}:
+                        continue
+                    try:
+                        fresh = await network.api_game_get(view["game_id"])
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        continue
+                    if int(fresh.get("revision", 0)) <= int(game.get("revision", 0)):
+                        continue
+                    view["game"] = fresh
+                    view["selected"] = None
+                    view["selected_row"] = None
+                    view["promotion"] = None
+                    handle = view.get("handle")
+                    if handle is not None and callable(getattr(handle, "edit", None)):
+                        with contextlib.suppress(Exception):
+                            await handle.edit(
+                                self._render_network(token),
+                                reply_markup=self._markup_network(token),
+                            )
+            await self._network_wait(int(self.config["network_poll_interval"]))
+
+    async def _poll_network_notifications(self, network):
+        data = await network.api_games(scope="mine", limit=50)
+        seen = self.get("network_seen_revisions", {})
+        seen = dict(seen) if isinstance(seen, dict) else {}
+        open_ids = {
+            str(view.get("game_id"))
+            for view in self._network_views.values()
+            if view.get("handle") is not None
+        }
+        for game in data.get("games", []):
+            game_id = str(game.get("game_id", ""))
+            revision = int(game.get("revision", 0) or 0)
+            if not game_id or revision <= int(seen.get(game_id, 0) or 0):
+                continue
+            seen[game_id] = revision
+            if game_id in open_ids:
+                continue
+            status = game.get("status")
+            state = game.get("state", {})
+            my_slot = game.get("my_slot")
+            label = NETWORK_LABELS.get(game.get("kind"), game.get("kind"))
+            text = None
+            if status == "invited" and my_slot == 1:
+                text = (
+                    f"✉️ <b>Нове запрошення HikkaNet</b>\n\n{label}\n"
+                    f"Прийняти: <code>.netjoin {html.escape(game_id)}</code>"
+                )
+            elif status == "active" and my_slot == state.get("turn"):
+                text = (
+                    f"🎮 <b>Ваш хід у HikkaNet</b>\n\n{label}\n"
+                    f"Відкрити: <code>.netgame {html.escape(game_id)}</code>"
+                )
+            elif status == "finished":
+                winner = state.get("winner")
+                if state.get("draw"):
+                    result = "нічия"
+                elif winner == my_slot:
+                    result = "ви перемогли 🏆"
+                else:
+                    result = "переміг суперник"
+                text = (
+                    f"🏁 <b>HikkaNet-партію завершено</b>\n\n{label} · {result}\n"
+                    f"Переглянути: <code>.netgame {html.escape(game_id)}</code>"
+                )
+            if text and self._client is not None:
+                await self._client.send_message("me", text, parse_mode="html")
+        # Keep the persisted map bounded while retaining all currently visible games.
+        current = {str(game.get("game_id")) for game in data.get("games", [])}
+        self.set(
+            "network_seen_revisions",
+            {key: value for key, value in seen.items() if key in current},
+        )
 
     @staticmethod
     def _display_name(user):
@@ -330,7 +508,8 @@ class MiniGamesMod(loader.Module):
             "♟ <b>Шахи</b> — повні правила, шах, мат і пат\n"
             "⚫⚪ <b>Ґо</b> — дошки 9×9 і 13×13\n"
             "🧠 <b>Вікторина</b> — перший правильний отримує бал\n\n"
-            "<i>Ігри відкриті для учасників поточного чату.</i>"
+            "🏠 <b>Локально</b> — учасники поточного чату\n"
+            "🌐 <b>HikkaNet</b> — суперник може бути в іншому чаті або на іншій Hikka"
         )
 
     def _markup_menu(self, token, session):
@@ -353,6 +532,13 @@ class MiniGamesMod(loader.Module):
             [
                 {"text": "🧠 Вікторина", "callback": self._select_game, "args": (token, "quiz")},
                 {"text": "🏆 Рейтинг", "callback": self._show_top, "args": (token,)},
+            ],
+            [
+                {
+                    "text": "🌐 Грати через HikkaNet",
+                    "callback": self._network_lobby_callback,
+                    "args": (token,),
+                }
             ],
             [{"text": "✖️ Закрити", "callback": self._close, "args": (token,)}],
         ]
@@ -2287,6 +2473,11 @@ class MiniGamesMod(loader.Module):
             "active_games": sum(
                 1 for session in self._sessions.values() if not session.get("finished")
             ),
+            "active_network_games": sum(
+                1
+                for view in self._network_views.values()
+                if view.get("game", {}).get("status") == "active"
+            ),
             "by_game": by_game,
         }
 
@@ -2321,7 +2512,814 @@ class MiniGamesMod(loader.Module):
             return
         await call.edit(self._render(token), reply_markup=self._markup(token))
 
+    def _purge_network_views(self):
+        now = time.monotonic()
+        for token, view in list(self._network_views.items()):
+            if now - float(view.get("created_at", now)) > NETWORK_VIEW_TTL:
+                self._network_views.pop(token, None)
+                self._locks.pop(token, None)
+
+    def _new_network_view(self, game, handle=None):
+        self._purge_network_views()
+        token = "n" + secrets.token_urlsafe(7)
+        self._network_views[token] = {
+            "game_id": str(game.get("game_id", "")),
+            "game": game,
+            "selected": None,
+            "selected_row": None,
+            "promotion": None,
+            "handle": handle,
+            "created_at": time.monotonic(),
+        }
+        self._locks[token] = asyncio.Lock()
+        return token
+
+    def _network_view(self, token):
+        self._purge_network_views()
+        return self._network_views.get(str(token))
+
+    async def _network_owner_only(self, call):
+        user_id, _ = self._actor(call)
+        if user_id == int(self._me_id or 0):
+            return True
+        await call.answer(
+            "🌐 Мережевою HikkaNet-партією керує власник цієї Hikka.",
+            show_alert=True,
+        )
+        return False
+
+    @staticmethod
+    def _network_status(value):
+        return {
+            "waiting": "🔎 відкрита",
+            "invited": "✉️ запрошення",
+            "active": "🟢 триває",
+            "finished": "🏁 завершена",
+            "cancelled": "🚫 скасована",
+        }.get(str(value), str(value))
+
+    def _network_as_local_session(self, view):
+        game = view["game"]
+        players_data = list(game.get("players", []))
+        players = [
+            str(item.get("instance_id")) for item in players_data[:2]
+        ]
+        while len(players) < 2:
+            players.append(None)
+        names = {
+            str(item.get("instance_id")): str(
+                item.get("display_name") or item.get("instance_id") or "Hikka"
+            )
+            for item in players_data
+            if item.get("instance_id")
+        }
+        state = dict(game.get("state", {}))
+        state.update(
+            kind=game.get("kind"),
+            players=players,
+            names=names,
+            creator_id=players[0],
+            invited_id=players[1],
+            chat_id=0,
+            selected=view.get("selected"),
+            selected_row=view.get("selected_row"),
+        )
+        if game.get("kind") == "chess":
+            state["castling"] = set(state.get("castling", []))
+            state["promotion"] = view.get("promotion")
+        elif str(game.get("kind", "")).startswith("go"):
+            state["history"] = set(state.get("history", []))
+        winner = state.get("winner")
+        if winner is not None and game.get("kind") != "ttt":
+            with contextlib.suppress(TypeError, ValueError, IndexError):
+                state["winner"] = players[int(winner)]
+        return state
+
+    def _render_network(self, token):
+        view = self._network_view(token)
+        if view is None:
+            return "⌛ <b>Панель мережевої гри застаріла.</b> Відкрийте <code>.netgames</code>."
+        game = view["game"]
+        game_id = html.escape(str(game.get("game_id", "")))
+        kind = str(game.get("kind", ""))
+        status = str(game.get("status", ""))
+        players = list(game.get("players", []))
+        heading = (
+            f"🌐 <b>HikkaNet · {NETWORK_LABELS.get(kind, kind)}</b>\n"
+            f"ID: <code>{game_id}</code> · {self._network_status(status)}\n\n"
+        )
+        if status in {"waiting", "invited"}:
+            creator = players[0].get("display_name", "Hikka") if players else "Hikka"
+            if status == "waiting":
+                detail = (
+                    f"Створив: <b>{html.escape(str(creator))}</b>\n"
+                    "Очікуємо суперника з будь-якого чату HikkaNet.\n\n"
+                    f"Він може відкрити <code>.netgame {game_id}</code> або знайти партію в <code>.netgames</code>."
+                )
+            else:
+                opponent = players[1].get("display_name", "Hikka") if len(players) > 1 else "Hikka"
+                detail = (
+                    f"<b>{html.escape(str(creator))}</b> запросив "
+                    f"<b>{html.escape(str(opponent))}</b>.\n"
+                    "Запрошений вузол має прийняти партію."
+                )
+            return heading + detail
+        if status == "cancelled":
+            return heading + "Партію скасовано або запрошення відхилено."
+        session = self._network_as_local_session(view)
+        renderer = getattr(self, f"_render_{kind}", None)
+        if not callable(renderer):
+            return heading + "Ця версія MiniGames не вміє показати гру."
+        return heading + renderer(session)
+
+    def _markup_network(self, token):
+        view = self._network_view(token)
+        if view is None:
+            return []
+        game = view["game"]
+        status = str(game.get("status", ""))
+        my_slot = game.get("my_slot")
+        if status in {"waiting", "invited"}:
+            rows = []
+            if status == "waiting" and my_slot is None:
+                rows.append(
+                    [{"text": "✅ Приєднатися", "callback": self._net_join, "args": (token,)}]
+                )
+            elif status == "invited" and my_slot == 1:
+                rows.append(
+                    [
+                        {"text": "✅ Прийняти", "callback": self._net_join, "args": (token,)},
+                        {"text": "🚫 Відхилити", "callback": self._net_cancel, "args": (token,)},
+                    ]
+                )
+            elif my_slot == 0:
+                rows.append(
+                    [{"text": "🚫 Скасувати", "callback": self._net_cancel, "args": (token,)}]
+                )
+            rows.append(
+                [
+                    {"text": "🔄 Оновити", "callback": self._net_refresh, "args": (token,)},
+                    {"text": "✖️ Закрити", "callback": self._net_close, "args": (token,)},
+                ]
+            )
+            return rows
+        if status == "cancelled":
+            return [[{"text": "✖️ Закрити", "callback": self._net_close, "args": (token,)}]]
+        session = self._network_as_local_session(view)
+        builder = getattr(self, f"_markup_{game.get('kind')}", None)
+        if not callable(builder):
+            return [[{"text": "✖️ Закрити", "callback": self._net_close, "args": (token,)}]]
+        rows = builder(token, session)
+        callback_map = {
+            "_ttt_move": self._net_ttt_move,
+            "_checker_click": self._net_checker_click,
+            "_checker_resign": self._net_resign,
+            "_chess_click": self._net_chess_click,
+            "_chess_promote": self._net_chess_promote,
+            "_chess_resign": self._net_resign,
+            "_go_select_row": self._net_go_select_row,
+            "_go_clear_row": self._net_go_clear_row,
+            "_go_place": self._net_go_place,
+            "_go_pass": self._net_go_pass,
+            "_go_resign": self._net_resign,
+            "_rematch": self._net_rematch,
+            "_show_top": self._net_game_top,
+            "_close": self._net_close,
+        }
+        for row in rows:
+            for button in row:
+                callback = button.get("callback")
+                name = getattr(callback, "__name__", "")
+                if name in callback_map:
+                    button["callback"] = callback_map[name]
+                if (
+                    game.get("kind") == "ttt"
+                    and status == "active"
+                    and name == "_close"
+                ):
+                    button["text"] = "🏳 Здатися"
+                    button["callback"] = self._net_resign
+        if status == "active":
+            rows.append(
+                [
+                    {"text": "🔄 Оновити", "callback": self._net_refresh, "args": (token,)},
+                    {"text": "↩️ Закрити панель", "callback": self._net_close, "args": (token,)},
+                ]
+            )
+        return rows
+
+    async def _network_lobby_data(self):
+        network = self._network()
+        if network is None:
+            raise RuntimeError("Встанови й налаштуй HikkaNet 2.0.0")
+        mine, opened = await asyncio.gather(
+            network.api_games(scope="mine", limit=12),
+            network.api_games(scope="open", limit=12),
+        )
+        return {
+            "mine": list(mine.get("games", [])),
+            "open": list(opened.get("games", [])),
+        }
+
+    def _network_lobby_text(self, data):
+        mine = data.get("mine", [])
+        opened = data.get("open", [])
+        active = sum(game.get("status") == "active" for game in mine)
+        invited = sum(game.get("status") == "invited" and game.get("my_slot") == 1 for game in mine)
+        return (
+            "🌐 <b>MiniGames · HikkaNet</b>\n\n"
+            "Грайте між різними чатами й різними Hikka. Ходи перевіряє сервер, "
+            "а результати потрапляють у глобальний рейтинг.\n\n"
+            f"Ваші активні: <b>{active}</b> · запрошення: <b>{invited}</b>\n"
+            f"Відкриті партії: <b>{len(opened)}</b>\n\n"
+            "Створіть відкриту партію або оберіть наявну нижче. Для приватного "
+            "запрошення: <code>.netgame chess instance-id</code>."
+        )
+
+    def _network_lobby_markup(self, data, back_token=""):
+        rows = [
+            [
+                {"text": "❌⭕ Створити", "callback": self._net_create, "args": ("ttt",)},
+                {"text": "⚪⚫ Шашки", "callback": self._net_create, "args": ("checkers",)},
+            ],
+            [
+                {"text": "♟ Шахи", "callback": self._net_create, "args": ("chess",)},
+                {"text": "⚫⚪ Ґо 9×9", "callback": self._net_create, "args": ("go9",)},
+            ],
+            [{"text": "⚫⚪ Ґо 13×13", "callback": self._net_create, "args": ("go13",)}],
+        ]
+        actionable = [
+            game
+            for game in data.get("mine", [])
+            if game.get("status") in {"waiting", "invited", "active"}
+        ][:6]
+        if actionable:
+            rows.append([{"text": "— Мої партії —", "callback": self._net_noop}])
+            for game in actionable:
+                label = NETWORK_LABELS.get(game.get("kind"), game.get("kind"))
+                rows.append(
+                    [
+                        {
+                            "text": f"{label} · {self._network_status(game.get('status'))}",
+                            "callback": self._net_open,
+                            "args": (game.get("game_id"),),
+                        }
+                    ]
+                )
+        opened = data.get("open", [])[:6]
+        if opened:
+            rows.append([{"text": "— Відкриті партії —", "callback": self._net_noop}])
+            for game in opened:
+                creator = (game.get("players") or [{}])[0].get("display_name", "Hikka")
+                creator = " ".join(str(creator).split())[:20] or "Hikka"
+                label = NETWORK_LABELS.get(game.get("kind"), game.get("kind"))
+                rows.append(
+                    [
+                        {
+                            "text": f"➕ {label} · {creator}",
+                            "callback": self._net_join_id,
+                            "args": (game.get("game_id"),),
+                        }
+                    ]
+                )
+        rows.append(
+            [
+                {"text": "🏆 Глобальний топ", "callback": self._net_lobby_top, "args": (back_token,)},
+                {"text": "🔄 Оновити", "callback": self._network_lobby_callback, "args": (back_token,)},
+            ]
+        )
+        if back_token and self._session(back_token) is not None:
+            rows.append(
+                [{"text": "↩️ Локальні ігри", "callback": self._net_back_local, "args": (back_token,)}]
+            )
+        else:
+            rows.append([{"text": "✖️ Закрити", "action": "close"}])
+        return rows
+
+    async def _net_noop(self, call):
+        await call.answer("Оберіть партію нижче")
+
+    async def _network_lobby_callback(self, call, back_token=""):
+        if not await self._network_owner_only(call):
+            return
+        try:
+            data = await self._network_lobby_data()
+            await call.edit(
+                self._network_lobby_text(data),
+                reply_markup=self._network_lobby_markup(data, back_token),
+            )
+        except Exception as error:
+            await call.answer(str(error)[:180], show_alert=True)
+
+    async def _net_back_local(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        if self._session(token) is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        await call.edit(self._render(token), reply_markup=self._markup(token))
+
+    async def _net_switch(self, call, game):
+        token = self._new_network_view(game, handle=call)
+        await call.edit(
+            self._render_network(token), reply_markup=self._markup_network(token)
+        )
+
+    async def _net_create(self, call, kind):
+        if not await self._network_owner_only(call):
+            return
+        network = self._network()
+        if network is None:
+            await call.answer("HikkaNet 2.0.0 недоступна", show_alert=True)
+            return
+        try:
+            await self._net_switch(call, await network.api_game_create(kind))
+        except Exception as error:
+            await call.answer(str(error)[:180], show_alert=True)
+
+    async def _net_open(self, call, game_id):
+        if not await self._network_owner_only(call):
+            return
+        try:
+            await self._net_switch(call, await self._network().api_game_get(game_id))
+        except Exception as error:
+            await call.answer(str(error)[:180], show_alert=True)
+
+    async def _net_join_id(self, call, game_id):
+        if not await self._network_owner_only(call):
+            return
+        try:
+            game = await self._network().api_game_join(game_id)
+            await self._net_switch(call, game)
+        except Exception as error:
+            await call.answer(str(error)[:180], show_alert=True)
+
+    async def _net_join(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None:
+            await call.answer("Панель застаріла", show_alert=True)
+            return
+        try:
+            view["game"] = await self._network().api_game_join(view["game_id"])
+            view["handle"] = call
+            await call.edit(
+                self._render_network(token), reply_markup=self._markup_network(token)
+            )
+        except Exception as error:
+            await call.answer(str(error)[:180], show_alert=True)
+
+    async def _net_refresh(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None:
+            await call.answer("Панель застаріла", show_alert=True)
+            return
+        try:
+            view["game"] = await self._network().api_game_get(view["game_id"])
+            view["selected"] = None
+            view["selected_row"] = None
+            view["promotion"] = None
+            view["handle"] = call
+            await call.edit(
+                self._render_network(token), reply_markup=self._markup_network(token)
+            )
+            await call.answer("Оновлено")
+        except Exception as error:
+            await call.answer(str(error)[:180], show_alert=True)
+
+    async def _net_close(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        self._network_views.pop(token, None)
+        self._locks.pop(token, None)
+        await call.edit(
+            "🌐 <b>Панель HikkaNet-гри закрито.</b> Сама партія збережена в мережі.",
+            reply_markup=[],
+        )
+
+    async def _net_cancel(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None:
+            await call.answer("Панель застаріла", show_alert=True)
+            return
+        try:
+            view["game"] = await self._network().api_game_cancel(view["game_id"])
+            await call.edit(
+                self._render_network(token), reply_markup=self._markup_network(token)
+            )
+        except Exception as error:
+            await call.answer(str(error)[:180], show_alert=True)
+
+    async def _net_resign(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None:
+            await call.answer("Панель застаріла", show_alert=True)
+            return
+        try:
+            view["game"] = await self._network().api_game_resign(view["game_id"])
+            view["selected"] = None
+            view["selected_row"] = None
+            await call.edit(
+                self._render_network(token), reply_markup=self._markup_network(token)
+            )
+        except Exception as error:
+            await call.answer(str(error)[:180], show_alert=True)
+
+    async def _net_rematch(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None:
+            await call.answer("Панель застаріла", show_alert=True)
+            return
+        game = view["game"]
+        network = self._network()
+        own_instance = str(network.config.get("instance_id", ""))
+        opponent = next(
+            (
+                item.get("instance_id")
+                for item in game.get("players", [])
+                if item.get("instance_id") != own_instance
+            ),
+            None,
+        )
+        if not opponent:
+            await call.answer("Не вдалося визначити суперника", show_alert=True)
+            return
+        try:
+            fresh = await network.api_game_create(game.get("kind"), opponent)
+            self._network_views.pop(token, None)
+            self._locks.pop(token, None)
+            await self._net_switch(call, fresh)
+        except Exception as error:
+            await call.answer(str(error)[:180], show_alert=True)
+
+    async def _net_submit(self, call, token, action):
+        view = self._network_view(token)
+        if view is None:
+            await call.answer("Панель застаріла", show_alert=True)
+            return False
+        lock = self._locks.setdefault(token, asyncio.Lock())
+        async with lock:
+            try:
+                view["game"] = await self._network().api_game_move(
+                    view["game_id"], view["game"]["revision"], action
+                )
+            except Exception as error:
+                if getattr(error, "code", "") == "revision_conflict":
+                    with contextlib.suppress(Exception):
+                        view["game"] = await self._network().api_game_get(
+                            view["game_id"]
+                        )
+                    await call.answer(
+                        "Суперник уже оновив партію. Стан синхронізовано.",
+                        show_alert=True,
+                    )
+                    await call.edit(
+                        self._render_network(token),
+                        reply_markup=self._markup_network(token),
+                    )
+                    return False
+                await call.answer(str(error)[:180], show_alert=True)
+                return False
+            view["selected"] = None
+            view["selected_row"] = None
+            view["promotion"] = None
+            view["handle"] = call
+            await call.edit(
+                self._render_network(token), reply_markup=self._markup_network(token)
+            )
+            return True
+
+    async def _net_require_turn(self, call, view):
+        game = view["game"]
+        if game.get("status") != "active":
+            await call.answer("Партія ще не активна або вже завершена", show_alert=True)
+            return False
+        if game.get("my_slot") != game.get("state", {}).get("turn"):
+            await call.answer("Зараз хід суперника", show_alert=True)
+            return False
+        return True
+
+    async def _net_ttt_move(self, call, token, position):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None or not await self._net_require_turn(call, view):
+            return
+        await self._net_submit(
+            call, token, {"type": "place", "position": int(position)}
+        )
+
+    async def _net_checker_click(self, call, token, position):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None or not await self._net_require_turn(call, view):
+            return
+        session = self._network_as_local_session(view)
+        side = int(session["turn"])
+        position = int(position)
+        board = session["board"]
+        if self._checker_owned(board[position], side):
+            forced = session.get("forced_piece")
+            if forced is not None and position != int(forced):
+                await call.answer("Продовжуйте взяття цією ж шашкою", show_alert=True)
+                return
+            if not self._checker_moves_for(board, side, position):
+                await call.answer("У цієї шашки немає доступного ходу", show_alert=True)
+                return
+            view["selected"] = position
+            view["handle"] = call
+            await call.edit(
+                self._render_network(token), reply_markup=self._markup_network(token)
+            )
+            return
+        selected = view.get("selected")
+        if selected is None:
+            await call.answer("Спочатку оберіть свою шашку", show_alert=True)
+            return
+        await self._net_submit(
+            call,
+            token,
+            {"type": "move", "source": int(selected), "target": position},
+        )
+
+    async def _net_chess_click(self, call, token, position):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None or not await self._net_require_turn(call, view):
+            return
+        if view.get("promotion"):
+            await call.answer("Спочатку оберіть фігуру перетворення", show_alert=True)
+            return
+        session = self._network_as_local_session(view)
+        side = int(session["turn"])
+        position = int(position)
+        board = session["board"]
+        if self._chess_side(board[position]) == side:
+            if not self._chess_legal_moves(
+                board,
+                side,
+                position,
+                session["castling"],
+                session.get("en_passant"),
+            ):
+                await call.answer("У цієї фігури немає дозволених ходів", show_alert=True)
+                return
+            view["selected"] = position
+            view["handle"] = call
+            await call.edit(
+                self._render_network(token), reply_markup=self._markup_network(token)
+            )
+            return
+        selected = view.get("selected")
+        if selected is None:
+            await call.answer("Спочатку оберіть свою фігуру", show_alert=True)
+            return
+        legal = dict(
+            self._chess_legal_moves(
+                board,
+                side,
+                selected,
+                session["castling"],
+                session.get("en_passant"),
+            )
+        )
+        if position not in legal:
+            await call.answer("Цей хід неможливий", show_alert=True)
+            return
+        piece = board[int(selected)]
+        target_row, _ = self._chess_position(position)
+        if piece.lower() == "p" and target_row in {0, 7}:
+            view["promotion"] = {
+                "source": int(selected),
+                "target": position,
+                "side": side,
+                "position": position,
+            }
+            view["handle"] = call
+            await call.edit(
+                self._render_network(token), reply_markup=self._markup_network(token)
+            )
+            return
+        await self._net_submit(
+            call,
+            token,
+            {"type": "move", "source": int(selected), "target": position},
+        )
+
+    async def _net_chess_promote(self, call, token, choice):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        pending = view.get("promotion") if view else None
+        if not pending or str(choice).lower() not in {"q", "r", "b", "n"}:
+            await call.answer("Перетворення вже недоступне", show_alert=True)
+            return
+        await self._net_submit(
+            call,
+            token,
+            {
+                "type": "move",
+                "source": int(pending["source"]),
+                "target": int(pending["target"]),
+                "promotion": str(choice).lower(),
+            },
+        )
+
+    async def _net_go_select_row(self, call, token, row):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None or not await self._net_require_turn(call, view):
+            return
+        size = int(view["game"].get("state", {}).get("go_size", 0))
+        row = int(row)
+        if not 0 <= row < size:
+            await call.answer("Некоректний рядок", show_alert=True)
+            return
+        view["selected_row"] = row
+        view["handle"] = call
+        await call.edit(
+            self._render_network(token), reply_markup=self._markup_network(token)
+        )
+
+    async def _net_go_clear_row(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None or not await self._net_require_turn(call, view):
+            return
+        view["selected_row"] = None
+        await call.edit(
+            self._render_network(token), reply_markup=self._markup_network(token)
+        )
+
+    async def _net_go_place(self, call, token, column):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None or not await self._net_require_turn(call, view):
+            return
+        row = view.get("selected_row")
+        size = int(view["game"].get("state", {}).get("go_size", 0))
+        column = int(column)
+        if row is None or not 0 <= column < size:
+            await call.answer("Спочатку оберіть рядок", show_alert=True)
+            return
+        await self._net_submit(
+            call,
+            token,
+            {"type": "place", "position": int(row) * size + column},
+        )
+
+    async def _net_go_pass(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None or not await self._net_require_turn(call, view):
+            return
+        await self._net_submit(call, token, {"type": "pass"})
+
+    async def _network_top_text(self, kind=None):
+        data = await self._network().api_game_leaderboard(
+            kind=kind or None, sort="rating" if kind else "wins", limit=20
+        )
+        label = NETWORK_LABELS.get(kind, "усі ігри") if kind else "усі ігри"
+        lines = [f"🏆 <b>HikkaNet · {label}</b>", ""]
+        medals = ("🥇", "🥈", "🥉")
+        for index, item in enumerate(data.get("ranking", [])[:20]):
+            lines.append(
+                f"{medals[index] if index < 3 else '▫️'} "
+                f"<b>{html.escape(str(item.get('display_name') or item.get('public_id') or 'Гравець'))}</b> — "
+                f"{int(item.get('wins', 0))}–{int(item.get('losses', 0))}–"
+                f"{int(item.get('draws', 0))} · {int(item.get('played', 0))} ігор · "
+                f"рейтинг {float(item.get('rating', 1000)):g}"
+            )
+        if not data.get("ranking"):
+            lines.append("<i>Завершених мережевих партій ще немає.</i>")
+        return "\n".join(lines)
+
+    async def _net_lobby_top(self, call, back_token=""):
+        if not await self._network_owner_only(call):
+            return
+        try:
+            await call.edit(
+                await self._network_top_text(),
+                reply_markup=[
+                    [
+                        {
+                            "text": "↩️ До HikkaNet-ігор",
+                            "callback": self._network_lobby_callback,
+                            "args": (back_token,),
+                        }
+                    ]
+                ],
+            )
+        except Exception as error:
+            await call.answer(str(error)[:180], show_alert=True)
+
+    async def _net_game_top(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None:
+            await call.answer("Панель застаріла", show_alert=True)
+            return
+        try:
+            await call.edit(
+                await self._network_top_text(view["game"].get("kind")),
+                reply_markup=[
+                    [{"text": "↩️ До партії", "callback": self._net_back_game, "args": (token,)}]
+                ],
+            )
+        except Exception as error:
+            await call.answer(str(error)[:180], show_alert=True)
+
+    async def _net_back_game(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        if self._network_view(token) is None:
+            await call.answer("Панель застаріла", show_alert=True)
+            return
+        await call.edit(
+            self._render_network(token), reply_markup=self._markup_network(token)
+        )
+
+    async def _open_network_game(self, message, game):
+        token = self._new_network_view(game)
+        try:
+            opened = await self.inline.form(
+                self._render_network(token),
+                message,
+                reply_markup=self._markup_network(token),
+                disable_security=True,
+            )
+        except Exception:
+            opened = False
+        if not opened:
+            self._network_views.pop(token, None)
+            self._locks.pop(token, None)
+            await utils.answer(message, self.strings["inline_failed"])
+            return
+        if callable(getattr(opened, "edit", None)):
+            self._network_views[token]["handle"] = opened
+
+    async def _open_network_lobby(self, message):
+        try:
+            data = await self._network_lobby_data()
+            opened = await self.inline.form(
+                self._network_lobby_text(data),
+                message,
+                reply_markup=self._network_lobby_markup(data),
+                disable_security=True,
+            )
+            if opened:
+                return
+        except Exception as error:
+            await utils.answer(message, f"❌ <code>{html.escape(str(error)[:300])}</code>")
+            return
+        await utils.answer(message, self.strings["inline_failed"])
+
+    async def _create_network_game(self, message, kind, opponent=None):
+        network = self._network()
+        if network is None:
+            await utils.answer(
+                message,
+                "❌ Потрібен налаштований <b>HikkaNet 2.0.0</b>. Перевір <code>.hknetstatus</code>.",
+            )
+            return
+        try:
+            game = await network.api_game_create(kind, opponent or None)
+        except Exception as error:
+            await utils.answer(message, f"❌ <code>{html.escape(str(error)[:300])}</code>")
+            return
+        await self._open_network_game(message, game)
+
     async def _direct_game(self, message, kind):
+        raw = str(utils.get_args_raw(message) or "").strip()
+        parts = raw.split()
+        if parts and parts[0].lower() in {"net", "network", "global", "мережа"}:
+            if kind == "gomenu":
+                await utils.answer(
+                    message,
+                    "Для мережевої партії обери <code>.go9 net [instance-id]</code> "
+                    "або <code>.go13 net [instance-id]</code>.",
+                )
+                return
+            await self._create_network_game(
+                message, kind, parts[1] if len(parts) > 1 else None
+            )
+            return
         invited = await self._resolve_invited(message)
         if invited is False:
             return
@@ -2379,5 +3377,116 @@ class MiniGamesMod(loader.Module):
 
     @loader.command(ru_doc="Показати рейтинг мініігор поточного чату")
     async def gametop(self, message):
-        """🏆 Перемоги та кількість зіграних ігор"""
+        """🏆 .gametop [global [ttt|checkers|chess|go9|go13]]"""
+        parts = str(utils.get_args_raw(message) or "").strip().lower().split()
+        if parts and parts[0] in {"global", "net", "network", "мережа"}:
+            kind = parts[1] if len(parts) > 1 else None
+            if kind and kind not in NETWORK_KINDS:
+                await utils.answer(
+                    message,
+                    "❌ Гра: <code>ttt</code>, <code>checkers</code>, <code>chess</code>, "
+                    "<code>go9</code> або <code>go13</code>.",
+                )
+                return
+            if self._network() is None:
+                await utils.answer(message, "❌ HikkaNet 2.0.0 недоступна.")
+                return
+            try:
+                await utils.answer(message, await self._network_top_text(kind))
+            except Exception as error:
+                await utils.answer(message, f"❌ <code>{html.escape(str(error)[:300])}</code>")
+            return
         await utils.answer(message, self._top_text(self._chat_id(message)))
+
+    @loader.command(ru_doc="Відкрити лобі глобальних HikkaNet-ігор")
+    async def netgames(self, message):
+        """🌐 Відкриті партії, запрошення та власні матчі"""
+        await self._open_network_lobby(message)
+
+    @loader.command(ru_doc="Створити або відкрити HikkaNet-партію")
+    async def netgame(self, message):
+        """🌐 .netgame <game|game-id> [instance-id]"""
+        parts = str(utils.get_args_raw(message) or "").strip().split()
+        if not parts:
+            await self._open_network_lobby(message)
+            return
+        value = parts[0].lower()
+        aliases = {
+            "хрестики": "ttt",
+            "шашки": "checkers",
+            "шахи": "chess",
+            "го9": "go9",
+            "ґо9": "go9",
+            "го13": "go13",
+            "ґо13": "go13",
+        }
+        value = aliases.get(value, value)
+        network = self._network()
+        if network is None:
+            await utils.answer(message, "❌ HikkaNet 2.0.0 недоступна.")
+            return
+        if value in NETWORK_KINDS:
+            await self._create_network_game(
+                message, value, parts[1] if len(parts) > 1 else None
+            )
+            return
+        try:
+            game = await network.api_game_get(value)
+        except Exception as error:
+            await utils.answer(
+                message,
+                "❌ Вкажи тип гри або чинний ID: "
+                f"<code>{html.escape(str(error)[:240])}</code>",
+            )
+            return
+        await self._open_network_game(message, game)
+
+    @loader.command(ru_doc="Прийняти HikkaNet-партію за ID")
+    async def netjoin(self, message):
+        """✅ .netjoin <game-id>"""
+        game_id = str(utils.get_args_raw(message) or "").strip().lower()
+        if not game_id:
+            await utils.answer(message, "Використання: <code>.netjoin ng_…</code>")
+            return
+        network = self._network()
+        if network is None:
+            await utils.answer(message, "❌ HikkaNet 2.0.0 недоступна.")
+            return
+        try:
+            game = await network.api_game_join(game_id)
+        except Exception as error:
+            await utils.answer(message, f"❌ <code>{html.escape(str(error)[:300])}</code>")
+            return
+        await self._open_network_game(message, game)
+
+    @loader.command(ru_doc="Власна глобальна статистика HikkaNet-ігор")
+    async def netprofile(self, message):
+        """📊 Перемоги, поразки, нічиї та рейтинг за іграми"""
+        network = self._network()
+        if network is None:
+            await utils.answer(message, "❌ HikkaNet 2.0.0 недоступна.")
+            return
+        try:
+            profile = await network.api_game_profile()
+        except Exception as error:
+            await utils.answer(message, f"❌ <code>{html.escape(str(error)[:300])}</code>")
+            return
+        totals = profile.get("totals", {})
+        lines = [
+            "📊 <b>Мій профіль HikkaNet Games</b>",
+            "",
+            f"Ігор: <b>{int(totals.get('played', 0))}</b>",
+            f"Перемог: <b>{int(totals.get('wins', 0))}</b>",
+            f"Поразок: <b>{int(totals.get('losses', 0))}</b>",
+            f"Нічиїх: <b>{int(totals.get('draws', 0))}</b>",
+        ]
+        for item in profile.get("by_game", []):
+            lines.extend(
+                [
+                    "",
+                    f"{NETWORK_LABELS.get(item.get('kind'), item.get('kind'))}: "
+                    f"{int(item.get('wins', 0))}–{int(item.get('losses', 0))}–"
+                    f"{int(item.get('draws', 0))} · Elo <b>{float(item.get('rating', 1000)):g}</b>",
+                ]
+            )
+        await utils.answer(message, "\n".join(lines))

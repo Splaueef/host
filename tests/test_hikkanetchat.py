@@ -100,6 +100,8 @@ class _Network:
         self.published = []
         self.requests = []
         self.responses = []
+        self.presence = []
+        self.left = []
 
     def _configured(self):
         return True
@@ -111,6 +113,32 @@ class _Network:
     async def api_events(self, **kwargs):
         self.requests.append(kwargs)
         return self.responses.pop(0) if self.responses else {"events": []}
+
+    async def api_chat_presence(self, room, nickname=""):
+        self.presence.append((room, nickname))
+        return {"room": room}
+
+    async def api_chat_leave(self, room):
+        self.left.append(room)
+        return {"left": True}
+
+    async def api_chat_rooms(self, **kwargs):
+        return {
+            "rooms": [
+                {"room": "lobby", "online": 2, "messages_24h": 7}
+            ]
+        }
+
+    async def api_chat_members(self, room, **kwargs):
+        return {
+            "members": [
+                {
+                    "instance_id": "hikka-two",
+                    "nickname": "Node Two",
+                    "display_name": "Second",
+                }
+            ]
+        }
 
 
 class _Message:
@@ -182,6 +210,7 @@ class HikkaNetChatTests(unittest.IsolatedAsyncioTestCase):
                     "events": [
                         {
                             "id": 4,
+                            "topic": "chat.lobby",
                             "created_at": 1700000000,
                             "sender_instance_id": "hikka-two",
                             "payload": {
@@ -200,8 +229,19 @@ class HikkaNetChatTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.network.requests[0]["latest"], True)
         self.assertEqual(self.network.requests[1]["after_id"], 3)
+        self.assertNotIn("topic", self.network.requests[1])
         self.assertEqual(len(self.module._client.sent), 1)
         self.assertEqual(self.module.modulehub_stats()["messages_received"], 1)
+
+    async def test_presence_rooms_and_members_use_hikkanet_api(self):
+        await self.module._sync_presence(force=True)
+        rooms = await self.module._rooms_text()
+        members = await self.module._members_text("lobby")
+
+        self.assertEqual(self.network.presence, [("lobby", "Main Hikka")])
+        self.assertIn("7 за 24 год", rooms)
+        self.assertIn("Node Two", members)
+        self.assertIn("hikka-two", members)
 
 
 if __name__ == "__main__":

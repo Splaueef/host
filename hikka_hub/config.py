@@ -42,6 +42,9 @@ class Settings:
     offline_after_seconds: int
     module_updates_enabled: bool = True
     module_update_interval: int = 300
+    game_wait_ttl_seconds: int = 3600
+    game_active_ttl_seconds: int = 7 * 86400
+    chat_presence_ttl_seconds: int = 120
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -66,5 +69,14 @@ class Settings:
             ),
             module_update_interval=_integer(
                 "HIKKA_HUB_MODULE_UPDATE_INTERVAL", 300, 60, 86400
+            ),
+            game_wait_ttl_seconds=_integer(
+                "HIKKA_HUB_GAME_WAIT_TTL", 3600, 300, 86400
+            ),
+            game_active_ttl_seconds=_integer(
+                "HIKKA_HUB_GAME_ACTIVE_TTL", 7 * 86400, 3600, 31_536_000
+            ),
+            chat_presence_ttl_seconds=_integer(
+                "HIKKA_HUB_CHAT_PRESENCE_TTL", 120, 30, 3600
             ),
         )
