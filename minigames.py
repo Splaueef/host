@@ -1,10 +1,10 @@
 # meta developer: @Huai_Baike
-# meta version: 1.1.1
+# meta version: 1.1.2
 # meta description: Інтерактивні мініігри для чатів із кнопками та рейтингом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (1, 1, 1)
+__version__ = (1, 1, 2)
 
 import asyncio
 import contextlib
@@ -29,8 +29,8 @@ WIN_LINES = (
 )
 CHECKER_DIRECTIONS = ((-1, -1), (-1, 1), (1, -1), (1, 1))
 CHECKER_SYMBOLS = {1: "⚪", 2: "⚪👑", -1: "⚫", -2: "⚫👑"}
-CHECKER_LIGHT_CELL = "🟨"
-CHECKER_DARK_CELL = "🟫"
+CHECKER_LIGHT_CELL = ""
+CHECKER_DARK_CELL = ""
 CHECKER_SELECTED_CELL = "🟦"
 CHECKER_TARGET_CELL = "🟩"
 CHECKER_DRAW_PLY = 80
