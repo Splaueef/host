@@ -32,7 +32,7 @@ from .. import loader, utils
 
 
 logger = logging.getLogger(__name__)
-__version__ = (1, 0, 0)
+__version__ = (1, 1, 0)
 _PROTOCOL = "HIKKA-HUB-V1"
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$")
@@ -309,7 +309,7 @@ class HikkaNetMod(loader.Module):
     async def _ensure_session(self):
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                headers={"User-Agent": "HikkaNet/1.0 (Hikka module)"}
+                headers={"User-Agent": "HikkaNet/1.1 (Hikka module)"}
             )
 
     def _start_worker(self):
@@ -485,7 +485,14 @@ class HikkaNetMod(loader.Module):
                 "display_name": str(display_name)[:64],
                 "hikka_version": self._hikka_version(),
                 "module_version": ".".join(map(str, __version__)),
-                "capabilities": ["events", "kv", "metrics", "presence"],
+                "capabilities": [
+                    "events",
+                    "event_history",
+                    "kv",
+                    "metrics",
+                    "metrics_batch",
+                    "presence",
+                ],
             },
         )
 
@@ -515,7 +522,7 @@ class HikkaNetMod(loader.Module):
             },
         )
 
-    async def api_events(self, after_id=0, topic=None, limit=50):
+    async def api_events(self, after_id=0, topic=None, limit=50, latest=False):
         topic = _identifier(topic, "тема") if topic else None
         return await self._request(
             "GET",
@@ -524,6 +531,7 @@ class HikkaNetMod(loader.Module):
                 "after_id": max(0, int(after_id)),
                 "limit": max(1, min(int(limit), 200)),
                 "topic": topic,
+                "latest": 1 if latest else None,
             },
         )
 
@@ -590,6 +598,20 @@ class HikkaNetMod(loader.Module):
             "POST",
             f"/v1/metrics/{quote(metric, safe='')}/increment",
             payload={"delta": delta},
+        )
+
+    async def api_increment_many(self, metrics):
+        if not isinstance(metrics, dict) or not 1 <= len(metrics) <= 100:
+            raise ValueError("metrics повинен містити від 1 до 100 значень")
+        clean = {}
+        for metric, delta in metrics.items():
+            metric = _identifier(metric, "метрика")
+            delta = float(delta)
+            if not math.isfinite(delta) or not 0 < delta <= 10000:
+                raise ValueError("кожен delta повинен бути > 0 та ≤ 10000")
+            clean[metric] = delta
+        return await self._request(
+            "POST", "/v1/metrics/batch", payload={"metrics": clean}
         )
 
     async def api_stats(self, metric=None, limit=20):

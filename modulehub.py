@@ -1,13 +1,17 @@
 # meta developer: @Huai_Baike
-# meta version: 2.2.3
-# meta description: 🧭 Центр команд, конфігурації та встановлення модулів Hikka.
+# meta version: 3.0.0
+# meta description: 🧭 Центр команд, локальна шина та синхронізація статистики Hikka.
 # scope: inline
 # scope: hikka_only
 
+import asyncio
 import contextlib
 import inspect
+import json
 import logging
+import math
 import re
+import time
 from urllib.parse import urlparse
 
 from .. import loader, utils
@@ -30,6 +34,8 @@ class ModuleHubMod(loader.Module):
 
     PAGE_SIZE = 6
     CONFIG_PAGE_SIZE = 8
+    SYNC_INTERVAL = 60
+    SNAPSHOT_TTL = 300
     REPO_BASE = "https://github.com/Splaueef/host/raw/main"
     TRUSTED_INSTALL_HOSTS = {
         "github.com",
@@ -49,6 +55,7 @@ class ModuleHubMod(loader.Module):
         "math": "math.py",
         "werwolf": "rkapi.py",
         "hikkanet": "hikkanet.py",
+        "hikkanetchat": "hikkanetchat.py",
         "systemd": "systemd.py",
         "backup": "backup.py",
         "quiet": "quietschedule.py",
@@ -131,6 +138,12 @@ class ModuleHubMod(loader.Module):
             "name": "HikkaNet",
             "icon": "🌐",
             "description": "Захищені події, спільні дані й статистика між Hikka.",
+        },
+        "hikkanetchat": {
+            "class": "HikkaNetChatMod",
+            "name": "HikkaNetChat",
+            "icon": "💬",
+            "description": "Кімнати спілкування між авторизованими Hikka.",
         },
         "systemd": {
             "class": "SystemdMod",
@@ -222,7 +235,7 @@ class ModuleHubMod(loader.Module):
         ("📊 Статистика", ("contactstatus", "stats", "analysis")),
         ("🤖 AI та медіа", ("vdlt", "dailynews", "mistral", "gemma", "math")),
         ("🐺 RotKranz", ("werwolf",)),
-        ("🌐 Мережа Hikka", ("hikkanet",)),
+        ("🌐 Мережа Hikka", ("hikkanet", "hikkanetchat")),
         ("🛡 Адміністрування", ("groupadmin", "purge", "quiet")),
         ("🎮 Розваги", ("minigames",)),
         ("🎁 Подарунки", ("giftmonitor", "hiddengifts")),
@@ -287,6 +300,13 @@ class ModuleHubMod(loader.Module):
         "hknetput",
         "hknetdel",
         "hknetinc",
+        "hkchat",
+        "hkjoin",
+        "hkroom",
+        "hkleave",
+        "hknick",
+        "hksay",
+        "hkhistory",
         "я",
         "чат",
         "топ",
@@ -386,6 +406,11 @@ class ModuleHubMod(loader.Module):
         "hknetput",
         "hknetdel",
         "hknetinc",
+        "hkjoin",
+        "hkroom",
+        "hkleave",
+        "hknick",
+        "hksay",
         "нік",
         "переказ",
         "чатнік",
@@ -450,6 +475,7 @@ class ModuleHubMod(loader.Module):
         "hknetput",
         "hknetdel",
         "hknetinc",
+        "hknick",
         "нік",
         "чатнік",
         "mistralmode",
@@ -458,6 +484,303 @@ class ModuleHubMod(loader.Module):
 
     async def client_ready(self, client, db):
         self._client = client
+        self._ensure_bus_state()
+        self._sync_stop.clear()
+        self._sync_task = asyncio.create_task(
+            self._sync_worker(), name="modulehub-hikkanet-sync"
+        )
+
+    async def on_unload(self):
+        self._ensure_bus_state()
+        self._sync_stop.set()
+        if self._sync_task:
+            self._sync_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._sync_task
+        self._sync_task = None
+
+    def _ensure_bus_state(self):
+        if not hasattr(self, "_sync_stop"):
+            self._sync_stop = asyncio.Event()
+        if not hasattr(self, "_sync_task"):
+            self._sync_task = None
+        if not hasattr(self, "_last_sync"):
+            self._last_sync = 0
+        if not hasattr(self, "_last_sync_error"):
+            self._last_sync_error = ""
+
+    def _storage_get(self, key, default):
+        getter = getattr(self, "get", None)
+        if not callable(getter):
+            return default
+        value = getter(key, default)
+        return value
+
+    def _storage_set(self, key, value):
+        setter = getattr(self, "set", None)
+        if callable(setter):
+            setter(key, value)
+
+    @staticmethod
+    def _slug(value, fallback="other", maximum=32):
+        value = re.sub(r"[^a-z0-9_.-]+", "_", str(value or "").lower())
+        value = value.strip("_.-")[:maximum]
+        if not value or not value[0].isalpha():
+            value = f"x_{value}" if value else fallback
+        return value[:maximum]
+
+    def _bus_module_key(self, module):
+        if not isinstance(module, str):
+            key = self._module_key(module)
+            if key:
+                return key
+            module = self._module_name(module)
+        if module in self.MODULES:
+            return module
+        return self._slug(module, "external")
+
+    def report_stat(self, module, metric="events", delta=1):
+        """Record an aggregate module metric and queue it for HikkaNet.
+
+        This public API is intentionally synchronous so any module can call
+        ``self.lookup("ModuleHub").report_stat(self, "jobs.completed")``.
+        No message text, arguments, Telegram IDs or credentials are accepted.
+        """
+        try:
+            delta = float(delta)
+        except (TypeError, ValueError):
+            raise ValueError("delta повинен бути числом") from None
+        if not math.isfinite(delta) or not 0 < delta <= 10000:
+            raise ValueError("delta повинен бути > 0 та ≤ 10000")
+        module_key = self._bus_module_key(module)
+        metric_key = self._slug(metric, "events", 30)
+        now = int(time.time())
+
+        usage = self._storage_get("hub_usage", {})
+        usage = dict(usage) if isinstance(usage, dict) else {}
+        row = dict(usage.get(module_key, {}))
+        metrics = dict(row.get("metrics", {}))
+        metrics[metric_key] = float(metrics.get(metric_key, 0) or 0) + delta
+        row.update({"metrics": metrics, "last_used": now})
+        usage[module_key] = row
+        self._storage_set("hub_usage", usage)
+
+        pending = self._storage_get("hub_pending_metrics", {})
+        pending = dict(pending) if isinstance(pending, dict) else {}
+        network_key = f"module.{module_key[:24]}.{metric_key[:30]}"[:64]
+        pending[network_key] = float(pending.get(network_key, 0) or 0) + delta
+        self._storage_set("hub_pending_metrics", pending)
+        return metrics[metric_key]
+
+    # Explicit alias used by modules that prefer a namespaced integration API.
+    hub_report = report_stat
+
+    def local_stats(self):
+        value = self._storage_get("hub_usage", {})
+        return dict(value) if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _safe_snapshot(value, depth=0):
+        """Convert an exporter result to bounded aggregate-only JSON data."""
+        if depth > 5:
+            return None
+        if value is None or isinstance(value, (bool, int)):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, str):
+            return value[:160]
+        if isinstance(value, (list, tuple)):
+            return [ModuleHubMod._safe_snapshot(item, depth + 1) for item in value[:50]]
+        if isinstance(value, dict):
+            result = {}
+            blocked = {
+                "api_key",
+                "authorization",
+                "chat_id",
+                "cookie",
+                "key_secret",
+                "message",
+                "password",
+                "peer_id",
+                "phone",
+                "recipient_id",
+                "secret",
+                "sender_id",
+                "session",
+                "session_string",
+                "text",
+                "token",
+                "user_id",
+                "username",
+            }
+            for raw_key, item in list(value.items())[:100]:
+                key = str(raw_key)[:64]
+                lowered = key.lower()
+                if lowered in blocked or any(
+                    marker in lowered for marker in ("password", "secret", "token")
+                ):
+                    continue
+                result[key] = ModuleHubMod._safe_snapshot(item, depth + 1)
+            return result
+        return str(value)[:160]
+
+    async def _collect_snapshots(self):
+        usage = self.local_stats()
+        snapshots = {}
+        for key in self.MODULES:
+            module = self._find_module(key)
+            if module is None:
+                continue
+            row = {
+                "loaded": True,
+                "commands": len(getattr(module, "commands", {}) or {}),
+            }
+            local = usage.get(key)
+            if isinstance(local, dict):
+                row["usage"] = self._safe_snapshot(local)
+            exporter = getattr(module, "modulehub_stats", None)
+            if callable(exporter):
+                try:
+                    exported = exporter()
+                    if inspect.isawaitable(exported):
+                        exported = await asyncio.wait_for(exported, timeout=5)
+                    exported = self._safe_snapshot(exported)
+                    encoded = json.dumps(
+                        exported, ensure_ascii=False, allow_nan=False
+                    ).encode("utf-8")
+                    if len(encoded) <= 16384:
+                        row["snapshot"] = exported
+                except Exception:
+                    logger.exception("ModuleHub: %s stats exporter failed", key)
+            snapshots[key] = row
+        return snapshots
+
+    def _network_module(self):
+        module = self._find_module("hikkanet")
+        configured = getattr(module, "_configured", None) if module else None
+        if module is None or (callable(configured) and not configured()):
+            return None
+        return module
+
+    async def report_event(self, module, event, payload=None, ttl_seconds=86400):
+        """Publish one sanitized cross-Hikka event through the HikkaNet module."""
+        network = self._network_module()
+        if network is None:
+            raise RuntimeError("HikkaNet не налаштовано")
+        data = self._safe_snapshot(payload if payload is not None else {})
+        return await network.api_publish(
+            "module.events",
+            {
+                "module": self._bus_module_key(module),
+                "event": self._slug(event, "event"),
+                "data": data,
+                "created_at": int(time.time()),
+            },
+            ttl_seconds=ttl_seconds,
+        )
+
+    hub_event = report_event
+
+    def _take_metric_batch(self):
+        pending = self._storage_get("hub_pending_metrics", {})
+        pending = dict(pending) if isinstance(pending, dict) else {}
+        batch = {}
+        remainder = {}
+        for key, raw_value in pending.items():
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if value <= 0 or not math.isfinite(value):
+                continue
+            if len(batch) < 100:
+                sent = min(value, 10000)
+                batch[key] = sent
+                value -= sent
+            if value > 0:
+                remainder[key] = value
+        self._storage_set("hub_pending_metrics", remainder)
+        return batch
+
+    def _restore_metric_batch(self, batch):
+        pending = self._storage_get("hub_pending_metrics", {})
+        pending = dict(pending) if isinstance(pending, dict) else {}
+        for key, value in batch.items():
+            pending[key] = float(pending.get(key, 0) or 0) + float(value)
+        self._storage_set("hub_pending_metrics", pending)
+
+    async def sync_stats(self):
+        """Upload pending metrics and a short-lived snapshot via HikkaNet."""
+        self._ensure_bus_state()
+        network = self._network_module()
+        if network is None:
+            raise RuntimeError("HikkaNet не налаштовано")
+        batch = self._take_metric_batch()
+        if batch:
+            try:
+                await network.api_increment_many(batch)
+            except Exception:
+                self._restore_metric_batch(batch)
+                raise
+        instance_id = str(network.config["instance_id"]).strip().lower()
+        item_key = self._slug(instance_id, "hikka", 64)
+        snapshot = {
+            "schema": 1,
+            "generated_at": int(time.time()),
+            "modules": await self._collect_snapshots(),
+        }
+        await network.api_put(
+            "module_stats",
+            item_key,
+            snapshot,
+            ttl_seconds=self.SNAPSHOT_TTL,
+        )
+        self._last_sync = snapshot["generated_at"]
+        self._last_sync_error = ""
+        return snapshot
+
+    async def _sync_worker(self):
+        await self._wait_for_sync(15)
+        while not self._sync_stop.is_set():
+            try:
+                if self._network_module() is not None:
+                    await self.sync_stats()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._last_sync_error = str(error).replace("\n", " ")[:240]
+                logger.warning("ModuleHub HikkaNet sync failed: %s", self._last_sync_error)
+            await self._wait_for_sync(self.SYNC_INTERVAL)
+
+    async def _wait_for_sync(self, seconds):
+        try:
+            await asyncio.wait_for(self._sync_stop.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
+
+    async def watcher(self, message):
+        """Count command use for every loaded module without storing arguments."""
+        if not getattr(message, "out", False):
+            return
+        text = getattr(message, "raw_text", None) or getattr(message, "text", None)
+        prefix = str(self.get_prefix())
+        if not isinstance(text, str) or not text.startswith(prefix):
+            return
+        command = text[len(prefix) :].split(maxsplit=1)[0].lower()
+        if not command:
+            return
+        handler = getattr(self.allmodules, "commands", {}).get(command)
+        module = getattr(handler, "__self__", None) if handler else None
+        if module is None:
+            for candidate in getattr(self.allmodules, "modules", []):
+                if command in (getattr(candidate, "commands", {}) or {}):
+                    module = candidate
+                    break
+        if module is None:
+            return
+        self.report_stat(module, "commands", 1)
+        self.report_stat(module, f"command.{command}", 1)
 
     @staticmethod
     def _chunks(items, size=2):

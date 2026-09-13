@@ -9,6 +9,7 @@ gift_monitor
 group_admin
 hidden_gifts
 hikkanet
+hikkanetchat
 math
 messagescheduler
 minigames

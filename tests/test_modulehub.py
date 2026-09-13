@@ -9,6 +9,14 @@ import unittest
 
 
 class _Module:
+    def get(self, key, default=None):
+        return getattr(self, "_storage", {}).get(key, default)
+
+    def set(self, key, value):
+        if not hasattr(self, "_storage"):
+            self._storage = {}
+        self._storage[key] = value
+
     def get_prefix(self):
         return "."
 
@@ -228,6 +236,7 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
             "alwaysonline": ("alwaysonline.py", "AlwaysOnlineMod"),
             "giftmonitor": ("gift_monitor.py", "GiftMonitorMod"),
             "hikkanet": ("hikkanet.py", "HikkaNetMod"),
+            "hikkanetchat": ("hikkanetchat.py", "HikkaNetChatMod"),
         }
         for key, (filename, class_name) in expected.items():
             self.assertEqual(self.module.REPO_FILES[key], filename)
@@ -237,6 +246,58 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("go", self.module.SAFE_EMPTY)
         self.assertIn("go9", self.module.SAFE_EMPTY)
         self.assertIn("go13", self.module.SAFE_EMPTY)
+
+    async def test_watcher_counts_module_and_command_without_arguments(self):
+        games = _loaded("MiniGamesMod", {"rps": _handler("Гра")})
+        self.module.allmodules.modules = [games]
+        self.module.allmodules.commands = {"rps": games.commands["rps"]}
+        message = types.SimpleNamespace(
+            out=True, text=".rps super-secret-argument", raw_text=None
+        )
+
+        await self.module.watcher(message)
+
+        stored = self.module.local_stats()["minigames"]["metrics"]
+        self.assertEqual(stored["commands"], 1)
+        self.assertEqual(stored["command.rps"], 1)
+        self.assertNotIn("super-secret-argument", repr(self.module._storage))
+
+    async def test_sync_batches_metrics_and_exports_sanitized_snapshots(self):
+        network = _loaded("HikkaNetMod", {})
+        network.config = {"instance_id": "hikka-main"}
+        network._configured = lambda: True
+        network.batches = []
+        network.items = []
+
+        async def increment_many(metrics):
+            network.batches.append(metrics)
+            return {"metrics": metrics}
+
+        async def put(namespace, key, value, ttl_seconds=None):
+            network.items.append((namespace, key, value, ttl_seconds))
+            return {"revision": 1}
+
+        network.api_increment_many = increment_many
+        network.api_put = put
+        games = _loaded("MiniGamesMod", {})
+        games.modulehub_stats = lambda: {
+            "games_completed": 7,
+            "user_id": 123,
+            "nested": {"secret": "must-not-leak"},
+        }
+        self.module.allmodules.modules = [network, games]
+        self.module.report_stat(games, "games.completed", 2)
+
+        snapshot = await self.module.sync_stats()
+
+        self.assertEqual(
+            network.batches, [{"module.minigames.games.completed": 2.0}]
+        )
+        self.assertEqual(network.items[0][0:2], ("module_stats", "hikka-main"))
+        exported = snapshot["modules"]["minigames"]["snapshot"]
+        self.assertEqual(exported["games_completed"], 7)
+        self.assertNotIn("user_id", exported)
+        self.assertNotIn("secret", exported["nested"])
 
     async def test_menu_is_owner_only_and_contains_search(self):
         self.module.inline = _Inline()

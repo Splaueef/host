@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 1.5.0
+# meta version: 1.6.0
 # meta description: 📊 Статистика вашої активності в Telegram — повідомлення, чати, піки по годинах.
 
 import datetime
@@ -426,6 +426,32 @@ class DailyStatMod(loader.Module):
                     target["sent_hours"][h] += info["sent_hours"][h]
                     target["received_hours"][h] += info["received_hours"][h]
         return merged
+
+    @staticmethod
+    def _modulehub_period(data):
+        active_chats = {
+            key for key, row in data["chats"].items() if row.get("count", 0) > 0
+        }
+        active_chats.update(
+            key for key, row in data["senders"].items() if row.get("count", 0) > 0
+        )
+        sent = int(data.get("sent", 0) or 0)
+        received = int(data.get("received", 0) or 0)
+        return {
+            "sent": sent,
+            "received": received,
+            "total": sent + received,
+            "media": int(data.get("media", 0) or 0),
+            "active_chats": len(active_chats),
+        }
+
+    def modulehub_stats(self):
+        """Aggregate-only snapshot for ModuleHub/HikkaNet synchronization."""
+        return {
+            "today": self._modulehub_period(self._get_day(self._today_key())),
+            "week": self._modulehub_period(self._merge_days(self._week_keys())),
+            "month": self._modulehub_period(self._merge_days(self._month_keys())),
+        }
 
     def _peak_hour(self, hours: list) -> str:
         mx = max(hours, default=0)

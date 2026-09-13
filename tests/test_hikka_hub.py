@@ -178,6 +178,29 @@ class HikkaHubApiTests(unittest.IsolatedAsyncioTestCase):
         response = await self._request("GET", target, who="two")
         self.assertEqual((await response.json())["data"]["events"], [])
 
+    async def test_latest_events_returns_tail_in_chronological_order(self):
+        ids = []
+        for number in range(4):
+            response = await self._request(
+                "POST",
+                "/v1/events",
+                {
+                    "topic": "chat.lobby",
+                    "payload": {"number": number},
+                    "ttl_seconds": 600,
+                },
+            )
+            ids.append((await response.json())["data"]["id"])
+
+        target = "/v1/events?after_id=0&latest=1&limit=2&topic=chat.lobby"
+        response = await self._request("GET", target, who="two")
+        data = (await response.json())["data"]
+
+        self.assertEqual([item["id"] for item in data["events"]], ids[-2:])
+        self.assertEqual(
+            [item["payload"]["number"] for item in data["events"]], [2, 3]
+        )
+
     async def test_kv_is_shared_but_only_creator_can_modify(self):
         path = "/v1/kv/config/release"
         response = await self._request("PUT", path, {"value": {"stable": 3}})
@@ -218,7 +241,28 @@ class HikkaHubApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(overview["today"]["requests"], 1)
         self.assertEqual(overview["instances"]["total"], 2)
 
+    async def test_metric_batch_is_atomic_and_validated(self):
+        response = await self._request(
+            "POST",
+            "/v1/metrics/batch",
+            {"metrics": {"module.games.commands": 2, "module.games.finished": 3}},
+        )
+        self.assertEqual(response.status, 200)
+        values = (await response.json())["data"]["metrics"]
+        self.assertEqual(values["module.games.commands"]["value"], 2)
+        self.assertEqual(values["module.games.finished"]["value"], 3)
+
+        response = await self._request(
+            "POST",
+            "/v1/metrics/batch",
+            {"metrics": {"module.games.commands": 1, "Bad metric": 2}},
+        )
+        self.assertEqual(response.status, 400)
+        response = await self._request(
+            "GET", "/v1/stats/module.games.commands", who="two"
+        )
+        self.assertEqual((await response.json())["data"]["total"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
-

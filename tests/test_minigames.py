@@ -122,6 +122,27 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.module._winner_ttt([0, None, None, None, 0, None, None, None, 0]), 0)
         self.assertIsNone(self.module._winner_ttt([0, 1, 0, 1, 0, 1, 1, 0, 1]))
 
+    def test_finished_games_have_aggregate_modulehub_snapshot(self):
+        reported = []
+        hub = types.SimpleNamespace(
+            report_stat=lambda module, metric, delta: reported.append((metric, delta))
+        )
+        self.module.lookup = lambda name: hub if name == "ModuleHub" else None
+        session = {
+            "kind": "rps",
+            "chat_id": -100,
+            "players": [1, 2],
+            "names": {"1": "Host", "2": "Guest"},
+        }
+
+        self.module._record_result(session, [1])
+        snapshot = self.module.modulehub_stats()
+
+        self.assertEqual(snapshot["games_completed"], 1)
+        self.assertEqual(snapshot["by_game"]["rps"]["completed"], 1)
+        self.assertIn(("games.completed", 1), reported)
+        self.assertNotIn("chat_id", repr(snapshot))
+
     def test_checkers_initial_board_has_twelve_pieces_per_side(self):
         board = self.module._checker_initial_board()
 

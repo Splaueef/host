@@ -109,6 +109,17 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.module = stats.DailyStatMod()
         self.module._init_storage()
 
+    def test_modulehub_snapshot_contains_aggregates_but_no_chat_records(self):
+        self.module._record_message(123, "Private Name", False, hour=10)
+        self.module._record_received(123, "Private Name", hour=11)
+
+        snapshot = self.module.modulehub_stats()
+
+        self.assertEqual(snapshot["today"]["total"], 2)
+        self.assertEqual(snapshot["today"]["active_chats"], 1)
+        self.assertNotIn("Private Name", repr(snapshot))
+        self.assertNotIn("123", repr(snapshot))
+
     async def test_private_user_and_bot_messages_are_counted_by_sender(self):
         alice = types.SimpleNamespace(id=1, first_name="Alice", username="alice")
         bot = types.SimpleNamespace(id=2, first_name="Helper Bot", bot=True)
