@@ -1,0 +1,26 @@
+services:
+  hikka-hub:
+    build: .
+    image: hikka-hub:1.0.0
+    container_name: hikka-hub
+    restart: unless-stopped
+    ports:
+      - "${HIKKA_HUB_LISTEN_IP:-127.0.0.1}:${HIKKA_HUB_PUBLIC_PORT:-8765}:8765"
+    environment:
+      HIKKA_HUB_BIND: 0.0.0.0
+      HIKKA_HUB_PORT: 8765
+      HIKKA_HUB_DATABASE: /data/hikka-hub.sqlite3
+      HIKKA_HUB_MAX_CLOCK_SKEW: "90"
+      HIKKA_HUB_RATE_LIMIT: "120"
+      HIKKA_HUB_BODY_LIMIT: "131072"
+      HIKKA_HUB_EVENT_RETENTION_HOURS: "168"
+      HIKKA_HUB_OFFLINE_AFTER: "120"
+    volumes:
+      - hikka_hub_data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  hikka_hub_data:
