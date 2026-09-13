@@ -125,6 +125,7 @@ class HikkaNetHelperTests(unittest.TestCase):
             "api_put",
             "api_delete",
             "api_increment",
+            "api_increment_many",
             "api_stats",
         ):
             self.assertTrue(callable(getattr(module, method)))

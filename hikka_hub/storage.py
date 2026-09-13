@@ -236,13 +236,39 @@ class Store:
         return await self._run(operation)
 
     async def list_events(
-        self, after_id: int, topic: Optional[str], limit: int
+        self,
+        after_id: int,
+        topic: Optional[str],
+        limit: int,
+        latest: bool = False,
     ) -> list[dict[str, Any]]:
         now = int(time.time())
 
         def operation():
             self._db.execute("DELETE FROM events WHERE expires_at < ?", (now,))
-            if topic:
+            if latest:
+                if topic:
+                    rows = self._db.execute(
+                        """
+                        SELECT id, topic, sender_instance_id, payload_json,
+                               created_at, expires_at
+                        FROM events WHERE topic=? AND expires_at >= ?
+                        ORDER BY id DESC LIMIT ?
+                        """,
+                        (topic, now, limit),
+                    ).fetchall()
+                else:
+                    rows = self._db.execute(
+                        """
+                        SELECT id, topic, sender_instance_id, payload_json,
+                               created_at, expires_at
+                        FROM events WHERE expires_at >= ?
+                        ORDER BY id DESC LIMIT ?
+                        """,
+                        (now, limit),
+                    ).fetchall()
+                rows = list(reversed(rows))
+            elif topic:
                 rows = self._db.execute(
                     """
                     SELECT id, topic, sender_instance_id, payload_json, created_at, expires_at
@@ -409,6 +435,50 @@ class Store:
                 (instance_id, metric),
             ).fetchone()
             return dict(row)
+
+        return await self._run(operation)
+
+    async def increment_metrics(
+        self, instance_id: str, metrics: dict[str, float]
+    ) -> dict[str, dict[str, Any]]:
+        """Increment several metrics atomically in one SQLite transaction."""
+        now = int(time.time())
+
+        def operation():
+            result = {}
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                for metric, delta in metrics.items():
+                    self._db.execute(
+                        """
+                        INSERT INTO metrics(instance_id, metric, value, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(instance_id, metric) DO UPDATE SET
+                            value=value + excluded.value,
+                            updated_at=excluded.updated_at
+                        """,
+                        (instance_id, metric, delta, now),
+                    )
+                placeholders = ",".join("?" for _ in metrics)
+                rows = self._db.execute(
+                    f"""
+                    SELECT metric, value, updated_at FROM metrics
+                    WHERE instance_id=? AND metric IN ({placeholders})
+                    """,
+                    (instance_id, *metrics),
+                ).fetchall()
+                result = {
+                    row["metric"]: {
+                        "value": row["value"],
+                        "updated_at": row["updated_at"],
+                    }
+                    for row in rows
+                }
+                self._db.execute("COMMIT")
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+            return result
 
         return await self._run(operation)
 

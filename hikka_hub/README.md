@@ -11,9 +11,11 @@
 - heartbeat і стан online/offline для кожної Hikka;
 - список зареєстрованих вузлів без публікації секретів або Telegram session;
 - шина подій із темами, cursor та автоматичним TTL;
+- читання останніх подій для історії кімнат;
 - спільне key/value-сховище JSON із namespace, TTL і revision;
 - запис може змінити або видалити лише Hikka, яка створила ключ;
 - власні числові метрики та рейтинги між Hikka;
+- атомарне пакетне додавання до 100 метрик за один запит;
 - автоматична статистика запитів, heartbeat, подій і записів;
 - локальна CLI для створення, відкликання, повторного ввімкнення й ротації ключів;
 - SQLite WAL, очищення прострочених даних, ліміти запитів і розміру body.
@@ -215,14 +217,34 @@ await hub.api_publish("deploy", {"version": "2.1.0"})
 release = await hub.api_get("releases", "stable")
 await hub.api_put("status", "worker-1", {"ready": True}, ttl_seconds=300)
 await hub.api_increment("jobs.completed")
+await hub.api_increment_many({"jobs.completed": 2, "jobs.failed": 1})
 events = await hub.api_events(after_id=0, topic="deploy", limit=50)
+latest = await hub.api_events(topic="chat.lobby", limit=20, latest=True)
 stats = await hub.api_stats("jobs.completed")
 nodes = await hub.api_instances()
 ```
 
 Доступні методи: `api_publish`, `api_events`, `api_instances`, `api_get`,
-`api_put`, `api_delete`, `api_increment` та `api_stats`. Вони проходять ту саму
-валідацію, перевірку чутливих полів і захищений підпис, що й команди модуля.
+`api_put`, `api_delete`, `api_increment`, `api_increment_many` та `api_stats`.
+Вони проходять ту саму валідацію, перевірку чутливих полів і захищений підпис,
+що й команди модуля.
+
+Рекомендований шлях для модулів репозиторію — `ModuleHub`: він збирає локальні
+лічильники, надсилає їх одним batch-запитом щохвилини та оновлює snapshot
+поточного вузла в namespace `module_stats`.
+
+```python
+module_hub = self.lookup("ModuleHub")
+if module_hub:
+    module_hub.report_stat(self, "jobs.completed")
+
+def modulehub_stats(self):
+    return {"completed": 42, "queued": 3}  # тільки агрегати, без ID/текстів
+```
+
+Окремий `hikkanetchat.py` використовує event-теми `chat.<room>` для кімнат.
+Команди: `.hkchat`, `.hkjoin`, `.hkroom`, `.hkleave`, `.hknick`, `.hksay` та
+`.hkhistory`.
 
 ## API v1
 
@@ -234,9 +256,10 @@ nodes = await hub.api_instances()
 | `POST /v1/heartbeat` | оновити присутність та capabilities |
 | `GET /v1/instances` | список вузлів |
 | `POST /v1/events` | опублікувати подію |
-| `GET /v1/events` | прочитати події після cursor |
+| `GET /v1/events` | події після cursor або останні з `latest=1` |
 | `PUT/GET/DELETE /v1/kv/{namespace}/{key}` | спільний запис |
 | `GET /v1/kv/{namespace}` | список записів namespace |
 | `POST /v1/metrics/{metric}/increment` | збільшити метрику |
+| `POST /v1/metrics/batch` | атомарно збільшити до 100 метрик |
 | `GET /v1/stats/{metric}` | рейтинг метрики |
 | `GET /v1/stats` | загальна статистика сервісу |

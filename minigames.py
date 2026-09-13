@@ -1,10 +1,10 @@
 # meta developer: @Huai_Baike
-# meta version: 1.3.0
+# meta version: 1.4.0
 # meta description: Інтерактивні мініігри для чатів із кнопками та рейтингом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (1, 3, 0)
+__version__ = (1, 4, 0)
 
 import asyncio
 import contextlib
@@ -2254,6 +2254,41 @@ class MiniGamesMod(loader.Module):
             row["draws"] = int(row.get("draws", 0)) + (1 if is_draw_player else 0)
             row["name"] = session["names"].get(key, row.get("name") or f"ID {user_id}")
         self.set("game_stats", stats)
+
+        kind = str(session.get("kind") or "other").lower()
+        totals = self.get("game_totals", {})
+        totals = dict(totals) if isinstance(totals, dict) else {}
+        total = dict(totals.get(kind, {}))
+        total["completed"] = int(total.get("completed", 0) or 0) + 1
+        total["draws"] = int(total.get("draws", 0) or 0) + (1 if draw else 0)
+        totals[kind] = total
+        self.set("game_totals", totals)
+        with contextlib.suppress(Exception):
+            hub = self.lookup("ModuleHub")
+            if hub is not None:
+                hub.report_stat(self, "games.completed", 1)
+                hub.report_stat(self, f"game.{kind}", 1)
+
+    def modulehub_stats(self):
+        """Return aggregate game data without chat or player identifiers."""
+        raw = self.get("game_totals", {})
+        raw = raw if isinstance(raw, dict) else {}
+        by_game = {}
+        for kind, value in raw.items():
+            if not isinstance(value, dict):
+                continue
+            by_game[str(kind)[:24]] = {
+                "completed": max(0, int(value.get("completed", 0) or 0)),
+                "draws": max(0, int(value.get("draws", 0) or 0)),
+            }
+        return {
+            "games_completed": sum(item["completed"] for item in by_game.values()),
+            "draws": sum(item["draws"] for item in by_game.values()),
+            "active_games": sum(
+                1 for session in self._sessions.values() if not session.get("finished")
+            ),
+            "by_game": by_game,
+        }
 
     def _top_text(self, chat_id):
         rows = list(self._stats().get(str(chat_id), {}).values())

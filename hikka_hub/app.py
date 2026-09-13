@@ -261,6 +261,18 @@ def _query_int(
     return value
 
 
+def _query_bool(request: web.Request, name: str, default: bool = False) -> bool:
+    raw = request.query.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ApiError(400, "invalid_query", f"{name} must be a boolean")
+
+
 async def root(request: web.Request) -> web.Response:
     return _response(
         {
@@ -349,9 +361,12 @@ async def publish_event(request: web.Request) -> web.Response:
 async def get_events(request: web.Request) -> web.Response:
     after_id = _query_int(request, "after_id", 0, 0, 2**63 - 1)
     limit = _query_int(request, "limit", 50, 1, 200)
+    latest = _query_bool(request, "latest")
     topic = request.query.get("topic")
     topic = _identifier(topic, "topic") if topic else None
-    events = await request.app[STORE_KEY].list_events(after_id, topic, limit)
+    events = await request.app[STORE_KEY].list_events(
+        after_id, topic, limit, latest=latest
+    )
     return _response(
         {
             "events": events,
@@ -448,6 +463,31 @@ async def increment_metric(request: web.Request) -> web.Response:
     return _response({"metric": metric, **result})
 
 
+async def increment_metrics(request: web.Request) -> web.Response:
+    payload = await _json_object(request)
+    raw_metrics = payload.get("metrics")
+    if not isinstance(raw_metrics, dict) or not 1 <= len(raw_metrics) <= 100:
+        raise ApiError(400, "invalid_field", "metrics must contain 1..100 items")
+    metrics = {}
+    for raw_metric, raw_delta in raw_metrics.items():
+        metric = _identifier(raw_metric, "metric")
+        try:
+            delta = float(raw_delta)
+        except (TypeError, ValueError):
+            raise ApiError(400, "invalid_field", "metric delta must be numeric") from None
+        if not math.isfinite(delta) or not 0 < delta <= 10000:
+            raise ApiError(
+                400,
+                "invalid_field",
+                "metric delta must be greater than 0 and at most 10000",
+            )
+        metrics[metric] = delta
+    values = await request.app[STORE_KEY].increment_metrics(
+        request["credential"]["instance_id"], metrics
+    )
+    return _response({"metrics": values})
+
+
 async def metric_stats(request: web.Request) -> web.Response:
     metric = _identifier(request.match_info["metric"], "metric")
     limit = _query_int(request, "limit", 20, 1, 100)
@@ -508,6 +548,7 @@ def create_app(
             web.get("/v1/kv/{namespace}/{item_key}", get_item),
             web.delete("/v1/kv/{namespace}/{item_key}", delete_item),
             web.get("/v1/kv/{namespace}", list_items),
+            web.post("/v1/metrics/batch", increment_metrics),
             web.post("/v1/metrics/{metric}/increment", increment_metric),
             web.get("/v1/stats/{metric}", metric_stats),
             web.get("/v1/stats", overview),
