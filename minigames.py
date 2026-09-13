@@ -1,10 +1,10 @@
 # meta developer: @Huai_Baike
-# meta version: 2.0.0
+# meta version: 2.1.0
 # meta description: Локальні та глобальні HikkaNet-ігри з рейтингом і матчмейкінгом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (2, 0, 0)
+__version__ = (2, 1, 0)
 
 import asyncio
 import contextlib
@@ -71,10 +71,12 @@ CHESS_KNIGHT_STEPS = (
 )
 CHESS_ORTHOGONAL = ((-1, 0), (1, 0), (0, -1), (0, 1))
 CHESS_DIAGONAL = ((-1, -1), (-1, 1), (1, -1), (1, 1))
-CHESS_EMPTY_CELL = "∙"
-CHESS_SELECTED_CELL = "🟦"
-CHESS_TARGET_CELL = "🟩"
-CHESS_CAPTURE_CELL = "🟥"
+CHESS_FILES = "abcdefgh"
+CHESS_LIGHT_CELL = "·"
+CHESS_DARK_CELL = "•"
+CHESS_SELECTED_CELL = "🔷"
+CHESS_TARGET_CELL = "🟢"
+CHESS_CAPTURE_CELL = "🔴"
 GO_COLUMNS = "ABCDEFGHJKLMNOPQRSTUVWXYZ"
 GO_STONES = {1: "●", -1: "○"}
 GO_LAST_STONES = {1: "◆", -1: "◇"}
@@ -248,6 +250,7 @@ class MiniGamesMod(loader.Module):
                     view["selected"] = None
                     view["selected_row"] = None
                     view["promotion"] = None
+                    view["finish_confirm"] = None
                     handle = view.get("handle")
                     if handle is not None and callable(getattr(handle, "edit", None)):
                         with contextlib.suppress(Exception):
@@ -403,6 +406,8 @@ class MiniGamesMod(loader.Module):
                 promotion=None,
                 last_move=None,
                 position_counts={},
+                board_flipped=False,
+                finish_confirm=None,
             )
             key = self._chess_position_key(session)
             session["position_counts"][key] = 1
@@ -1411,11 +1416,13 @@ class MiniGamesMod(loader.Module):
     def _render_chess(self, session):
         white, black = session["players"]
         black_name = self._name(session, black) if black else "очікується суперник"
+        flipped = bool(session.get("board_flipped"))
         lines = [
             "♟ <b>Шахи · 8×8</b>",
             "",
             f"♔ {self._name(session, white)}",
             f"♚ {black_name}",
+            f"Орієнтація: <b>{'чорні знизу' if flipped else 'білі знизу'}</b>",
             "",
         ]
         if session["winner"] is not None:
@@ -1435,10 +1442,12 @@ class MiniGamesMod(loader.Module):
             lines.append(f"Хід: <b>{turn_name}</b>")
             if session.get("promotion"):
                 lines.append("👑 <b>Оберіть фігуру для перетворення пішака.</b>")
+            elif session.get("finish_confirm") is not None:
+                lines.append("⚠️ <b>Підтвердіть завершення партії нижче.</b>")
             elif session["selected"] is not None:
                 lines.append(
                     f"🔹 Обрано: <b>{self._chess_coordinate(session['selected'])}</b> · "
-                    "🟩 хід · 🟥 взяття"
+                    "🟢 хід · 🔴 взяття"
                 )
             if self._chess_in_check(session["board"], session["turn"]):
                 lines.append("⚠️ <b>Шах королю.</b>")
@@ -1447,10 +1456,42 @@ class MiniGamesMod(loader.Module):
         lines.extend(
             (
                 "",
-                "<i>Натисніть свою фігуру, потім підсвічену клітинку.</i>",
+                "💡 <i>Натисніть фігуру, потім клітинку, куди вона має піти. "
+                "Дошку можна перевернути кнопкою нижче.</i>",
             )
         )
         return "\n".join(lines)
+
+    @staticmethod
+    def _chess_display_axes(session):
+        if session.get("board_flipped"):
+            return range(7, -1, -1), range(7, -1, -1), CHESS_FILES[::-1]
+        return range(8), range(8), CHESS_FILES
+
+    @staticmethod
+    def _chess_cell_text(session, row, column, display_column, legal):
+        position = row * 8 + column
+        piece = session["board"][position]
+        special = legal.get(position)
+        piece_symbol = CHESS_SYMBOLS.get(piece, "")
+        if position == session["selected"]:
+            symbol = CHESS_SELECTED_CELL + piece_symbol
+        elif position in legal:
+            symbol = (
+                CHESS_CAPTURE_CELL + piece_symbol
+                if piece or special == "en_passant"
+                else CHESS_TARGET_CELL
+            )
+        else:
+            symbol = piece_symbol or (
+                CHESS_LIGHT_CELL if (row + column) % 2 == 0 else CHESS_DARK_CELL
+            )
+        rank = str(8 - row)
+        if display_column == 0:
+            return f"{rank} {symbol}"
+        if display_column == 7:
+            return f"{symbol} {rank}"
+        return symbol
 
     def _markup_chess(self, token, session):
         legal = {}
@@ -1468,31 +1509,31 @@ class MiniGamesMod(loader.Module):
                     session["en_passant"],
                 )
             )
-        rows = []
-        for row in range(8):
+        row_order, column_order, files = self._chess_display_axes(session)
+        coordinate_row = [
+            {
+                "text": letter,
+                "callback": self._chess_coordinates,
+                "args": (token,),
+            }
+            for letter in files
+        ]
+        rows = [coordinate_row]
+        for row in row_order:
             buttons = []
-            for column in range(8):
+            for display_column, column in enumerate(column_order):
                 position = self._chess_index(row, column)
-                piece = session["board"][position]
-                special = legal.get(position)
-                if position == session["selected"]:
-                    symbol = CHESS_SELECTED_CELL
-                elif position in legal:
-                    symbol = (
-                        CHESS_CAPTURE_CELL
-                        if piece or special == "en_passant"
-                        else CHESS_TARGET_CELL
-                    )
-                else:
-                    symbol = CHESS_SYMBOLS.get(piece, CHESS_EMPTY_CELL)
                 buttons.append(
                     {
-                        "text": symbol,
+                        "text": self._chess_cell_text(
+                            session, row, column, display_column, legal
+                        ),
                         "callback": self._chess_click,
                         "args": (token, position),
                     }
                 )
             rows.append(buttons)
+        rows.append([dict(button) for button in coordinate_row])
         if session.get("promotion") and not session["finished"]:
             side = int(session["promotion"]["side"])
             labels = {"q": "Ферзь", "r": "Тура", "b": "Слон", "n": "Кінь"}
@@ -1511,11 +1552,118 @@ class MiniGamesMod(loader.Module):
         else:
             rows.append(
                 [
-                    {"text": "🏳 Здатися", "callback": self._chess_resign, "args": (token,)},
-                    {"text": "✖️ Закрити", "callback": self._close, "args": (token,)},
+                    {
+                        "text": "↻ Перевернути дошку",
+                        "callback": self._chess_flip,
+                        "args": (token,),
+                    },
+                    {
+                        "text": "↶ Хід назад",
+                        "callback": self._chess_undo_info,
+                        "args": (token,),
+                    },
                 ]
             )
+            if session.get("finish_confirm") is not None:
+                rows.append(
+                    [
+                        {
+                            "text": "🏳 Так, здатися",
+                            "callback": self._chess_confirm_resign,
+                            "args": (token,),
+                        },
+                        {
+                            "text": "↩ Продовжити гру",
+                            "callback": self._chess_cancel_finish,
+                            "args": (token,),
+                        },
+                    ]
+                )
+            else:
+                rows.append(
+                    [
+                        {
+                            "text": "🏳 Завершити партію",
+                            "callback": self._chess_finish_prompt,
+                            "args": (token,),
+                        }
+                    ]
+                )
         return rows
+
+    async def _chess_coordinates(self, call, token):
+        session = self._session(token)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        await call.answer(
+            "Координати: літери — стовпці, цифри — горизонталі."
+        )
+
+    async def _chess_flip(self, call, token):
+        session = self._session(token)
+        user_id, _ = self._actor(call)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        if user_id not in [player for player in session.get("players", []) if player]:
+            await call.answer(self.strings["not_yours"], show_alert=True)
+            return
+        session["board_flipped"] = not bool(session.get("board_flipped"))
+        await call.edit(self._render(token), reply_markup=self._markup(token))
+        await call.answer("Дошку перевернуто")
+
+    async def _chess_undo_info(self, call, token):
+        session = self._session(token)
+        user_id, _ = self._actor(call)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        if user_id not in [player for player in session.get("players", []) if player]:
+            await call.answer(self.strings["not_yours"], show_alert=True)
+            return
+        await call.answer(
+            "Підтверджені ходи не скасовуються — так суперник не може переписати партію.",
+            show_alert=True,
+        )
+
+    async def _chess_finish_prompt(self, call, token):
+        session = self._session(token)
+        user_id, _ = self._actor(call)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        if user_id not in [player for player in session.get("players", []) if player]:
+            await call.answer(self.strings["not_yours"], show_alert=True)
+            return
+        if session["finished"]:
+            await call.answer("Партію вже завершено")
+            return
+        session["finish_confirm"] = user_id
+        await call.edit(self._render(token), reply_markup=self._markup(token))
+
+    async def _chess_cancel_finish(self, call, token):
+        session = self._session(token)
+        user_id, _ = self._actor(call)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        if session.get("finish_confirm") != user_id:
+            await call.answer(self.strings["not_yours"], show_alert=True)
+            return
+        session["finish_confirm"] = None
+        await call.edit(self._render(token), reply_markup=self._markup(token))
+
+    async def _chess_confirm_resign(self, call, token):
+        session = self._session(token)
+        user_id, _ = self._actor(call)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        if session.get("finish_confirm") != user_id:
+            await call.answer(self.strings["not_yours"], show_alert=True)
+            return
+        await self._chess_resign(call, token)
 
     async def _chess_click(self, call, token, position):
         session = self._session(token)
@@ -1570,6 +1718,7 @@ class MiniGamesMod(loader.Module):
                 )
                 return
 
+            session["finish_confirm"] = None
             clicked_piece = board[position]
             if self._chess_side(clicked_piece) == side:
                 moves = self._chess_legal_moves(
@@ -1661,6 +1810,7 @@ class MiniGamesMod(loader.Module):
             promoted = choice.upper() if side == 0 else choice
             session["board"][position] = promoted
             session["last_move"] += f"={CHESS_SYMBOLS[promoted]}"
+            session["finish_confirm"] = None
             self._chess_finish_turn(session, side)
             labels = {"q": "ферзя", "r": "туру", "b": "слона", "n": "коня"}
             await call.answer(f"Пішака перетворено на {labels[choice]}")
@@ -1689,6 +1839,7 @@ class MiniGamesMod(loader.Module):
                 return
             session["winner"] = opponents[0]
             session["finish_reason"] = "resignation"
+            session["finish_confirm"] = None
             session["finished"] = True
             self._record_result(session, [opponents[0]])
             await call.edit(
@@ -2528,6 +2679,8 @@ class MiniGamesMod(loader.Module):
             "selected": None,
             "selected_row": None,
             "promotion": None,
+            "board_flipped": game.get("my_slot") == 1,
+            "finish_confirm": None,
             "handle": handle,
             "created_at": time.monotonic(),
         }
@@ -2583,10 +2736,13 @@ class MiniGamesMod(loader.Module):
             chat_id=0,
             selected=view.get("selected"),
             selected_row=view.get("selected_row"),
+            board_flipped=bool(view.get("board_flipped")),
+            finish_confirm=view.get("finish_confirm"),
         )
         if game.get("kind") == "chess":
             state["castling"] = set(state.get("castling", []))
             state["promotion"] = view.get("promotion")
+            state["last_move"] = state.get("last_action")
         elif str(game.get("kind", "")).startswith("go"):
             state["history"] = set(state.get("history", []))
         winner = state.get("winner")
@@ -2677,6 +2833,12 @@ class MiniGamesMod(loader.Module):
             "_chess_click": self._net_chess_click,
             "_chess_promote": self._net_chess_promote,
             "_chess_resign": self._net_resign,
+            "_chess_coordinates": self._net_chess_coordinates,
+            "_chess_flip": self._net_chess_flip,
+            "_chess_undo_info": self._net_chess_undo_info,
+            "_chess_finish_prompt": self._net_chess_finish_prompt,
+            "_chess_confirm_resign": self._net_chess_confirm_resign,
+            "_chess_cancel_finish": self._net_chess_cancel_finish,
             "_go_select_row": self._net_go_select_row,
             "_go_clear_row": self._net_go_clear_row,
             "_go_place": self._net_go_place,
@@ -2862,7 +3024,10 @@ class MiniGamesMod(loader.Module):
             await call.answer("Панель застаріла", show_alert=True)
             return
         try:
+            was_unassigned = view["game"].get("my_slot") is None
             view["game"] = await self._network().api_game_join(view["game_id"])
+            if was_unassigned and view["game"].get("my_slot") == 1:
+                view["board_flipped"] = True
             view["handle"] = call
             await call.edit(
                 self._render_network(token), reply_markup=self._markup_network(token)
@@ -2882,6 +3047,7 @@ class MiniGamesMod(loader.Module):
             view["selected"] = None
             view["selected_row"] = None
             view["promotion"] = None
+            view["finish_confirm"] = None
             view["handle"] = call
             await call.edit(
                 self._render_network(token), reply_markup=self._markup_network(token)
@@ -2926,6 +3092,7 @@ class MiniGamesMod(loader.Module):
             view["game"] = await self._network().api_game_resign(view["game_id"])
             view["selected"] = None
             view["selected_row"] = None
+            view["finish_confirm"] = None
             await call.edit(
                 self._render_network(token), reply_markup=self._markup_network(token)
             )
@@ -2992,6 +3159,7 @@ class MiniGamesMod(loader.Module):
             view["selected"] = None
             view["selected_row"] = None
             view["promotion"] = None
+            view["finish_confirm"] = None
             view["handle"] = call
             await call.edit(
                 self._render_network(token), reply_markup=self._markup_network(token)
@@ -3052,12 +3220,94 @@ class MiniGamesMod(loader.Module):
             {"type": "move", "source": int(selected), "target": position},
         )
 
+    async def _net_chess_coordinates(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        if self._network_view(token) is None:
+            await call.answer("Панель застаріла", show_alert=True)
+            return
+        await call.answer("Координати шахової дошки")
+
+    async def _net_chess_flip(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None:
+            await call.answer("Панель застаріла", show_alert=True)
+            return
+        view["board_flipped"] = not bool(view.get("board_flipped"))
+        view["handle"] = call
+        await call.edit(
+            self._render_network(token), reply_markup=self._markup_network(token)
+        )
+        await call.answer("Дошку перевернуто")
+
+    async def _net_chess_undo_info(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        if self._network_view(token) is None:
+            await call.answer("Панель застаріла", show_alert=True)
+            return
+        await call.answer(
+            "Підтверджені сервером ходи не скасовуються — суперник не може переписати партію.",
+            show_alert=True,
+        )
+
+    async def _net_chess_finish_prompt(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None:
+            await call.answer("Панель застаріла", show_alert=True)
+            return
+        game = view["game"]
+        if game.get("status") != "active":
+            await call.answer("Партія ще не активна або вже завершена", show_alert=True)
+            return
+        if game.get("my_slot") not in {0, 1}:
+            await call.answer("Ви не учасник цієї партії", show_alert=True)
+            return
+        view["finish_confirm"] = True
+        view["handle"] = call
+        await call.edit(
+            self._render_network(token), reply_markup=self._markup_network(token)
+        )
+
+    async def _net_chess_cancel_finish(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None:
+            await call.answer("Панель застаріла", show_alert=True)
+            return
+        if view.get("finish_confirm") is None:
+            await call.answer("Підтвердження вже закрито")
+            return
+        view["finish_confirm"] = None
+        view["handle"] = call
+        await call.edit(
+            self._render_network(token), reply_markup=self._markup_network(token)
+        )
+
+    async def _net_chess_confirm_resign(self, call, token):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None:
+            await call.answer("Панель застаріла", show_alert=True)
+            return
+        if view.get("finish_confirm") is None:
+            await call.answer("Спочатку підтвердьте завершення", show_alert=True)
+            return
+        await self._net_resign(call, token)
+
     async def _net_chess_click(self, call, token, position):
         if not await self._network_owner_only(call):
             return
         view = self._network_view(token)
         if view is None or not await self._net_require_turn(call, view):
             return
+        view["finish_confirm"] = None
         if view.get("promotion"):
             await call.answer("Спочатку оберіть фігуру перетворення", show_alert=True)
             return

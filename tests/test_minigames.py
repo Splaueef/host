@@ -390,7 +390,12 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(session["promotion"])
         self.assertEqual(session["turn"], 0)
-        self.assertEqual(len(self.module._markup(token)[8]), 4)
+        promotion_row = next(
+            row
+            for row in self.module._markup(token)
+            if row and row[0].get("callback") == self.module._chess_promote
+        )
+        self.assertEqual(len(promotion_row), 4)
 
         await self.module._chess_promote(host, token, "q")
 
@@ -461,11 +466,42 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
 
         markup = self.module._markup(token)
 
-        self.assertEqual(len(markup[:8]), 8)
-        self.assertTrue(all(len(row) == 8 for row in markup[:8]))
-        self.assertEqual(markup[6][4]["text"], "🟦")
-        self.assertEqual(markup[5][4]["text"], "🟥")
-        self.assertEqual(markup[6][3]["text"], "🟩")
+        self.assertEqual([button["text"] for button in markup[0]], list("abcdefgh"))
+        self.assertEqual([button["text"] for button in markup[9]], list("abcdefgh"))
+        self.assertTrue(all(len(row) == 8 for row in markup[1:9]))
+        self.assertEqual(markup[7][4]["text"], "🔷♖")
+        self.assertEqual(markup[6][4]["text"], "🔴♟")
+        self.assertEqual(markup[7][3]["text"], "🟢")
+        self.assertTrue(markup[1][0]["text"].startswith("8 "))
+        self.assertTrue(markup[8][7]["text"].endswith(" 1"))
+
+    async def test_chess_board_can_flip_and_finish_requires_confirmation(self):
+        invited = types.SimpleNamespace(
+            id=2,
+            first_name="Guest",
+            last_name=None,
+            username="guest",
+            bot=False,
+        )
+        token = self.module._new_session("chess", -100, invited)
+        host = _Call(1, "Host")
+
+        await self.module._chess_flip(host, token)
+
+        session = self.module._session(token)
+        markup = self.module._markup(token)
+        self.assertTrue(session["board_flipped"])
+        self.assertEqual([button["text"] for button in markup[0]], list("hgfedcba"))
+        self.assertEqual(markup[1][0]["args"], (token, 63))
+        self.assertTrue(markup[1][0]["text"].startswith("1 "))
+        self.assertIn("чорні знизу", self.module._render(token))
+
+        await self.module._chess_finish_prompt(host, token)
+        self.assertEqual(session["finish_confirm"], 1)
+        self.assertIn("підтвердіть завершення", self.module._render(token).lower())
+
+        await self.module._chess_cancel_finish(host, token)
+        self.assertIsNone(session["finish_confirm"])
 
     def test_go_creates_nine_and_thirteen_line_boards(self):
         for kind, size, button_rows in (("go9", 9, (7, 2)), ("go13", 13, (7, 6))):
@@ -699,6 +735,55 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.module._network_view(token)["game"]["revision"], 5)
         self.assertIn("Хід", call.edits[-1]["text"])
+
+    async def test_hikkanet_chess_uses_player_orientation_and_network_controls(self):
+        game = {
+            "game_id": "ng_chess0123456789",
+            "kind": "chess",
+            "status": "active",
+            "my_slot": 1,
+            "revision": 3,
+            "players": [
+                {"slot": 0, "instance_id": "hikka-one", "display_name": "Host"},
+                {"slot": 1, "instance_id": "hikka-two", "display_name": "Guest"},
+            ],
+            "state": {
+                "board": self.module._chess_initial_board(),
+                "turn": 1,
+                "winner": None,
+                "draw": False,
+                "finished": False,
+                "finish_reason": None,
+                "move_number": 0,
+                "last_action": None,
+                "castling": ["K", "Q", "k", "q"],
+                "en_passant": None,
+                "halfmove_clock": 0,
+                "position_counts": {},
+            },
+        }
+        token = self.module._new_network_view(game)
+        call = _Call(1, "Host")
+
+        markup = self.module._markup_network(token)
+        self.assertEqual([button["text"] for button in markup[0]], list("hgfedcba"))
+        flip = next(
+            button
+            for row in markup
+            for button in row
+            if button["text"].startswith("↻")
+        )
+        self.assertEqual(flip["callback"], self.module._net_chess_flip)
+
+        await self.module._net_chess_flip(call, token)
+        self.assertFalse(self.module._network_view(token)["board_flipped"])
+
+        await self.module._net_chess_finish_prompt(call, token)
+        self.assertTrue(self.module._network_view(token)["finish_confirm"])
+        self.assertIn("підтвердіть завершення", call.edits[-1]["text"].lower())
+
+        await self.module._net_chess_cancel_finish(call, token)
+        self.assertIsNone(self.module._network_view(token)["finish_confirm"])
 
     def test_games_menu_offers_local_and_hikkanet_modes(self):
         token = self.module._new_session("menu", -100)
