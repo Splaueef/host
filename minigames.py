@@ -1,10 +1,10 @@
 # meta developer: @Huai_Baike
-# meta version: 1.2.0
+# meta version: 1.3.0
 # meta description: Інтерактивні мініігри для чатів із кнопками та рейтингом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (1, 2, 0)
+__version__ = (1, 3, 0)
 
 import asyncio
 import contextlib
@@ -64,6 +64,10 @@ CHESS_EMPTY_CELL = "∙"
 CHESS_SELECTED_CELL = "🟦"
 CHESS_TARGET_CELL = "🟩"
 CHESS_CAPTURE_CELL = "🟥"
+GO_COLUMNS = "ABCDEFGHJKLMNOPQRSTUVWXYZ"
+GO_STONES = {1: "●", -1: "○"}
+GO_LAST_STONES = {1: "◆", -1: "◇"}
+GO_KOMI = 6.5
 
 
 @loader.tds
@@ -224,6 +228,26 @@ class MiniGamesMod(loader.Module):
             )
             key = self._chess_position_key(session)
             session["position_counts"][key] = 1
+        elif kind in {"go9", "go13"}:
+            size = int(kind[2:])
+            board = [0] * (size * size)
+            session.update(
+                go_size=size,
+                board=board,
+                turn=0,
+                selected_row=None,
+                winner=None,
+                draw=False,
+                finish_reason=None,
+                captures=[0, 0],
+                consecutive_passes=0,
+                move_number=0,
+                last_move=None,
+                last_action=None,
+                history={self._go_board_key(board)},
+                scores=None,
+                territory=[0, 0],
+            )
         elif kind == "quiz":
             rounds = min(int(self.config["quiz_rounds"]), len(self.QUIZ_BANK))
             session.update(
@@ -304,6 +328,7 @@ class MiniGamesMod(loader.Module):
             "🎲 <b>Кубик-дуель</b> — найбільше число перемагає\n"
             "⚪⚫ <b>Шашки</b> — обов'язкове взяття та дамки\n"
             "♟ <b>Шахи</b> — повні правила, шах, мат і пат\n"
+            "⚫⚪ <b>Ґо</b> — дошки 9×9 і 13×13\n"
             "🧠 <b>Вікторина</b> — перший правильний отримує бал\n\n"
             "<i>Ігри відкриті для учасників поточного чату.</i>"
         )
@@ -320,6 +345,10 @@ class MiniGamesMod(loader.Module):
             [
                 {"text": "⚪⚫ Шашки", "callback": self._select_game, "args": (token, "checkers")},
                 {"text": "♟ Шахи", "callback": self._select_game, "args": (token, "chess")},
+            ],
+            [
+                {"text": "⚫⚪ Ґо 9×9", "callback": self._select_game, "args": (token, "go9")},
+                {"text": "⚫⚪ Ґо 13×13", "callback": self._select_game, "args": (token, "go13")},
             ],
             [
                 {"text": "🧠 Вікторина", "callback": self._select_game, "args": (token, "quiz")},
@@ -1481,6 +1510,482 @@ class MiniGamesMod(loader.Module):
                 reply_markup=self._markup(token),
             )
 
+    @staticmethod
+    def _go_board_key(board):
+        return "".join("b" if stone == 1 else "w" if stone == -1 else "." for stone in board)
+
+    @staticmethod
+    def _go_index(row, column, size):
+        return int(row) * int(size) + int(column)
+
+    @staticmethod
+    def _go_position(index, size):
+        return divmod(int(index), int(size))
+
+    @staticmethod
+    def _go_coordinate(index, size):
+        row, column = divmod(int(index), int(size))
+        return f"{GO_COLUMNS[column]}{int(size) - row}"
+
+    @classmethod
+    def _go_neighbors(cls, position, size):
+        row, column = cls._go_position(position, size)
+        neighbors = []
+        for row_step, column_step in CHESS_ORTHOGONAL:
+            target_row = row + row_step
+            target_column = column + column_step
+            if 0 <= target_row < size and 0 <= target_column < size:
+                neighbors.append(cls._go_index(target_row, target_column, size))
+        return neighbors
+
+    @classmethod
+    def _go_group_and_liberties(cls, board, size, start):
+        stone = board[int(start)]
+        if not stone:
+            return set(), set()
+        group = set()
+        liberties = set()
+        stack = [int(start)]
+        while stack:
+            position = stack.pop()
+            if position in group:
+                continue
+            group.add(position)
+            for neighbor in cls._go_neighbors(position, size):
+                if not board[neighbor]:
+                    liberties.add(neighbor)
+                elif board[neighbor] == stone and neighbor not in group:
+                    stack.append(neighbor)
+        return group, liberties
+
+    @classmethod
+    def _go_try_move(cls, board, size, side, position, history=None):
+        position = int(position)
+        size = int(size)
+        if not 0 <= position < size * size:
+            return None, 0, "invalid"
+        if board[position]:
+            return None, 0, "occupied"
+        stone = 1 if int(side) == 0 else -1
+        candidate = list(board)
+        candidate[position] = stone
+        captured_positions = set()
+        for neighbor in cls._go_neighbors(position, size):
+            if candidate[neighbor] != -stone:
+                continue
+            group, liberties = cls._go_group_and_liberties(candidate, size, neighbor)
+            if liberties:
+                continue
+            captured_positions.update(group)
+            for captured in group:
+                candidate[captured] = 0
+        _, liberties = cls._go_group_and_liberties(candidate, size, position)
+        if not liberties:
+            return None, 0, "suicide"
+        if history and cls._go_board_key(candidate) in history:
+            return None, 0, "ko"
+        return candidate, len(captured_positions), None
+
+    @classmethod
+    def _go_score(cls, board, size, komi=GO_KOMI):
+        stones = [sum(stone == 1 for stone in board), sum(stone == -1 for stone in board)]
+        territory = [0, 0]
+        visited = set()
+        for start, stone in enumerate(board):
+            if stone or start in visited:
+                continue
+            region = set()
+            borders = set()
+            stack = [start]
+            while stack:
+                position = stack.pop()
+                if position in region:
+                    continue
+                region.add(position)
+                for neighbor in cls._go_neighbors(position, size):
+                    neighbor_stone = board[neighbor]
+                    if not neighbor_stone and neighbor not in region:
+                        stack.append(neighbor)
+                    elif neighbor_stone:
+                        borders.add(neighbor_stone)
+            visited.update(region)
+            if borders == {1}:
+                territory[0] += len(region)
+            elif borders == {-1}:
+                territory[1] += len(region)
+        scores = [stones[0] + territory[0], stones[1] + territory[1] + float(komi)]
+        return scores, territory
+
+    @staticmethod
+    def _go_hoshi(size):
+        if int(size) == 9:
+            return {(2, 2), (2, 6), (4, 4), (6, 2), (6, 6)}
+        if int(size) == 13:
+            return {(3, 3), (3, 9), (6, 6), (9, 3), (9, 9)}
+        return set()
+
+    @classmethod
+    def _go_board_text(cls, session):
+        size = int(session["go_size"])
+        columns = GO_COLUMNS[:size]
+        lines = ["   " + " ".join(columns)]
+        last_move = session.get("last_move")
+        hoshi = cls._go_hoshi(size)
+        for row in range(size):
+            cells = []
+            for column in range(size):
+                position = cls._go_index(row, column, size)
+                stone = session["board"][position]
+                if position == last_move and stone:
+                    symbol = GO_LAST_STONES[stone]
+                elif stone:
+                    symbol = GO_STONES[stone]
+                else:
+                    symbol = "+" if (row, column) in hoshi else "·"
+                cells.append(symbol)
+            lines.append(f"{size - row:>2} " + " ".join(cells))
+        lines.append("   " + " ".join(columns))
+        return "<pre>" + "\n".join(lines) + "</pre>"
+
+    @staticmethod
+    def _go_format_score(value):
+        return f"{float(value):.1f}".rstrip("0").rstrip(".")
+
+    def _go_finish(self, session):
+        scores, territory = self._go_score(session["board"], session["go_size"])
+        session["scores"] = scores
+        session["territory"] = territory
+        session["finished"] = True
+        session["finish_reason"] = "score"
+        if scores[0] == scores[1]:
+            session["draw"] = True
+            self._record_result(session, [], draw=True)
+            return
+        winner_side = 0 if scores[0] > scores[1] else 1
+        session["winner"] = session["players"][winner_side]
+        self._record_result(session, [session["winner"]])
+
+    def _render_gomenu(self, session):
+        invited = session["players"][1]
+        opponent = (
+            f"\nСуперник: <b>{self._name(session, invited)}</b>"
+            if invited
+            else "\nСуперник зможе приєднатися після першого ходу."
+        )
+        return (
+            "⚫⚪ <b>Ґо · вибір дошки</b>\n\n"
+            "Оберіть компактну <b>9×9</b> або більшу <b>13×13</b>."
+            f"{opponent}\n\n"
+            f"<i>Китайський підрахунок території · комі {GO_KOMI}</i>"
+        )
+
+    def _markup_gomenu(self, token, session):
+        return [
+            [
+                {
+                    "text": "⚫⚪ 9×9",
+                    "callback": self._select_go_size,
+                    "args": (token, "go9"),
+                },
+                {
+                    "text": "⚫⚪ 13×13",
+                    "callback": self._select_go_size,
+                    "args": (token, "go13"),
+                },
+            ],
+            [{"text": "✖️ Закрити", "callback": self._close, "args": (token,)}],
+        ]
+
+    async def _select_go_size(self, call, token, kind):
+        session = self._session(token)
+        user_id, _ = self._actor(call)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        if user_id != session["creator_id"] or kind not in {"go9", "go13"}:
+            await call.answer(self.strings["not_yours"], show_alert=True)
+            return
+        self._reset_game(session, kind)
+        await call.edit(self._render(token), reply_markup=self._markup(token))
+
+    def _render_go(self, session):
+        size = int(session["go_size"])
+        black, white = session["players"]
+        white_name = self._name(session, white) if white else "очікується суперник"
+        lines = [
+            f"⚫⚪ <b>Ґо · {size}×{size}</b>",
+            "",
+            f"● {self._name(session, black)} · полон: <b>{session['captures'][0]}</b>",
+            f"○ {white_name} · полон: <b>{session['captures'][1]}</b>",
+            "",
+        ]
+        if session["winner"] is not None:
+            lines.append(f"🏆 Переміг: <b>{self._name(session, session['winner'])}</b>")
+        elif session["draw"]:
+            lines.append("🤝 <b>Нічия.</b>")
+        else:
+            turn_id = session["players"][session["turn"]]
+            turn_name = self._name(session, turn_id) if turn_id else "другого гравця"
+            stone = GO_STONES[1 if session["turn"] == 0 else -1]
+            lines.append(f"Хід {session['move_number'] + 1}: {stone} <b>{turn_name}</b>")
+            if session["selected_row"] is None:
+                lines.append("Оберіть <b>номер рядка</b> кнопкою нижче.")
+            else:
+                row_label = size - int(session["selected_row"])
+                lines.append(f"Обрано рядок <b>{row_label}</b> · тепер оберіть стовпець.")
+            if session["consecutive_passes"] == 1:
+                lines.append("⏭ <b>Був пас. Наступний пас завершить партію.</b>")
+        if session.get("scores"):
+            black_score, white_score = session["scores"]
+            lines.extend(
+                (
+                    "",
+                    "📊 <b>Китайський підрахунок</b>",
+                    f"● {self._go_format_score(black_score)} · "
+                    f"○ {self._go_format_score(white_score)} <i>(комі {GO_KOMI})</i>",
+                )
+            )
+        if session.get("last_action"):
+            lines.extend(("", f"Остання дія: <b>{session['last_action']}</b>"))
+        lines.extend(
+            (
+                "",
+                self._go_board_text(session),
+                "<i>●/○ — камені · ◆/◇ — останній хід · + — хосі</i>",
+            )
+        )
+        return "\n".join(lines)
+
+    def _render_go9(self, session):
+        return self._render_go(session)
+
+    def _render_go13(self, session):
+        return self._render_go(session)
+
+    def _markup_go(self, token, session):
+        if session["finished"]:
+            return self._footer(token, session)
+        size = int(session["go_size"])
+        rows = []
+        if session["selected_row"] is None:
+            choices = [
+                {
+                    "text": str(size - row),
+                    "callback": self._go_select_row,
+                    "args": (token, row),
+                }
+                for row in range(size)
+            ]
+            rows.extend(choices[index : index + 7] for index in range(0, len(choices), 7))
+        else:
+            selected_row = int(session["selected_row"])
+            choices = []
+            for column, letter in enumerate(GO_COLUMNS[:size]):
+                position = self._go_index(selected_row, column, size)
+                symbol = GO_STONES.get(session["board"][position], "·")
+                choices.append(
+                    {
+                        "text": f"{letter} {symbol}",
+                        "callback": self._go_place,
+                        "args": (token, column),
+                    }
+                )
+            rows.extend(choices[index : index + 7] for index in range(0, len(choices), 7))
+            rows.append(
+                [
+                    {
+                        "text": "↩ Інший рядок",
+                        "callback": self._go_clear_row,
+                        "args": (token,),
+                    }
+                ]
+            )
+        rows.append(
+            [
+                {"text": "⏭ Пас", "callback": self._go_pass, "args": (token,)},
+                {"text": "🏳 Здатися", "callback": self._go_resign, "args": (token,)},
+                {"text": "✖️ Закрити", "callback": self._close, "args": (token,)},
+            ]
+        )
+        return rows
+
+    def _markup_go9(self, token, session):
+        return self._markup_go(token, session)
+
+    def _markup_go13(self, token, session):
+        return self._markup_go(token, session)
+
+    def _go_authorized(self, session, user_id, user):
+        side = int(session["turn"])
+        if (
+            session["players"][1] is None
+            and side == 1
+            and user_id != session["players"][0]
+        ):
+            if session.get("invited_id") and user_id != session["invited_id"]:
+                return False
+            session["players"][1] = user_id
+            self._remember_actor(session, user_id, user)
+        return user_id == session["players"][side]
+
+    async def _go_select_row(self, call, token, row):
+        session = self._session(token)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        lock = self._locks.setdefault(token, asyncio.Lock())
+        async with lock:
+            user_id, user = self._actor(call)
+            if session["finished"]:
+                await call.answer("Партію вже завершено")
+                return
+            row = int(row)
+            if not 0 <= row < session["go_size"]:
+                await call.answer("Некоректний рядок", show_alert=True)
+                return
+            if not self._go_authorized(session, user_id, user):
+                await call.answer(
+                    self.strings["wait_opponent"]
+                    if session["players"][1] is None
+                    else self.strings["not_yours"],
+                    show_alert=True,
+                )
+                return
+            session["selected_row"] = row
+            await call.edit(self._render(token), reply_markup=self._markup(token))
+
+    async def _go_clear_row(self, call, token):
+        session = self._session(token)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        lock = self._locks.setdefault(token, asyncio.Lock())
+        async with lock:
+            user_id, user = self._actor(call)
+            if not self._go_authorized(session, user_id, user):
+                await call.answer(self.strings["not_yours"], show_alert=True)
+                return
+            session["selected_row"] = None
+            await call.edit(self._render(token), reply_markup=self._markup(token))
+
+    async def _go_place(self, call, token, column):
+        session = self._session(token)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        lock = self._locks.setdefault(token, asyncio.Lock())
+        async with lock:
+            user_id, user = self._actor(call)
+            if session["finished"]:
+                await call.answer("Партію вже завершено")
+                return
+            if not self._go_authorized(session, user_id, user):
+                await call.answer(self.strings["not_yours"], show_alert=True)
+                return
+            if session["selected_row"] is None:
+                await call.answer("Спочатку оберіть рядок", show_alert=True)
+                return
+            column = int(column)
+            size = int(session["go_size"])
+            if not 0 <= column < size:
+                await call.answer("Некоректний стовпець", show_alert=True)
+                return
+            position = self._go_index(session["selected_row"], column, size)
+            board, captured, error = self._go_try_move(
+                session["board"],
+                size,
+                session["turn"],
+                position,
+                session["history"],
+            )
+            if error:
+                errors = {
+                    "invalid": "Некоректна точка",
+                    "occupied": "Ця точка вже зайнята",
+                    "suicide": "Самогубний хід заборонений",
+                    "ko": "Не можна повторювати попередню позицію",
+                }
+                await call.answer(errors[error], show_alert=True)
+                return
+            side = int(session["turn"])
+            stone = 1 if side == 0 else -1
+            session["board"] = board
+            session["history"].add(self._go_board_key(board))
+            session["captures"][side] += captured
+            session["consecutive_passes"] = 0
+            session["move_number"] += 1
+            session["last_move"] = position
+            session["last_action"] = f"{GO_STONES[stone]} {self._go_coordinate(position, size)}"
+            session["selected_row"] = None
+            if all(board):
+                self._go_finish(session)
+            else:
+                session["turn"] = 1 - side
+            await call.edit(self._render(token), reply_markup=self._markup(token))
+
+    async def _go_pass(self, call, token):
+        session = self._session(token)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        lock = self._locks.setdefault(token, asyncio.Lock())
+        async with lock:
+            user_id, user = self._actor(call)
+            if session["finished"]:
+                await call.answer("Партію вже завершено")
+                return
+            if not self._go_authorized(session, user_id, user):
+                await call.answer(
+                    self.strings["wait_opponent"]
+                    if session["players"][1] is None
+                    else self.strings["not_yours"],
+                    show_alert=True,
+                )
+                return
+            side = int(session["turn"])
+            stone = 1 if side == 0 else -1
+            session["consecutive_passes"] += 1
+            session["move_number"] += 1
+            session["last_move"] = None
+            session["last_action"] = f"{GO_STONES[stone]} пас"
+            session["selected_row"] = None
+            if session["consecutive_passes"] >= 2:
+                self._go_finish(session)
+            else:
+                session["turn"] = 1 - side
+            await call.answer("⏭ Пас")
+            await call.edit(self._render(token), reply_markup=self._markup(token))
+
+    async def _go_resign(self, call, token):
+        session = self._session(token)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        lock = self._locks.setdefault(token, asyncio.Lock())
+        async with lock:
+            user_id, _ = self._actor(call)
+            players = [player for player in session.get("players", []) if player]
+            if user_id not in players:
+                await call.answer(self.strings["not_yours"], show_alert=True)
+                return
+            if session["finished"]:
+                await call.answer("Партію вже завершено")
+                return
+            opponents = [player for player in players if player != user_id]
+            if not opponents:
+                self._sessions.pop(token, None)
+                self._locks.pop(token, None)
+                await call.edit(self.strings["closed"], reply_markup=[])
+                return
+            session["winner"] = opponents[0]
+            session["finish_reason"] = "resignation"
+            session["finished"] = True
+            self._record_result(session, [opponents[0]])
+            await call.edit(
+                self._render(token) + f"\n\n🏳 {self._name(session, user_id)} здався.",
+                reply_markup=self._markup(token),
+            )
+
     def _render_rps(self, session):
         first, second = session["players"]
         lines = ["🪨📄✂️ <b>Камінь, ножиці, папір</b>", ""]
@@ -1702,7 +2207,15 @@ class MiniGamesMod(loader.Module):
         if user_id not in participants and user_id != session["creator_id"]:
             await call.answer(self.strings["not_yours"], show_alert=True)
             return
-        if session["kind"] in {"ttt", "rps", "dice", "checkers", "chess"} and session["players"][1] is not None:
+        if session["kind"] in {
+            "ttt",
+            "rps",
+            "dice",
+            "checkers",
+            "chess",
+            "go9",
+            "go13",
+        } and session["players"][1] is not None:
             session["players"] = [session["players"][1], session["players"][0]]
             session["invited_id"] = session["players"][1]
         self._reset_game(session)
@@ -1808,6 +2321,21 @@ class MiniGamesMod(loader.Module):
     async def chess(self, message):
         """♟ Почати шахову партію з повними правилами"""
         await self._direct_game(message, "chess")
+
+    @loader.command(ru_doc="Ґо: .go [@user] або у відповідь, потім вибір дошки")
+    async def go(self, message):
+        """⚫⚪ Обрати дошку 9×9 або 13×13 кнопкою"""
+        await self._direct_game(message, "gomenu")
+
+    @loader.command(ru_doc="Ґо на дошці 9×9: .go9 [@user] або у відповідь")
+    async def go9(self, message):
+        """⚫⚪ Почати партію в ґо 9×9"""
+        await self._direct_game(message, "go9")
+
+    @loader.command(ru_doc="Ґо на дошці 13×13: .go13 [@user] або у відповідь")
+    async def go13(self, message):
+        """⚫⚪ Почати партію в ґо 13×13"""
+        await self._direct_game(message, "go13")
 
     @loader.command(ru_doc="Запустити швидку вікторину для всього чату")
     async def quiz(self, message):

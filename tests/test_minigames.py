@@ -385,6 +385,160 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(markup[5][4]["text"], "🟥")
         self.assertEqual(markup[6][3]["text"], "🟩")
 
+    def test_go_creates_nine_and_thirteen_line_boards(self):
+        for kind, size, button_rows in (("go9", 9, (7, 2)), ("go13", 13, (7, 6))):
+            with self.subTest(kind=kind):
+                token = self.module._new_session(kind, -100)
+                session = self.module._session(token)
+                markup = self.module._markup(token)
+
+                self.assertEqual(session["go_size"], size)
+                self.assertEqual(len(session["board"]), size * size)
+                self.assertEqual([len(row) for row in markup[:2]], list(button_rows))
+                self.assertEqual(len(markup[-1]), 3)
+
+        text = self.module._render(self.module._new_session("go13", -100))
+        self.assertIn("A B C D E F G H J K L M N", text)
+        self.assertIn("<pre>", text)
+        self.assertIn("+", text)
+
+    async def test_go_size_menu_preserves_invited_player(self):
+        invited = types.SimpleNamespace(id=2, first_name="Guest", last_name=None, username="guest", bot=False)
+        token = self.module._new_session("gomenu", -100, invited)
+        host = _Call(1, "Host")
+
+        self.assertEqual(len(self.module._markup(token)[0]), 2)
+        await self.module._select_go_size(host, token, "go13")
+
+        session = self.module._session(token)
+        self.assertEqual(session["kind"], "go13")
+        self.assertEqual(session["go_size"], 13)
+        self.assertEqual(session["players"], [1, 2])
+
+    def test_go_captures_surrounded_group_and_rejects_suicide(self):
+        size = 9
+        center = self.module._go_index(4, 4, size)
+        board = [0] * (size * size)
+        board[center] = -1
+        for row, column in ((3, 4), (5, 4), (4, 3)):
+            board[self.module._go_index(row, column, size)] = 1
+        closing = self.module._go_index(4, 5, size)
+
+        result, captured, error = self.module._go_try_move(
+            board,
+            size,
+            0,
+            closing,
+            set(),
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(captured, 1)
+        self.assertEqual(result[center], 0)
+
+        suicide = [0] * (size * size)
+        for row, column in ((3, 4), (5, 4), (4, 3), (4, 5)):
+            suicide[self.module._go_index(row, column, size)] = 1
+        result, captured, error = self.module._go_try_move(
+            suicide,
+            size,
+            1,
+            center,
+            set(),
+        )
+        self.assertIsNone(result)
+        self.assertEqual(captured, 0)
+        self.assertEqual(error, "suicide")
+
+    def test_go_superko_rejects_repeated_board(self):
+        size = 9
+        board = [0] * (size * size)
+        center = self.module._go_index(4, 4, size)
+        capture_point = self.module._go_index(4, 5, size)
+        board[center] = -1
+        for row, column in ((3, 4), (5, 4), (4, 3)):
+            board[self.module._go_index(row, column, size)] = 1
+        for row, column in ((3, 5), (5, 5), (4, 6)):
+            board[self.module._go_index(row, column, size)] = -1
+        original_key = self.module._go_board_key(board)
+
+        captured_board, captured, error = self.module._go_try_move(
+            board,
+            size,
+            0,
+            capture_point,
+            {original_key},
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(captured, 1)
+        history = {original_key, self.module._go_board_key(captured_board)}
+
+        result, captured, error = self.module._go_try_move(
+            captured_board,
+            size,
+            1,
+            center,
+            history,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(captured, 0)
+        self.assertEqual(error, "ko")
+
+    def test_go_chinese_scoring_counts_stones_and_territory(self):
+        board = [1] * 9
+        board[4] = 0
+
+        scores, territory = self.module._go_score(board, 3)
+
+        self.assertEqual(territory, [1, 0])
+        self.assertEqual(scores, [9, 6.5])
+
+    async def test_go_buttons_place_stones_and_join_second_player(self):
+        token = self.module._new_session("go9", -100)
+        host = _Call(1, "Host")
+        guest = _Call(2, "Guest")
+
+        await self.module._go_select_row(host, token, 0)
+        await self.module._go_place(host, token, 0)
+        await self.module._go_select_row(guest, token, 0)
+        await self.module._go_place(guest, token, 1)
+
+        session = self.module._session(token)
+        self.assertEqual(session["players"][1], 2)
+        self.assertEqual(session["board"][:2], [1, -1])
+        self.assertEqual(session["move_number"], 2)
+        self.assertEqual(session["turn"], 0)
+        self.assertIn("B9", session["last_action"])
+
+    async def test_go_two_passes_finish_with_komi_score(self):
+        invited = types.SimpleNamespace(id=2, first_name="Guest", last_name=None, username="guest", bot=False)
+        token = self.module._new_session("go9", -100, invited)
+        host = _Call(1, "Host")
+        guest = _Call(2, "Guest")
+
+        await self.module._go_pass(host, token)
+        await self.module._go_pass(guest, token)
+
+        session = self.module._session(token)
+        self.assertTrue(session["finished"])
+        self.assertEqual(session["scores"], [0, 6.5])
+        self.assertEqual(session["winner"], 2)
+        self.assertIn("Китайський підрахунок", guest.edits[-1]["text"])
+
+    def test_go_column_picker_is_split_for_thirteen_board(self):
+        token = self.module._new_session("go13", -100)
+        session = self.module._session(token)
+        session["selected_row"] = 0
+
+        markup = self.module._markup(token)
+
+        self.assertEqual([len(markup[0]), len(markup[1])], [7, 6])
+        self.assertEqual(markup[0][0]["text"], "A ·")
+        self.assertEqual(markup[1][-1]["text"], "N ·")
+        self.assertEqual(markup[2][0]["text"], "↩ Інший рядок")
+
     async def test_rps_choices_are_hidden_until_both_players_answer(self):
         invited = types.SimpleNamespace(id=2, first_name="Guest", last_name=None, username="guest", bot=False)
         token = self.module._new_session("rps", -100, invited)
