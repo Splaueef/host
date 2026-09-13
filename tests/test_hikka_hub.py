@@ -125,6 +125,9 @@ class HikkaHubApiTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/health")
         self.assertEqual(response.status, 200)
         self.assertEqual((await response.json())["data"]["status"], "ok")
+        health = (await response.json())["data"]
+        self.assertEqual(health["api_version"], 2)
+        self.assertIn("network_games", health["capabilities"])
 
         response = await self.client.get("/v1/me")
         self.assertEqual(response.status, 401)
@@ -333,6 +336,198 @@ class HikkaHubApiTests(unittest.IsolatedAsyncioTestCase):
             "GET", "/v1/stats/module.games.commands", who="two"
         )
         self.assertEqual((await response.json())["data"]["total"], 2)
+
+    async def test_network_game_matchmaking_moves_and_global_stats(self):
+        response = await self._request(
+            "POST", "/v1/games", {"kind": "ttt"}, who="one"
+        )
+        self.assertEqual(response.status, 201)
+        game = (await response.json())["data"]
+        game_id = game["game_id"]
+        self.assertEqual(game["status"], "waiting")
+        self.assertEqual(game["my_slot"], 0)
+
+        response = await self._request(
+            "GET", "/v1/games?scope=open&kind=ttt", who="two"
+        )
+        open_games = (await response.json())["data"]["games"]
+        self.assertEqual(open_games[0]["game_id"], game_id)
+
+        response = await self._request(
+            "POST", f"/v1/games/{game_id}/join", {}, who="two"
+        )
+        game = (await response.json())["data"]
+        self.assertEqual(game["status"], "active")
+        self.assertEqual(game["my_slot"], 1)
+        revision = game["revision"]
+
+        response = await self._request(
+            "POST",
+            f"/v1/games/{game_id}/move",
+            {"if_revision": revision, "action": {"type": "place", "position": 1}},
+            who="two",
+        )
+        self.assertEqual(response.status, 409)
+        self.assertEqual((await response.json())["error"]["code"], "not_your_turn")
+
+        for who, position in (
+            ("one", 0),
+            ("two", 3),
+            ("one", 1),
+            ("two", 4),
+            ("one", 2),
+        ):
+            current = await self._request(
+                "GET", f"/v1/games/{game_id}", who=who
+            )
+            revision = (await current.json())["data"]["revision"]
+            moved = await self._request(
+                "POST",
+                f"/v1/games/{game_id}/move",
+                {
+                    "if_revision": revision,
+                    "action": {"type": "place", "position": position},
+                },
+                who=who,
+            )
+            self.assertEqual(moved.status, 200)
+            game = (await moved.json())["data"]
+
+        self.assertEqual(game["status"], "finished")
+        self.assertEqual(game["state"]["winner"], 0)
+        self.assertEqual(game["state"]["board"][:5], [0, 0, 0, 1, 1])
+
+        response = await self._request(
+            "GET", "/v1/games/leaderboard?kind=ttt&sort=rating", who="two"
+        )
+        ranking = (await response.json())["data"]["ranking"]
+        self.assertEqual([row["display_name"] for row in ranking], ["One", "Two"])
+        self.assertEqual(ranking[0]["wins"], 1)
+        self.assertGreater(ranking[0]["rating"], ranking[1]["rating"])
+
+        response = await self._request("GET", "/v1/games/profile", who="one")
+        profile = (await response.json())["data"]
+        self.assertEqual(profile["totals"]["played"], 1)
+        self.assertEqual(profile["totals"]["wins"], 1)
+        self.assertTrue(profile["public_id"].startswith("p_"))
+
+    async def test_private_game_invite_is_visible_only_to_invited_node(self):
+        response = await self._request(
+            "POST",
+            "/v1/games",
+            {"kind": "chess", "opponent_instance_id": "hikka-two"},
+        )
+        game = (await response.json())["data"]
+        self.assertEqual(game["status"], "invited")
+
+        response = await self._request(
+            "GET", f"/v1/games/{game['game_id']}", who="two"
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())["data"]["my_slot"], 1)
+
+        response = await self._request(
+            "GET", "/v1/games?scope=open", who="two"
+        )
+        self.assertNotIn(
+            game["game_id"],
+            [item["game_id"] for item in (await response.json())["data"]["games"]],
+        )
+
+    async def test_game_revision_and_result_are_recorded_once(self):
+        response = await self._request(
+            "POST", "/v1/games", {"kind": "ttt"}, who="one"
+        )
+        game_id = (await response.json())["data"]["game_id"]
+        response = await self._request(
+            "POST", f"/v1/games/{game_id}/join", {}, who="two"
+        )
+        revision = (await response.json())["data"]["revision"]
+
+        response = await self._request(
+            "POST",
+            f"/v1/games/{game_id}/move",
+            {
+                "if_revision": revision,
+                "action": {"type": "place", "position": 0},
+            },
+            who="one",
+        )
+        self.assertEqual(response.status, 200)
+
+        stale = await self._request(
+            "POST",
+            f"/v1/games/{game_id}/move",
+            {
+                "if_revision": revision,
+                "action": {"type": "place", "position": 1},
+            },
+            who="two",
+        )
+        self.assertEqual(stale.status, 409)
+        self.assertEqual((await stale.json())["error"]["code"], "revision_conflict")
+
+        resigned = await self._request(
+            "POST", f"/v1/games/{game_id}/resign", {}, who="two"
+        )
+        self.assertEqual(resigned.status, 200)
+        self.assertEqual((await resigned.json())["data"]["state"]["winner"], 0)
+
+        repeated = await self._request(
+            "POST", f"/v1/games/{game_id}/resign", {}, who="two"
+        )
+        self.assertEqual(repeated.status, 409)
+        self.assertEqual((await repeated.json())["error"]["code"], "game_unavailable")
+
+        for who, wins in (("one", 1), ("two", 0)):
+            profile_response = await self._request(
+                "GET", "/v1/games/profile", who=who
+            )
+            totals = (await profile_response.json())["data"]["totals"]
+            self.assertEqual(totals["played"], 1)
+            self.assertEqual(totals["wins"], wins)
+
+    async def test_chat_presence_exposes_rooms_and_online_members(self):
+        response = await self._request(
+            "POST",
+            "/v1/chat/presence",
+            {"room": "lobby", "nickname": "Player One"},
+            who="one",
+        )
+        self.assertEqual(response.status, 200)
+        await self._request(
+            "POST",
+            "/v1/chat/presence",
+            {"room": "lobby", "nickname": "Player Two"},
+            who="two",
+        )
+        await self._request(
+            "POST",
+            "/v1/events",
+            {
+                "topic": "chat.lobby",
+                "payload": {"kind": "chat.message", "body": "hello"},
+                "ttl_seconds": 600,
+            },
+            who="one",
+        )
+
+        response = await self._request("GET", "/v1/chat/rooms", who="one")
+        rooms = (await response.json())["data"]["rooms"]
+        self.assertEqual(rooms[0]["room"], "lobby")
+        self.assertEqual(rooms[0]["online"], 2)
+        self.assertEqual(rooms[0]["messages_24h"], 1)
+
+        response = await self._request(
+            "GET", "/v1/chat/rooms/lobby/members", who="two"
+        )
+        members = (await response.json())["data"]["members"]
+        self.assertEqual({item["nickname"] for item in members}, {"Player One", "Player Two"})
+
+        response = await self._request(
+            "DELETE", "/v1/chat/presence/lobby", who="one"
+        )
+        self.assertTrue((await response.json())["data"]["left"])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # meta developer: @Huai_Baike
-# meta version: 1.2.0
-# meta description: 🔐 Захищена мережа обміну даними між окремими Hikka.
+# meta version: 2.0.0
+# meta description: 🔐 HikkaNet: вузли, глобальні ігри, чат, події та статистика.
 # scope: inline
 # scope: hikka_only
 
@@ -32,10 +32,12 @@ from .. import loader, utils
 
 
 logger = logging.getLogger(__name__)
-__version__ = (1, 2, 0)
+__version__ = (2, 0, 0)
 _PROTOCOL = "HIKKA-HUB-V1"
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$")
+_GAME_ID_RE = re.compile(r"^ng_[0-9a-f]{16}$")
+_ROOM_RE = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 _KEY_RE = re.compile(r"^hk_[A-Za-z0-9_-]{8,48}$")
 _SECRET_FIELDS = {
     "api_key",
@@ -49,6 +51,8 @@ _SECRET_FIELDS = {
     "session_string",
     "token",
 }
+_GAME_KINDS = {"ttt", "checkers", "chess", "go9", "go13"}
+_GAME_STATUSES = {"waiting", "invited", "active", "finished", "cancelled"}
 
 
 class HubClientError(RuntimeError):
@@ -140,6 +144,27 @@ def _identifier(value: str, label="ідентифікатор") -> str:
     value = str(value or "").strip().lower()
     if not _IDENTIFIER_RE.fullmatch(value):
         raise ValueError(f"{label}: лише a-z, 0-9, крапка, _ або -, до 64 символів")
+    return value
+
+
+def _game_id(value: str) -> str:
+    value = _identifier(value, "ID гри")
+    if not _GAME_ID_RE.fullmatch(value):
+        raise ValueError("Некоректний ID мережевої гри")
+    return value
+
+
+def _instance_identifier(value: str) -> str:
+    value = str(value or "").strip()
+    if not _INSTANCE_RE.fullmatch(value):
+        raise ValueError("Некоректний instance_id суперника")
+    return value
+
+
+def _room_identifier(value: str) -> str:
+    value = str(value or "").strip().lower()
+    if not _ROOM_RE.fullmatch(value):
+        raise ValueError("Кімната: a-z, 0-9, _ або -, до 48 символів")
     return value
 
 
@@ -309,7 +334,7 @@ class HikkaNetMod(loader.Module):
     async def _ensure_session(self):
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                headers={"User-Agent": "HikkaNet/1.1 (Hikka module)"}
+                headers={"User-Agent": "HikkaNet/2.0 (Hikka module)"}
             )
 
     def _start_worker(self):
@@ -492,6 +517,9 @@ class HikkaNetMod(loader.Module):
                     "metrics",
                     "metrics_batch",
                     "module_updates",
+                    "network_games",
+                    "game_leaderboard",
+                    "chat_presence",
                     "presence",
                 ],
             },
@@ -546,6 +574,148 @@ class HikkaNetMod(loader.Module):
     async def api_module_versions(self):
         """Return the server-cached trusted module version manifest."""
         return await self._request("GET", "/v1/modules/versions")
+
+    async def api_game_create(self, kind, opponent_instance_id=None):
+        kind = _identifier(kind, "гра")
+        if kind not in _GAME_KINDS:
+            raise ValueError("Підтримуються ttt, checkers, chess, go9 та go13")
+        payload = {"kind": kind}
+        if opponent_instance_id:
+            payload["opponent_instance_id"] = _instance_identifier(
+                opponent_instance_id
+            )
+        return await self._request("POST", "/v1/games", payload=payload)
+
+    async def api_games(
+        self,
+        scope="mine",
+        kind=None,
+        status=None,
+        updated_after=0,
+        limit=30,
+    ):
+        scope = str(scope).strip().lower()
+        if scope not in {"mine", "open", "all"}:
+            raise ValueError("scope повинен бути mine, open або all")
+        if kind:
+            kind = _identifier(kind, "гра")
+            if kind not in _GAME_KINDS:
+                raise ValueError("Непідтримувана гра")
+        if status:
+            status = _identifier(status, "статус")
+            if status not in _GAME_STATUSES:
+                raise ValueError("Непідтримуваний статус гри")
+        return await self._request(
+            "GET",
+            "/v1/games",
+            params={
+                "scope": scope,
+                "kind": kind,
+                "status": status,
+                "updated_after": max(0, int(updated_after)),
+                "limit": max(1, min(int(limit), 100)),
+            },
+        )
+
+    async def api_game_get(self, game_id):
+        game_id = _game_id(game_id)
+        return await self._request(
+            "GET", f"/v1/games/{quote(game_id, safe='')}"
+        )
+
+    async def api_game_join(self, game_id):
+        game_id = _game_id(game_id)
+        return await self._request(
+            "POST", f"/v1/games/{quote(game_id, safe='')}/join", payload={}
+        )
+
+    async def api_game_move(self, game_id, revision, action):
+        game_id = _game_id(game_id)
+        if not isinstance(action, dict) or not action:
+            raise ValueError("action повинен бути непорожнім словником")
+        _reject_non_finite(action)
+        sensitive = _find_sensitive_field(action)
+        if sensitive:
+            raise ValueError(f"Схоже на секретне поле: {sensitive}")
+        revision = int(revision)
+        if revision < 1:
+            raise ValueError("revision повинен бути додатним")
+        return await self._request(
+            "POST",
+            f"/v1/games/{quote(game_id, safe='')}/move",
+            payload={"if_revision": revision, "action": action},
+        )
+
+    async def api_game_resign(self, game_id):
+        game_id = _game_id(game_id)
+        return await self._request(
+            "POST", f"/v1/games/{quote(game_id, safe='')}/resign", payload={}
+        )
+
+    async def api_game_cancel(self, game_id):
+        game_id = _game_id(game_id)
+        return await self._request(
+            "DELETE", f"/v1/games/{quote(game_id, safe='')}"
+        )
+
+    async def api_game_leaderboard(self, kind=None, sort="wins", limit=20):
+        if kind:
+            kind = _identifier(kind, "гра")
+            if kind not in _GAME_KINDS:
+                raise ValueError("Непідтримувана гра")
+        sort = str(sort).strip().lower()
+        if sort not in {"wins", "played", "rating"}:
+            raise ValueError("sort повинен бути wins, played або rating")
+        return await self._request(
+            "GET",
+            "/v1/games/leaderboard",
+            params={
+                "kind": kind,
+                "sort": sort,
+                "limit": max(1, min(int(limit), 100)),
+            },
+        )
+
+    async def api_game_profile(self):
+        return await self._request("GET", "/v1/games/profile")
+
+    async def api_chat_presence(self, room, nickname=""):
+        room = _room_identifier(room)
+        nickname = str(nickname or "").strip()
+        if len(nickname) > 40 or any(character in nickname for character in "\r\n"):
+            raise ValueError("Псевдонім має містити до 40 символів")
+        return await self._request(
+            "POST",
+            "/v1/chat/presence",
+            payload={"room": room, "nickname": nickname},
+        )
+
+    async def api_chat_leave(self, room):
+        room = _room_identifier(room)
+        return await self._request(
+            "DELETE", f"/v1/chat/presence/{quote(room, safe='')}"
+        )
+
+    async def api_chat_rooms(self, active_within=120, limit=50):
+        return await self._request(
+            "GET",
+            "/v1/chat/rooms",
+            params={
+                "active_within": max(30, min(int(active_within), 3600)),
+                "limit": max(1, min(int(limit), 100)),
+            },
+        )
+
+    async def api_chat_members(self, room, active_within=120, limit=100):
+        room = _room_identifier(room)
+        return await self._request(
+            "GET",
+            f"/v1/chat/rooms/{quote(room, safe='')}/members",
+            params={
+                "active_within": max(30, min(int(active_within), 3600)),
+                "limit": max(1, min(int(limit), 200)),
+            },
+        )
 
     async def api_get(self, namespace, item_key=None, prefix="", limit=50):
         namespace = _identifier(namespace, "namespace")
@@ -669,6 +839,10 @@ class HikkaNetMod(loader.Module):
             ],
             [
                 {"text": "📊 Статистика", "callback": self._stats_callback},
+                {"text": "🎮 Ігри", "callback": self._games_callback},
+            ],
+            [
+                {"text": "💬 Чат", "callback": self._chat_callback},
                 {"text": "📨 Події", "callback": self._events_callback},
             ],
             [{"text": "✖️ Закрити", "action": "close"}],
@@ -696,6 +870,10 @@ class HikkaNetMod(loader.Module):
             if remote:
                 lines.append(
                     f"Авторизація: <b>{_esc(remote.get('display_name') or remote.get('instance_id'))}</b>"
+                )
+                lines.append(
+                    f"Hikka Hub: <b>v{_esc(remote.get('server_version') or '?')}</b> · "
+                    f"API <b>{int(remote.get('api_version', 1) or 1)}</b>"
                 )
         else:
             lines.extend(["", self.strings["not_configured"]])
@@ -742,6 +920,8 @@ class HikkaNetMod(loader.Module):
         data = await self._request("GET", "/v1/stats")
         instances = data.get("instances", {})
         today = data.get("today", {})
+        games = data.get("games", {})
+        chat = data.get("chat", {})
         return (
             "<b>📊 HikkaNet · статистика</b>\n\n"
             f"🟢 Онлайн: <b>{int(instances.get('online', 0))}</b> / "
@@ -751,8 +931,55 @@ class HikkaNetMod(loader.Module):
             f"Запитів: <b>{int(today.get('requests', 0))}</b>\n"
             f"Heartbeat: <b>{int(today.get('heartbeats', 0))}</b>\n"
             f"Опубліковано подій: <b>{int(today.get('events', 0))}</b>\n"
-            f"Записів даних: <b>{int(today.get('kv_writes', 0))}</b>"
+            f"Записів даних: <b>{int(today.get('kv_writes', 0))}</b>\n\n"
+            "<b>Спільнота</b>\n"
+            f"Активних партій: <b>{int(games.get('active', 0))}</b>\n"
+            f"Завершених партій: <b>{int(games.get('finished', 0))}</b>\n"
+            f"Гравців: <b>{int(games.get('players', 0))}</b>\n"
+            f"Активних чат-кімнат: <b>{int(chat.get('active_rooms', 0))}</b>"
         )
+
+    async def _games_text(self):
+        overview, leaders = await asyncio.gather(
+            self.api_stats(),
+            self.api_game_leaderboard(sort="wins", limit=10),
+        )
+        games = overview.get("games", {})
+        lines = [
+            "🎮 <b>HikkaNet · глобальні ігри</b>",
+            "",
+            f"Активні: <b>{int(games.get('active', 0))}</b>",
+            f"Завершені: <b>{int(games.get('finished', 0))}</b>",
+            f"Гравці: <b>{int(games.get('players', 0))}</b>",
+            "",
+            "<b>Топ за перемогами</b>",
+        ]
+        for index, item in enumerate(leaders.get("ranking", [])[:10], 1):
+            lines.append(
+                f"{index}. <b>{_esc(item.get('display_name') or item.get('public_id'))}</b> — "
+                f"{int(item.get('wins', 0))}–{int(item.get('losses', 0))}–"
+                f"{int(item.get('draws', 0))} · {int(item.get('played', 0))} ігор"
+            )
+        if not leaders.get("ranking"):
+            lines.append("<i>Завершених мережевих ігор ще немає.</i>")
+        lines.extend(
+            ["", "Відкрити матчі: <code>.netgames</code> у модулі MiniGames."]
+        )
+        return "\n".join(lines)
+
+    async def _chat_text(self):
+        data = await self.api_chat_rooms(limit=20)
+        lines = ["💬 <b>HikkaNet · чат-кімнати</b>", ""]
+        for room in data.get("rooms", []):
+            lines.append(
+                f"• <code>#{_esc(room.get('room'))}</code> — "
+                f"🟢 {int(room.get('online', 0))} · "
+                f"💬 {int(room.get('messages_24h', 0))}/24г"
+            )
+        if not data.get("rooms"):
+            lines.append("<i>Активних кімнат ще немає.</i>")
+        lines.extend(["", "Відкрити чат: <code>.hkchat</code>."])
+        return "\n".join(lines)
 
     async def _events_text(self, topic=None, advance=False):
         after_id = int(self.get("last_event_id", 0) or 0)
@@ -792,6 +1019,12 @@ class HikkaNetMod(loader.Module):
 
     async def _stats_callback(self, call):
         await self._edit_callback(call, self._overview_text)
+
+    async def _games_callback(self, call):
+        await self._edit_callback(call, self._games_text)
+
+    async def _chat_callback(self, call):
+        await self._edit_callback(call, self._chat_text)
 
     async def _events_callback(self, call):
         await self._edit_callback(call, lambda: self._events_text(advance=True))
@@ -896,6 +1129,22 @@ class HikkaNetMod(loader.Module):
                     lines.append("Даних немає.")
                 text = "\n".join(lines)
             await utils.answer(message, text)
+        except Exception as exc:
+            await utils.answer(message, f"❌ <code>{_esc(self._safe_error(exc))}</code>")
+
+    @loader.command(ru_doc="Глобальна статистика ігор HikkaNet")
+    async def hknetgames(self, message):
+        """🎮 Глобальні партії та рейтинг HikkaNet"""
+        try:
+            await utils.answer(message, await self._games_text())
+        except Exception as exc:
+            await utils.answer(message, f"❌ <code>{_esc(self._safe_error(exc))}</code>")
+
+    @loader.command(ru_doc="Активні кімнати HikkaNetChat")
+    async def hknetrooms(self, message):
+        """💬 Активні чат-кімнати мережі"""
+        try:
+            await utils.answer(message, await self._chat_text())
         except Exception as exc:
             await utils.answer(message, f"❌ <code>{_esc(self._safe_error(exc))}</code>")
 

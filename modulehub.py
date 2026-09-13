@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 3.2.0
+# meta version: 3.3.0
 # meta description: 🧭 Центр команд, автооновлення та синхронізація статистики Hikka.
 # scope: inline
 # scope: hikka_only
@@ -148,13 +148,13 @@ class ModuleHubMod(loader.Module):
             "class": "HikkaNetMod",
             "name": "HikkaNet",
             "icon": "🌐",
-            "description": "Захищені події, спільні дані й статистика між Hikka.",
+            "description": "Захищені вузли, глобальні ігри, чат, події та статистика.",
         },
         "hikkanetchat": {
             "class": "HikkaNetChatMod",
             "name": "HikkaNetChat",
             "icon": "💬",
-            "description": "Кімнати спілкування між авторизованими Hikka.",
+            "description": "Глобальні кімнати, online-учасники та історія HikkaNet.",
         },
         "systemd": {
             "class": "SystemdMod",
@@ -190,7 +190,7 @@ class ModuleHubMod(loader.Module):
             "class": "MiniGamesMod",
             "name": "MiniGames",
             "icon": "🎮",
-            "description": "Інтерактивні ігри для чату з кнопками та рейтингом.",
+            "description": "Локальні й міжчатові HikkaNet-ігри з глобальним рейтингом.",
         },
         "alwaysonline": {
             "class": "AlwaysOnlineMod",
@@ -304,6 +304,8 @@ class ModuleHubMod(loader.Module):
         "hknetstatus",
         "hknetnodes",
         "hknetstats",
+        "hknetgames",
+        "hknetrooms",
         "hknetevents",
         "hknetget",
         "hknetsetup",
@@ -318,6 +320,8 @@ class ModuleHubMod(loader.Module):
         "hknick",
         "hksay",
         "hkhistory",
+        "hkrooms",
+        "hkmembers",
         "я",
         "чат",
         "топ",
@@ -345,6 +349,9 @@ class ModuleHubMod(loader.Module):
         "gwarns",
         "games",
         "gametop",
+        "netgames",
+        "netgame",
+        "netprofile",
         "ttt",
         "rps",
         "dicegame",
@@ -422,6 +429,8 @@ class ModuleHubMod(loader.Module):
         "hkleave",
         "hknick",
         "hksay",
+        "netgame",
+        "netjoin",
         "нік",
         "переказ",
         "чатнік",

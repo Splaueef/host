@@ -1,6 +1,6 @@
 # meta developer: @Huai_Baike
-# meta version: 1.0.0
-# meta description: 💬 Кімнати спілкування між авторизованими HikkaNet-вузлами.
+# meta version: 2.0.0
+# meta description: 💬 Глобальні кімнати HikkaNet з online-учасниками та історією.
 # scope: hikka_only
 
 """Small room-based chat built on top of the authenticated HikkaNet API."""
@@ -18,7 +18,7 @@ from .. import loader, utils
 
 
 logger = logging.getLogger(__name__)
-__version__ = (1, 0, 0)
+__version__ = (2, 0, 0)
 ROOM_RE = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 
 
@@ -90,6 +90,7 @@ class HikkaNetChatMod(loader.Module):
         self._poll_task = None
         self._stop_event = asyncio.Event()
         self._last_error = ""
+        self._last_presence = 0
 
     async def client_ready(self, client, db):
         self._client = client
@@ -107,6 +108,12 @@ class HikkaNetChatMod(loader.Module):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._poll_task
         self._poll_task = None
+        network = self._network()
+        leave = getattr(network, "api_chat_leave", None) if network else None
+        if callable(leave):
+            for room in self._rooms()[:32]:
+                with contextlib.suppress(Exception):
+                    await leave(room)
 
     @staticmethod
     def _room(value):
@@ -202,9 +209,11 @@ class HikkaNetChatMod(loader.Module):
     async def _poll_worker(self):
         await self._wait(5)
         while not self._stop_event.is_set():
-            if self.config["notify"] and self._network() is not None:
+            if self._network() is not None:
                 try:
-                    await self._poll_once()
+                    await self._sync_presence()
+                    if self.config["notify"]:
+                        await self._poll_once()
                     self._last_error = ""
                 except asyncio.CancelledError:
                     raise
@@ -213,32 +222,44 @@ class HikkaNetChatMod(loader.Module):
                     logger.warning("HikkaNetChat polling failed: %s", self._last_error)
             await self._wait(int(self.config["poll_interval"]))
 
+    async def _sync_presence(self, force=False):
+        network = self._network()
+        publish = getattr(network, "api_chat_presence", None) if network else None
+        if not callable(publish):
+            return
+        now = int(time.time())
+        if not force and now - int(self._last_presence or 0) < 45:
+            return
+        nickname = self._nickname()
+        for room in self._rooms()[:32]:
+            await publish(room, nickname)
+        self._last_presence = now
+
     async def _poll_once(self):
         network = self._network()
         if network is None:
             return
+        await self._sync_presence()
         cursors = self._cursors()
         instance_id = str(network.config["instance_id"])
-        for room in self._rooms():
-            if room not in cursors:
-                latest = await network.api_events(
-                    topic=self._topic(room), limit=1, latest=True
-                )
-                events = latest.get("events", [])
-                cursors[room] = max(
-                    [int(item.get("id", 0)) for item in events] or [0]
-                )
-                continue
-            after_id = int(cursors.get(room, 0) or 0)
-            data = await network.api_events(
-                after_id=after_id, topic=self._topic(room), limit=50
+        rooms = set(self._rooms())
+        global_cursor = int(cursors.get("__global__", 0) or 0)
+        if "__global__" not in cursors:
+            latest = await network.api_events(limit=1, latest=True)
+            events = latest.get("events", [])
+            cursors["__global__"] = max(
+                [int(item.get("id", 0)) for item in events] or [0]
             )
+            self._save_cursors(cursors)
+            return
+        for _ in range(3):
+            data = await network.api_events(after_id=global_cursor, limit=200)
             events = data.get("events", [])
             for event in events:
-                cursors[room] = max(
-                    int(cursors.get(room, 0) or 0), int(event.get("id", 0))
-                )
-                if event.get("sender_instance_id") == instance_id:
+                global_cursor = max(global_cursor, int(event.get("id", 0)))
+                topic = str(event.get("topic", ""))
+                room = topic[5:] if topic.startswith("chat.") else ""
+                if room not in rooms or event.get("sender_instance_id") == instance_id:
                     continue
                 payload = event.get("payload")
                 if not isinstance(payload, dict) or payload.get("kind") != "chat.message":
@@ -254,6 +275,9 @@ class HikkaNetChatMod(loader.Module):
                     parse_mode="html",
                 )
                 self._count("messages_received")
+            if len(events) < 200:
+                break
+        cursors["__global__"] = global_cursor
         self._save_cursors(cursors)
 
     @staticmethod
@@ -283,6 +307,8 @@ class HikkaNetChatMod(loader.Module):
             "",
             "<code>.hksay текст</code> — написати",
             "<code>.hkhistory [room]</code> — історія",
+            "<code>.hkrooms</code> — глобальні кімнати",
+            "<code>.hkmembers [room]</code> — хто online",
             "<code>.hkjoin room</code> — приєднатися",
             "<code>.hkroom room</code> — вибрати активну",
             "<code>.hkleave [room]</code> — вийти",
@@ -302,9 +328,121 @@ class HikkaNetChatMod(loader.Module):
             )
         return "\n".join(lines)
 
+    def _panel_markup(self):
+        return [
+            [
+                {"text": "🔄 Оновити", "callback": self._status_callback},
+                {"text": "🌐 Кімнати", "callback": self._rooms_callback},
+            ],
+            [
+                {"text": "👥 Учасники", "callback": self._members_callback},
+                {"text": "🕘 Історія", "callback": self._history_callback},
+            ],
+            [{"text": "✖️ Закрити", "action": "close"}],
+        ]
+
+    async def _rooms_text(self):
+        network = self._network()
+        method = getattr(network, "api_chat_rooms", None) if network else None
+        if not callable(method):
+            raise RuntimeError("Онови модуль HikkaNet до версії 2.0.0")
+        data = await method(limit=50)
+        lines = ["🌐 <b>HikkaNetChat · кімнати</b>", ""]
+        for item in data.get("rooms", []):
+            lines.append(
+                f"• <code>#{_esc(item.get('room'))}</code> — "
+                f"🟢 <b>{int(item.get('online', 0))}</b> · "
+                f"💬 {int(item.get('messages_24h', 0))} за 24 год"
+            )
+        if not data.get("rooms"):
+            lines.append("<i>Активних кімнат ще немає.</i>")
+        return "\n".join(lines)
+
+    async def _members_text(self, room=None):
+        network = self._network()
+        method = getattr(network, "api_chat_members", None) if network else None
+        if not callable(method):
+            raise RuntimeError("Онови модуль HikkaNet до версії 2.0.0")
+        room = self._room(room or self.config["active_room"])
+        data = await method(room, limit=100)
+        lines = [f"👥 <b>HikkaNetChat · #{_esc(room)}</b>", ""]
+        for item in data.get("members", []):
+            nickname = item.get("nickname") or item.get("display_name") or "Hikka"
+            lines.append(
+                f"🟢 <b>{_esc(nickname)}</b> "
+                f"<code>{_esc(item.get('instance_id'))}</code>"
+            )
+        if not data.get("members"):
+            lines.append("<i>Зараз нікого немає online.</i>")
+        return "\n".join(lines)
+
+    async def _history_text(self, room):
+        network = self._network()
+        if network is None:
+            raise RuntimeError("HikkaNet не встановлено або не налаштовано")
+        room = self._room(room)
+        data = await network.api_events(
+            topic=self._topic(room),
+            limit=int(self.config["history_limit"]),
+            latest=True,
+        )
+        events = data.get("events", [])
+        lines = [line for line in (self._event_line(event) for event in events) if line]
+        if events:
+            cursors = self._cursors()
+            cursors[room] = max(int(item.get("id", 0)) for item in events)
+            self._save_cursors(cursors)
+        header = f"💬 <b>HikkaNet · #{_esc(room)}</b>\n\n"
+        selected = []
+        used = len(header)
+        for line in reversed(lines):
+            if used + len(line) + 2 > 4000:
+                break
+            selected.insert(0, line)
+            used += len(line) + 2
+        return header + (
+            "\n\n".join(selected)
+            if selected
+            else "<i>Повідомлень ще немає.</i>"
+        )
+
+    async def _edit_panel(self, call, producer):
+        try:
+            text = await producer()
+            await call.edit(text, reply_markup=self._panel_markup())
+        except Exception as error:
+            self._last_error = str(error).replace("\n", " ")[:240]
+            await call.answer(self._last_error, show_alert=True)
+
+    async def _status_callback(self, call):
+        with contextlib.suppress(Exception):
+            await self._sync_presence(force=True)
+        await call.edit(self._status_text(), reply_markup=self._panel_markup())
+
+    async def _rooms_callback(self, call):
+        await self._edit_panel(call, self._rooms_text)
+
+    async def _members_callback(self, call):
+        await self._edit_panel(call, self._members_text)
+
+    async def _history_callback(self, call):
+        await self._edit_panel(
+            call, lambda: self._history_text(self.config["active_room"])
+        )
+
     @loader.command(ru_doc="Стан і довідка HikkaNetChat")
     async def hkchat(self, message):
         """💬 Відкрити HikkaNetChat"""
+        with contextlib.suppress(Exception):
+            await self._sync_presence(force=True)
+        try:
+            opened = await self.inline.form(
+                self._status_text(), message, reply_markup=self._panel_markup()
+            )
+            if opened:
+                return
+        except Exception:
+            logger.exception("HikkaNetChat inline panel failed")
         await utils.answer(message, self._status_text())
 
     @loader.command(ru_doc="Приєднатися до HikkaNet-кімнати")
@@ -323,6 +461,8 @@ class HikkaNetChatMod(loader.Module):
         cursors = self._cursors()
         cursors.pop(room, None)
         self._save_cursors(cursors)
+        with contextlib.suppress(Exception):
+            await self._sync_presence(force=True)
         await utils.answer(message, f"✅ Активна кімната: <code>#{_esc(room)}</code>")
 
     @loader.command(ru_doc="Змінити активну HikkaNet-кімнату")
@@ -349,6 +489,11 @@ class HikkaNetChatMod(loader.Module):
             await utils.answer(message, f"❌ <code>{_esc(error)}</code>")
             return
         rooms = [item for item in self._rooms() if item != room]
+        network = self._network()
+        leave = getattr(network, "api_chat_leave", None) if network else None
+        if callable(leave):
+            with contextlib.suppress(Exception):
+                await leave(room)
         self.config["rooms"] = rooms
         if self.config["active_room"] == room:
             self.config["active_room"] = rooms[0] if rooms else ""
@@ -365,7 +510,26 @@ class HikkaNetChatMod(loader.Module):
             await utils.answer(message, "❌ Псевдонім має містити до 40 символів.")
             return
         self.config["nickname"] = nickname
+        with contextlib.suppress(Exception):
+            await self._sync_presence(force=True)
         await utils.answer(message, f"✅ Новий псевдонім: <b>{_esc(nickname)}</b>")
+
+    @loader.command(ru_doc="Показати активні кімнати HikkaNetChat")
+    async def hkrooms(self, message):
+        """🌐 Кімнати, online і повідомлення за 24 години"""
+        try:
+            await utils.answer(message, await self._rooms_text())
+        except Exception as error:
+            await utils.answer(message, f"❌ <code>{_esc(error)}</code>")
+
+    @loader.command(ru_doc="Показати online-учасників чат-кімнати")
+    async def hkmembers(self, message):
+        """👥 .hkmembers [room]"""
+        raw = utils.get_args_raw(message).strip() or self.config["active_room"]
+        try:
+            await utils.answer(message, await self._members_text(raw))
+        except Exception as error:
+            await utils.answer(message, f"❌ <code>{_esc(error)}</code>")
 
     @loader.command(ru_doc="Надіслати повідомлення в активну HikkaNet-кімнату")
     async def hksay(self, message):
@@ -403,39 +567,11 @@ class HikkaNetChatMod(loader.Module):
     @loader.command(ru_doc="Показати останні повідомлення HikkaNet-кімнати")
     async def hkhistory(self, message):
         """🕘 .hkhistory [room]"""
-        network = self._network()
-        if network is None:
-            await utils.answer(message, "❌ HikkaNet не встановлено або не налаштовано.")
-            return
         raw = utils.get_args_raw(message).strip() or self.config["active_room"]
         try:
-            room = self._room(raw)
-            data = await network.api_events(
-                topic=self._topic(room),
-                limit=int(self.config["history_limit"]),
-                latest=True,
-            )
+            text = await self._history_text(raw)
         except Exception as error:
             self._last_error = str(error).replace("\n", " ")[:240]
             await utils.answer(message, f"❌ <code>{_esc(self._last_error)}</code>")
             return
-        events = data.get("events", [])
-        lines = [line for line in (self._event_line(event) for event in events) if line]
-        if events:
-            cursors = self._cursors()
-            cursors[room] = max(int(item.get("id", 0)) for item in events)
-            self._save_cursors(cursors)
-        header = f"💬 <b>HikkaNet · #{_esc(room)}</b>\n\n"
-        selected = []
-        used = len(header)
-        for line in reversed(lines):
-            if used + len(line) + 2 > 4000:
-                break
-            selected.insert(0, line)
-            used += len(line) + 2
-        text = header + (
-            "\n\n".join(selected)
-            if selected
-            else "<i>Повідомлень ще немає.</i>"
-        )
         await utils.answer(message, text)
