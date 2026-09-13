@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 2.1.1
+# meta version: 2.1.2
 # meta description: 🧭 Центр команд, конфігурації та встановлення модулів Hikka.
 # scope: inline
 # scope: hikka_only
@@ -149,7 +149,7 @@ class ModuleHubMod(loader.Module):
             "class": "HiddenGiftsMod",
             "name": "HiddenGifts",
             "icon": "🎁",
-            "description": "Безпечне надсилання прихованих історичних подарунків.",
+            "description": "Надсилання актуальних та прихованих Telegram-подарунків.",
         },
         "sysinfo": {
             "class": "InfoMod",

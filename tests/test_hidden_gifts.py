@@ -64,6 +64,10 @@ def _load_module():
         def __init__(self, invoice):
             self.invoice = invoice
 
+    class GetStarGiftsRequest:
+        def __init__(self, hash):
+            self.hash = hash
+
     class SendStarsFormRequest:
         def __init__(self, form_id, invoice):
             self.form_id = form_id
@@ -83,6 +87,7 @@ def _load_module():
 
     telethon_errors.RPCError = RPCError
     telethon_payments.GetPaymentFormRequest = GetPaymentFormRequest
+    telethon_payments.GetStarGiftsRequest = GetStarGiftsRequest
     telethon_payments.SendStarsFormRequest = SendStarsFormRequest
     telethon_types.InputInvoiceStarGift = InputInvoiceStarGift
     telethon_types.TextWithEntities = TextWithEntities
@@ -126,6 +131,36 @@ def _form(amount=50, currency="XTR", form_id=100):
     )
 
 
+def _gift(
+    gift_id,
+    title="Кекс",
+    stars=25,
+    emoji="🧁",
+    sold_out=False,
+    auction=False,
+    remains=None,
+    per_user_remains=None,
+    require_premium=False,
+):
+    sticker = types.SimpleNamespace(
+        attributes=[types.SimpleNamespace(alt=emoji)]
+    )
+    return types.SimpleNamespace(
+        id=gift_id,
+        title=title,
+        stars=stars,
+        sticker=sticker,
+        sold_out=sold_out,
+        auction=auction,
+        availability_remains=remains,
+        availability_total=100 if remains is not None else None,
+        per_user_remains=per_user_remains,
+        locked_until_date=None,
+        require_premium=require_premium,
+        birthday=False,
+    )
+
+
 class _Entity:
     def __init__(self, user_id=42, first_name="Yana", bot=False):
         self.id = user_id
@@ -135,8 +170,9 @@ class _Entity:
 
 
 class _Client:
-    def __init__(self, forms=None):
+    def __init__(self, forms=None, catalog=None):
         self.forms = list(forms or [])
+        self.catalog = list(catalog or [])
         self.requests = []
         self.entities = {"@yana": _Entity()}
 
@@ -150,6 +186,8 @@ class _Client:
 
     async def __call__(self, request):
         self.requests.append(request)
+        if isinstance(request, hidden_gifts.GetStarGiftsRequest):
+            return types.SimpleNamespace(gifts=self.catalog)
         if isinstance(request, hidden_gifts.SendStarsFormRequest):
             return types.SimpleNamespace(updates=[])
         response = self.forms.pop(0)
@@ -200,8 +238,8 @@ class HiddenGiftsTests(unittest.IsolatedAsyncioTestCase):
         self.module = hidden_gifts.HiddenGiftsMod()
         self.module.inline = _Inline()
 
-    async def _ready(self, forms=None):
-        client = _Client(forms)
+    async def _ready(self, forms=None, catalog=None):
+        client = _Client(forms, catalog)
         await self.module.client_ready(client, object())
         return client
 
@@ -220,7 +258,7 @@ class HiddenGiftsTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_command_opens_owner_only_catalog_with_message(self):
-        await self._ready()
+        client = await self._ready(catalog=[_gift(7000000000000000001)])
         message = _Message("@yana | Люблю тебе")
 
         await self.module.hgift(message)
@@ -231,7 +269,58 @@ class HiddenGiftsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Yana", form["text"])
         self.assertIn("Люблю тебе", form["text"])
         labels = [button["text"] for button in _buttons(form["reply_markup"])]
-        self.assertTrue(any("Білий ведмедик" in label for label in labels))
+        self.assertTrue(any("Актуальні · 1" in label for label in labels))
+        self.assertTrue(any("Історичні · 11" in label for label in labels))
+        self.assertIsInstance(client.requests[0], hidden_gifts.GetStarGiftsRequest)
+
+    async def test_current_catalog_filters_unsendable_and_historical_duplicates(self):
+        current_id = 7000000000000000001
+        await self._ready(
+            catalog=[
+                _gift(current_id, title="Кекс", stars=25),
+                _gift(7000000000000000002, sold_out=True),
+                _gift(7000000000000000003, auction=True),
+                _gift(7000000000000000004, remains=0),
+                _gift(5800655655995968830),
+            ]
+        )
+
+        gifts = await self.module._get_current_gifts()
+
+        self.assertEqual([gift["id"] for gift in gifts], [current_id])
+        self.assertEqual(gifts[0]["emoji"], "🧁")
+        self.assertEqual(gifts[0]["stars"], 25)
+
+    async def test_current_gift_can_be_selected_and_paid(self):
+        current_id = 7000000000000000001
+        client = await self._ready([_form(25), _form(25)])
+        gift = self.module._normalise_current_gifts([_gift(current_id)])[0]
+        recipient = {"peer": "input:42", "name": "Yana", "id": 42}
+        token = self.module._create_session(recipient, "", current_gifts=[gift])
+        call = _Call()
+
+        await self.module._select_gift(call, token, current_id, "current", 0)
+        await self.module._pay(call, token)
+
+        self.assertEqual(len(client.requests), 3)
+        self.assertIsInstance(client.requests[-1], hidden_gifts.SendStarsFormRequest)
+        self.assertEqual(client.requests[-1].invoice.gift_id, current_id)
+        self.assertIn("Подарунок надіслано", call.edits[-1]["text"])
+
+    async def test_current_catalog_is_paginated(self):
+        await self._ready()
+        gifts = self.module._normalise_current_gifts(
+            [_gift(7000000000000000000 + index, title=f"Gift {index}") for index in range(1, 11)]
+        )
+        recipient = {"peer": "input:42", "name": "Yana", "id": 42}
+        token = self.module._create_session(recipient, "", current_gifts=gifts)
+        call = _Call()
+
+        await self.module._open_catalog(call, token, "current", 0)
+
+        labels = [button["text"] for button in _buttons(call.edits[-1]["reply_markup"])]
+        self.assertIn("➡️", labels)
+        self.assertIn("Сторінка <b>1/2</b>", call.edits[-1]["text"])
 
     async def test_selection_preflights_before_showing_payment_button(self):
         client = await self._ready([_form(50)])

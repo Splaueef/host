@@ -1,10 +1,10 @@
 # meta developer: @Huang_Baike
-# meta version: 1.0.0
-# meta description: Безпечне надсилання прихованих історичних Telegram-подарунків
+# meta version: 1.1.0
+# meta description: Безпечне надсилання актуальних та прихованих Telegram-подарунків
 # scope: inline
 # scope: hikka_only
 
-__version__ = (1, 0, 0)
+__version__ = (1, 1, 0)
 
 import asyncio
 import html
@@ -16,6 +16,7 @@ try:
     from telethon.errors import RPCError
     from telethon.tl.functions.payments import (
         GetPaymentFormRequest,
+        GetStarGiftsRequest,
         SendStarsFormRequest,
     )
     from telethon.tl.types import InputInvoiceStarGift, TextWithEntities
@@ -24,6 +25,7 @@ try:
 except ImportError:
     RPCError = Exception
     GetPaymentFormRequest = None
+    GetStarGiftsRequest = None
     SendStarsFormRequest = None
     InputInvoiceStarGift = None
     TextWithEntities = None
@@ -35,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 128
 SESSION_TTL = 10 * 60
+CATALOG_TTL = 5 * 60
+PAGE_SIZE = 8
 
 
 class GiftFormError(Exception):
@@ -43,18 +47,19 @@ class GiftFormError(Exception):
 
 @loader.tds
 class HiddenGiftsMod(loader.Module):
-    """Надсилає 11 прихованих історичних подарунків через Telegram Stars."""
+    """Надсилає актуальні та приховані історичні подарунки через Stars."""
 
     strings = {
         "name": "HiddenGifts",
         "cfg_hide_name": "За замовчуванням приховувати ім'я відправника у профілі",
         "usage": (
             "🎁 <b>HiddenGifts</b>\n\n"
-            "<code>.hgift @username</code> — відкрити каталог\n"
+            "<code>.hgift @username</code> — відкрити весь каталог\n"
             "<code>.hgift @username | Текст</code> — додати підпис\n"
             "<code>.hgift</code> у приватному чаті — подарунок співрозмовнику\n"
             "<code>.hgift</code> у відповідь — подарунок автору повідомлення\n"
-            "<code>.hgiftcheck @username</code> — перевірити доступність усіх 11\n\n"
+            "<code>.hgiftcheck @username</code> — перевірити 11 історичних ID\n\n"
+            "Актуальні подарунки завантажуються безпосередньо з Telegram. "
             "Оплата відбувається лише після окремого підтвердження."
         ),
         "need_recipient": (
@@ -68,16 +73,41 @@ class HiddenGiftsMod(loader.Module):
             "❌ Підпис задовгий: <b>{length}</b>/<b>{maximum}</b> символів."
         ),
         "telethon_too_old": (
-            "❌ Ця версія Telethon/Hikka не підтримує оплату Star Gifts. "
+            "❌ Ця версія Telethon/Hikka не підтримує каталог або оплату Star Gifts. "
             "Онови Hikka та Telethon, а потім перезавантаж модуль."
         ),
-        "catalog": (
-            "🎁 <b>Приховані історичні подарунки</b>\n\n"
+        "home": (
+            "🎁 <b>Каталог Telegram-подарунків</b>\n\n"
             "👤 <b>Одержувач:</b> {recipient}\n"
             "💬 <b>Підпис:</b> {message}\n"
             "🙈 <b>Приховати ім'я:</b> {hidden}\n\n"
-            "Обери подарунок. Telegram перевірить його доступність і поверне "
-            "актуальну суму до того, як з'явиться кнопка оплати."
+            "🛍 Доступні зараз: <b>{current_count}</b>\n"
+            "🕰 Приховані історичні: <b>{historical_count}</b>\n\n"
+            "Обери розділ. Перед оплатою Telegram перевірить подарунок і поверне "
+            "точну суму.{warning}"
+        ),
+        "catalog_warning": (
+            "\n\n⚠️ Актуальний каталог не завантажився: {error}. "
+            "Історичні подарунки все одно доступні."
+        ),
+        "catalog_page": (
+            "🎁 <b>{title}</b>\n\n"
+            "👤 <b>Одержувач:</b> {recipient}\n"
+            "📄 Сторінка <b>{page}/{pages}</b> · подарунків: <b>{count}</b>\n\n"
+            "{hint}"
+        ),
+        "current_hint": (
+            "Показані всі звичайні подарунки, які Telegram зараз дозволяє "
+            "купувати. Ціна на кнопці довідкова; перед списанням вона буде "
+            "перевірена ще раз."
+        ),
+        "historical_hint": (
+            "Ці старі подарунки приховані у стандартному каталозі. Кожен ID "
+            "перевіряється через Telegram перед появою кнопки оплати."
+        ),
+        "current_empty": (
+            "Актуальних подарунків для звичайного надсилання зараз немає або "
+            "Telegram не повернув каталог."
         ),
         "no_message": "немає",
         "yes": "так",
@@ -85,11 +115,12 @@ class HiddenGiftsMod(loader.Module):
         "session_expired": (
             "⌛ Сесія застаріла або вже використана. Запусти <code>.hgift</code> ще раз."
         ),
+        "refreshing": "🔄 Оновлюю каталог безпосередньо з Telegram…",
         "checking": "🔎 Перевіряю подарунок у Telegram…",
         "confirm": (
             "⚠️ <b>Підтвердження покупки</b>\n\n"
             "🎁 <b>{gift}</b>\n"
-            "📅 Тематика: <b>{occasion}</b>\n"
+            "📚 Категорія: <b>{category}</b>\n"
             "🔢 ID: <code>{gift_id}</code>\n"
             "👤 Одержувач: {recipient}\n"
             "💬 Підпис: {message}\n"
@@ -215,6 +246,9 @@ class HiddenGiftsMod(loader.Module):
         )
         self._client = None
         self._sessions = {}
+        self._current_gifts = ()
+        self._current_loaded_at = 0.0
+        self._catalog_lock = asyncio.Lock()
         self._payment_lock = asyncio.Lock()
 
     async def client_ready(self, client, db):
@@ -223,8 +257,9 @@ class HiddenGiftsMod(loader.Module):
 
     async def on_unload(self):
         self._sessions.clear()
+        self._current_gifts = ()
 
-    @loader.command(ru_doc="Відкрити каталог прихованих історичних подарунків")
+    @loader.command(ru_doc="Відкрити каталог усіх доступних Telegram-подарунків")
     async def hgift(self, message):
         """Відкрити каталог: .hgift [@user] [| підпис]"""
         if not GIFT_API_AVAILABLE:
@@ -250,11 +285,24 @@ class HiddenGiftsMod(loader.Module):
         if recipient is None:
             return
 
-        token = self._create_session(recipient, gift_message)
+        catalog_error = ""
+        try:
+            current_gifts = await self._get_current_gifts()
+        except Exception as error:
+            logger.warning("[HiddenGifts] Current catalogue load failed: %s", error)
+            current_gifts = ()
+            catalog_error = self._friendly_error(error)
+
+        token = self._create_session(
+            recipient,
+            gift_message,
+            current_gifts=current_gifts,
+            catalog_error=catalog_error,
+        )
         opened = await self.inline.form(
-            self._catalog_text(self._sessions[token]),
+            self._home_text(self._sessions[token]),
             message,
-            reply_markup=self._catalog_markup(token),
+            reply_markup=self._home_markup(token),
             force_me=True,
         )
         if not opened:
@@ -263,7 +311,7 @@ class HiddenGiftsMod(loader.Module):
 
     @loader.command(ru_doc="Перевірити доступність 11 прихованих подарунків")
     async def hgiftcheck(self, message):
-        """Перевірити доступність: .hgiftcheck [@user]"""
+        """Перевірити історичні ID: .hgiftcheck [@user]"""
         if not GIFT_API_AVAILABLE:
             await utils.answer(message, self.strings["telethon_too_old"])
             return
@@ -369,9 +417,106 @@ class HiddenGiftsMod(loader.Module):
             or getattr(entity, "id", "невідомо")
         )
 
-    def _create_session(self, recipient, gift_message):
+    async def _get_current_gifts(self, force=False):
+        if (
+            not force
+            and self._current_loaded_at
+            and time.monotonic() - self._current_loaded_at < CATALOG_TTL
+        ):
+            return self._current_gifts
+
+        async with self._catalog_lock:
+            if (
+                not force
+                and self._current_loaded_at
+                and time.monotonic() - self._current_loaded_at < CATALOG_TTL
+            ):
+                return self._current_gifts
+
+            response = await self._client(GetStarGiftsRequest(hash=0))
+            raw_gifts = getattr(response, "gifts", None)
+            if raw_gifts is None:
+                raise GiftFormError("Telegram повернув неповний каталог подарунків")
+            self._current_gifts = tuple(self._normalise_current_gifts(raw_gifts))
+            self._current_loaded_at = time.monotonic()
+            return self._current_gifts
+
+    def _normalise_current_gifts(self, raw_gifts):
+        historical_ids = set(self.GIFT_BY_ID)
+        seen = set()
+        result = []
+        for item in raw_gifts:
+            gift_id = int(getattr(item, "id", 0) or 0)
+            stars = int(getattr(item, "stars", 0) or 0)
+            remains = getattr(item, "availability_remains", None)
+            per_user_remains = getattr(item, "per_user_remains", None)
+            if (
+                gift_id <= 0
+                or gift_id in historical_ids
+                or gift_id in seen
+                or stars <= 0
+                or bool(getattr(item, "sold_out", False))
+                or bool(getattr(item, "auction", False))
+                or remains == 0
+                or per_user_remains == 0
+                or self._is_locked(item)
+            ):
+                continue
+
+            seen.add(gift_id)
+            title = str(getattr(item, "title", "") or "").strip()
+            emoji = self._gift_emoji(getattr(item, "sticker", None))
+            result.append(
+                {
+                    "id": gift_id,
+                    "emoji": emoji,
+                    "name": title or f"Подарунок {gift_id}",
+                    "occasion": (
+                        "день народження"
+                        if bool(getattr(item, "birthday", False))
+                        else "актуальний каталог Telegram"
+                    ),
+                    "source": "current",
+                    "stars": stars,
+                    "premium": bool(getattr(item, "require_premium", False)),
+                    "availability_remains": remains,
+                    "availability_total": getattr(item, "availability_total", None),
+                }
+            )
+        return result
+
+    @staticmethod
+    def _is_locked(item):
+        locked_until = getattr(item, "locked_until_date", None)
+        if not locked_until:
+            return False
+        try:
+            timestamp = locked_until.timestamp()
+        except AttributeError:
+            try:
+                timestamp = float(locked_until)
+            except (TypeError, ValueError):
+                return True
+        return timestamp > time.time()
+
+    @staticmethod
+    def _gift_emoji(sticker):
+        for attribute in getattr(sticker, "attributes", ()) or ():
+            alt = str(getattr(attribute, "alt", "") or "").strip()
+            if alt:
+                return alt[:8]
+        return "🎁"
+
+    def _create_session(
+        self,
+        recipient,
+        gift_message,
+        current_gifts=None,
+        catalog_error="",
+    ):
         self._purge_sessions()
         token = secrets.token_urlsafe(9)
+        current_gifts = tuple(current_gifts or ())
         self._sessions[token] = {
             "created_at": time.monotonic(),
             "peer": recipient["peer"],
@@ -379,7 +524,13 @@ class HiddenGiftsMod(loader.Module):
             "recipient_id": recipient["id"],
             "message": gift_message,
             "hide_name": bool(self.config["hide_name_by_default"]),
+            "current_gifts": current_gifts,
+            "current_by_id": {gift["id"]: gift for gift in current_gifts},
+            "catalog_error": catalog_error,
+            "category": "home",
+            "page": 0,
             "gift_id": None,
+            "gift": None,
             "confirmed_price": None,
             "processing": False,
         }
@@ -395,26 +546,142 @@ class HiddenGiftsMod(loader.Module):
         self._purge_sessions()
         return self._sessions.get(token)
 
-    def _catalog_text(self, session):
-        message = session["message"] or self.strings["no_message"]
-        return self.strings["catalog"].format(
+    def _home_text(self, session):
+        warning = ""
+        if session.get("catalog_error"):
+            warning = self.strings["catalog_warning"].format(
+                error=html.escape(session["catalog_error"])
+            )
+        return self.strings["home"].format(
             recipient=html.escape(session["recipient"]),
-            message=html.escape(message),
+            message=html.escape(session["message"] or self.strings["no_message"]),
             hidden=self.strings["yes" if session["hide_name"] else "no"],
+            current_count=len(session["current_gifts"]),
+            historical_count=len(self.GIFTS),
+            warning=warning,
         )
 
-    def _catalog_markup(self, token):
+    def _home_markup(self, token):
+        session = self._get_session(token)
+        current_count = len(session["current_gifts"]) if session else 0
+        return [
+            [
+                {
+                    "text": f"🛍 Актуальні · {current_count}",
+                    "callback": self._open_catalog,
+                    "args": (token, "current", 0),
+                }
+            ],
+            [
+                {
+                    "text": f"🕰 Історичні · {len(self.GIFTS)}",
+                    "callback": self._open_catalog,
+                    "args": (token, "historical", 0),
+                }
+            ],
+            [
+                {
+                    "text": "🔄 Оновити каталог",
+                    "callback": self._refresh_catalog,
+                    "args": (token,),
+                },
+                {
+                    "text": "✖️ Скасувати",
+                    "callback": self._cancel,
+                    "args": (token,),
+                },
+            ],
+        ]
+
+    def _gifts_for_category(self, session, category):
+        if category == "historical":
+            return self.GIFTS
+        if category == "current":
+            return session["current_gifts"]
+        return ()
+
+    async def _open_catalog(self, call, token, category, page=0):
+        session = self._get_session(token)
+        if session is None or session.get("processing"):
+            await call.answer(self.strings["session_expired"], show_alert=True)
+            return
+        gifts = self._gifts_for_category(session, category)
+        if not gifts:
+            await call.answer(self.strings["current_empty"], show_alert=True)
+            return
+
+        pages = max(1, (len(gifts) + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = max(0, min(int(page), pages - 1))
+        session["category"] = category
+        session["page"] = page
+        await call.edit(
+            self._catalog_page_text(session, category, page),
+            reply_markup=self._catalog_page_markup(token, category, page),
+        )
+
+    def _catalog_page_text(self, session, category, page):
+        gifts = self._gifts_for_category(session, category)
+        pages = max(1, (len(gifts) + PAGE_SIZE - 1) // PAGE_SIZE)
+        return self.strings["catalog_page"].format(
+            title=(
+                "Актуальні подарунки Telegram"
+                if category == "current"
+                else "Приховані історичні подарунки"
+            ),
+            recipient=html.escape(session["recipient"]),
+            page=page + 1,
+            pages=pages,
+            count=len(gifts),
+            hint=self.strings[
+                "current_hint" if category == "current" else "historical_hint"
+            ],
+        )
+
+    def _catalog_page_markup(self, token, category, page):
+        session = self._get_session(token)
+        if session is None:
+            return []
+        gifts = self._gifts_for_category(session, category)
+        pages = max(1, (len(gifts) + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = max(0, min(int(page), pages - 1))
+        start = page * PAGE_SIZE
+        visible = gifts[start : start + PAGE_SIZE]
         buttons = [
             {
-                "text": f"{gift['emoji']} {gift['name']}",
+                "text": self._gift_button_text(gift),
                 "callback": self._select_gift,
-                "args": (token, gift["id"]),
+                "args": (token, gift["id"], category, page),
             }
-            for gift in self.GIFTS
+            for gift in visible
         ]
         rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+
+        navigation = []
+        if page > 0:
+            navigation.append(
+                {
+                    "text": "⬅️",
+                    "callback": self._open_catalog,
+                    "args": (token, category, page - 1),
+                }
+            )
+        if page + 1 < pages:
+            navigation.append(
+                {
+                    "text": "➡️",
+                    "callback": self._open_catalog,
+                    "args": (token, category, page + 1),
+                }
+            )
+        if navigation:
+            rows.append(navigation)
         rows.append(
             [
+                {
+                    "text": "↩️ До розділів",
+                    "callback": self._back_home,
+                    "args": (token,),
+                },
                 {
                     "text": "✖️ Скасувати",
                     "callback": self._cancel,
@@ -424,13 +691,61 @@ class HiddenGiftsMod(loader.Module):
         )
         return rows
 
-    async def _select_gift(self, call, token, gift_id):
+    @staticmethod
+    def _gift_button_text(gift):
+        price = f" · {gift['stars']} ⭐" if gift.get("stars") else ""
+        premium = "🔒 " if gift.get("premium") else ""
+        label = f"{premium}{gift['emoji']} {gift['name']}{price}"
+        return label if len(label) <= 60 else f"{label[:57]}…"
+
+    async def _refresh_catalog(self, call, token):
         session = self._get_session(token)
-        gift = self.GIFT_BY_ID.get(int(gift_id))
+        if session is None or session.get("processing"):
+            await call.answer(self.strings["session_expired"], show_alert=True)
+            return
+        await call.answer(self.strings["refreshing"])
+        try:
+            gifts = tuple(await self._get_current_gifts(force=True))
+        except Exception as error:
+            logger.warning("[HiddenGifts] Catalogue refresh failed: %s", error)
+            session["catalog_error"] = self._friendly_error(error)
+        else:
+            session["current_gifts"] = gifts
+            session["current_by_id"] = {gift["id"]: gift for gift in gifts}
+            session["catalog_error"] = ""
+        session["category"] = "home"
+        session["page"] = 0
+        await call.edit(
+            self._home_text(session), reply_markup=self._home_markup(token)
+        )
+
+    async def _back_home(self, call, token):
+        session = self._get_session(token)
+        if session is None or session.get("processing"):
+            await call.answer(self.strings["session_expired"], show_alert=True)
+            return
+        session["category"] = "home"
+        session["page"] = 0
+        session["gift_id"] = None
+        session["gift"] = None
+        session["confirmed_price"] = None
+        await call.edit(
+            self._home_text(session), reply_markup=self._home_markup(token)
+        )
+
+    def _gift_for_session(self, session, gift_id):
+        gift_id = int(gift_id)
+        return self.GIFT_BY_ID.get(gift_id) or session["current_by_id"].get(gift_id)
+
+    async def _select_gift(self, call, token, gift_id, category=None, page=0):
+        session = self._get_session(token)
+        gift = self._gift_for_session(session, gift_id) if session else None
         if session is None or gift is None or session.get("processing"):
             await call.answer(self.strings["session_expired"], show_alert=True)
             return
 
+        session["category"] = category or gift.get("source", "historical")
+        session["page"] = int(page)
         await call.answer(self.strings["checking"])
         try:
             _, _, price = await self._prepare_payment(session, gift["id"])
@@ -445,12 +760,13 @@ class HiddenGiftsMod(loader.Module):
             return
 
         session["gift_id"] = gift["id"]
+        session["gift"] = gift
         session["confirmed_price"] = price
         await self._show_confirmation(call, token)
 
     async def _toggle_hide(self, call, token):
         session = self._get_session(token)
-        if session is None or session.get("gift_id") is None or session.get("processing"):
+        if session is None or session.get("gift") is None or session.get("processing"):
             await call.answer(self.strings["session_expired"], show_alert=True)
             return
         session["hide_name"] = not session["hide_name"]
@@ -458,15 +774,15 @@ class HiddenGiftsMod(loader.Module):
 
     async def _show_confirmation(self, call, token, note=""):
         session = self._get_session(token)
-        if session is None or session.get("gift_id") is None:
+        if session is None or session.get("gift") is None:
             await call.answer(self.strings["session_expired"], show_alert=True)
             return
-        gift = self.GIFT_BY_ID[session["gift_id"]]
+        gift = session["gift"]
         price = session["confirmed_price"]
         await call.edit(
             self.strings["confirm"].format(
                 gift=html.escape(f"{gift['emoji']} {gift['name']}"),
-                occasion=html.escape(gift["occasion"]),
+                category=html.escape(self._gift_category(gift)),
                 gift_id=gift["id"],
                 recipient=html.escape(session["recipient"]),
                 message=html.escape(session["message"] or self.strings["no_message"]),
@@ -508,16 +824,32 @@ class HiddenGiftsMod(loader.Module):
             ],
         )
 
+    @staticmethod
+    def _gift_category(gift):
+        if gift.get("source") != "current":
+            return f"історичний · {gift['occasion']}"
+        details = [gift.get("occasion") or "актуальний каталог Telegram"]
+        if gift.get("premium"):
+            details.append("тільки Premium")
+        remains = gift.get("availability_remains")
+        total = gift.get("availability_total")
+        if remains is not None:
+            details.append(f"залишилося {remains}/{total or '?'}")
+        return " · ".join(details)
+
     async def _back_to_catalog(self, call, token):
         session = self._get_session(token)
         if session is None or session.get("processing"):
             await call.answer(self.strings["session_expired"], show_alert=True)
             return
         session["gift_id"] = None
+        session["gift"] = None
         session["confirmed_price"] = None
-        await call.edit(
-            self._catalog_text(session), reply_markup=self._catalog_markup(token)
-        )
+        category = session.get("category", "historical")
+        if category not in {"current", "historical"}:
+            await self._back_home(call, token)
+            return
+        await self._open_catalog(call, token, category, session.get("page", 0))
 
     def _back_markup(self, token):
         return [
@@ -540,14 +872,14 @@ class HiddenGiftsMod(loader.Module):
             session = self._get_session(token)
             if (
                 session is None
-                or session.get("gift_id") is None
+                or session.get("gift") is None
                 or session.get("confirmed_price") is None
                 or session.get("processing")
             ):
                 await call.answer(self.strings["session_expired"], show_alert=True)
                 return
 
-            gift = self.GIFT_BY_ID[session["gift_id"]]
+            gift = session["gift"]
             session["processing"] = True
             await call.edit(self.strings["processing"], reply_markup=[])
 
@@ -707,6 +1039,7 @@ class HiddenGiftsMod(loader.Module):
             ("STARS_FORM_AMOUNT_MISMATCH", "ціна змінилася; повтори перевірку"),
             ("API_GIFT_RESTRICTED_UPDATE_APP", "потрібно оновити Hikka/Telethon"),
             ("FORM_UNSUPPORTED", "ця версія Hikka/Telethon не підтримує форму"),
+            ("PREMIUM_ACCOUNT_REQUIRED", "цей подарунок доступний лише з Telegram Premium"),
             ("PEER_ID_INVALID", "Telegram не прийняв одержувача"),
             ("USER_ID_INVALID", "Telegram не прийняв одержувача"),
         )
