@@ -102,6 +102,22 @@ class _Inline:
         return True
 
 
+class _RichInline:
+    def __init__(self):
+        self._token = "test-token"
+        self._units = {"rich-unit": {"buttons": [], "disable_security": True}}
+        self._counter = 0
+
+    def generate_markup(self, value):
+        rows = self._units[value]["buttons"] if isinstance(value, str) else value
+        for row in rows:
+            for button in row:
+                if button.get("callback") and not button.get("_callback_data"):
+                    self._counter += 1
+                    button["_callback_data"] = f"rich-{self._counter}"
+        return object()
+
+
 class _Message:
     def __init__(self):
         self.chat_id = -100
@@ -502,6 +518,78 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
 
         await self.module._chess_cancel_finish(host, token)
         self.assertIsNone(session["finish_confirm"])
+
+    async def test_chess_renders_as_interactive_telegram_rich_message(self):
+        token = self.module._new_session("chess", -100)
+        session = self.module._session(token)
+        call = _Call(1, "Host")
+        call.unit_id = "rich-unit"
+        call.inline_message_id = "inline-message-id"
+        self.module.inline = _RichInline()
+        rendered = []
+
+        async def capture_rich_edit(target, record, rich_message):
+            rendered.append((target, record, rich_message))
+            return True
+
+        self.module._edit_rich_chess_message = capture_rich_edit
+
+        result = await self.module._edit_chess_panel(call, token)
+
+        self.assertTrue(result)
+        self.assertFalse(call.edits)
+        rich_message = rendered[0][2]
+        blocks = rich_message["blocks"]
+        table = next(block for block in blocks if block["type"] == "table")
+        self.assertTrue(table["is_bordered"])
+        self.assertTrue(table["is_striped"])
+        self.assertTrue(table["is_compact"])
+        self.assertEqual(len(table["cells"]), 10)
+        self.assertTrue(all(len(row) == 10 for row in table["cells"]))
+        self.assertEqual(
+            [cell["text"] for cell in table["cells"][0][1:9]],
+            list("abcdefgh"),
+        )
+        first_square = table["cells"][1][1]["text"]
+        self.assertEqual(first_square["type"], "button")
+        self.assertEqual(first_square["button"]["text"], "♜")
+        self.assertEqual(first_square["button"]["style"], "link")
+        self.assertTrue(first_square["button"]["callback_data"].startswith("rich-"))
+        self.assertEqual(table["cells"][3][1]["text"]["button"]["text"], "\u00a0")
+        self.assertIn("blockquote", [block["type"] for block in blocks])
+
+        controls = [block for block in blocks if block["type"] == "buttons"]
+        undo = next(
+            button
+            for block in controls
+            for button in block["buttons"]
+            if button["text"].startswith("↶")
+        )
+        finish = next(
+            button
+            for block in controls
+            for button in block["buttons"]
+            if "Завершити" in button["text"]
+        )
+        self.assertEqual(undo["disabled"], {})
+        self.assertNotIn("callback_data", undo)
+        self.assertEqual(finish["style"], "danger")
+        self.assertTrue(finish["callback_data"].startswith("rich-"))
+        self.assertEqual(session["rich_unit_id"], "rich-unit")
+        self.assertEqual(session["rich_inline_message_id"], "inline-message-id")
+
+        callback_count = self.module.inline._counter
+        refreshed_markup = self.module._markup(token)
+        self.assertTrue(
+            self.module._register_rich_chess_callbacks(
+                call, session, refreshed_markup
+            )
+        )
+        self.assertEqual(self.module.inline._counter, callback_count)
+        self.assertEqual(
+            refreshed_markup[1][0]["_callback_data"],
+            first_square["button"]["callback_data"],
+        )
 
     def test_go_creates_nine_and_thirteen_line_boards(self):
         for kind, size, button_rows in (("go9", 9, (7, 2)), ("go13", 13, (7, 6))):
