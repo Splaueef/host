@@ -203,6 +203,35 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
             self.module.MODULES["stats"]["description"],
         )
 
+    def test_catalog_and_full_manifest_cover_every_root_module(self):
+        root = pathlib.Path(__file__).parents[1]
+        root_modules = {path.name for path in root.glob("*.py")}
+        catalog_modules = set(self.module.REPO_FILES.values())
+        manifest_modules = {
+            f"{line.strip()}.py"
+            for line in (root / "full.txt").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+
+        self.assertEqual(set(self.module.REPO_FILES), set(self.module.MODULES))
+        self.assertEqual(catalog_modules, root_modules - {"modulehub.py"})
+        self.assertEqual(manifest_modules, root_modules)
+
+        section_keys = [key for _, keys in self.module.SECTIONS for key in keys]
+        self.assertEqual(len(section_keys), len(set(section_keys)))
+        self.assertEqual(set(section_keys), set(self.module.MODULES))
+
+    def test_catalog_contains_admin_games_and_previously_missing_modules(self):
+        expected = {
+            "groupadmin": ("group_admin.py", "GroupAdminMod"),
+            "minigames": ("minigames.py", "MiniGamesMod"),
+            "alwaysonline": ("alwaysonline.py", "AlwaysOnlineMod"),
+            "giftmonitor": ("gift_monitor.py", "GiftMonitorMod"),
+        }
+        for key, (filename, class_name) in expected.items():
+            self.assertEqual(self.module.REPO_FILES[key], filename)
+            self.assertEqual(self.module.MODULES[key]["class"], class_name)
+
     async def test_menu_is_owner_only_and_contains_search(self):
         self.module.inline = _Inline()
         message = _Message(reply_to_msg_id=77)

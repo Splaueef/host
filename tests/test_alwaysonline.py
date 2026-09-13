@@ -106,7 +106,7 @@ def _load_module():
             "telethon.tl.types": tl_types,
         }
     )
-    path = pathlib.Path(__file__).parent / "alwaysonline.py"
+    path = pathlib.Path(__file__).parents[1] / "alwaysonline.py"
     spec = importlib.util.spec_from_file_location("testhost.modules.alwaysonline", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
