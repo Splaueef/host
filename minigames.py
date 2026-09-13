@@ -1,10 +1,10 @@
 # meta developer: @Huai_Baike
-# meta version: 1.1.3
+# meta version: 1.2.0
 # meta description: Інтерактивні мініігри для чатів із кнопками та рейтингом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (1, 1, 2)
+__version__ = (1, 2, 0)
 
 import asyncio
 import contextlib
@@ -34,6 +34,36 @@ CHECKER_DARK_CELL = "∙"
 CHECKER_SELECTED_CELL = "🟦"
 CHECKER_TARGET_CELL = "🟩"
 CHECKER_DRAW_PLY = 80
+CHESS_SYMBOLS = {
+    "K": "♔",
+    "Q": "♕",
+    "R": "♖",
+    "B": "♗",
+    "N": "♘",
+    "P": "♙",
+    "k": "♚",
+    "q": "♛",
+    "r": "♜",
+    "b": "♝",
+    "n": "♞",
+    "p": "♟",
+}
+CHESS_KNIGHT_STEPS = (
+    (-2, -1),
+    (-2, 1),
+    (-1, -2),
+    (-1, 2),
+    (1, -2),
+    (1, 2),
+    (2, -1),
+    (2, 1),
+)
+CHESS_ORTHOGONAL = ((-1, 0), (1, 0), (0, -1), (0, 1))
+CHESS_DIAGONAL = ((-1, -1), (-1, 1), (1, -1), (1, 1))
+CHESS_EMPTY_CELL = "∙"
+CHESS_SELECTED_CELL = "🟦"
+CHESS_TARGET_CELL = "🟩"
+CHESS_CAPTURE_CELL = "🟥"
 
 
 @loader.tds
@@ -176,6 +206,24 @@ class MiniGamesMod(loader.Module):
                 quiet_ply=0,
                 captures=[0, 0],
             )
+        elif kind == "chess":
+            session.update(
+                board=self._chess_initial_board(),
+                turn=0,
+                selected=None,
+                winner=None,
+                draw=False,
+                draw_reason=None,
+                finish_reason=None,
+                castling={"K", "Q", "k", "q"},
+                en_passant=None,
+                halfmove_clock=0,
+                promotion=None,
+                last_move=None,
+                position_counts={},
+            )
+            key = self._chess_position_key(session)
+            session["position_counts"][key] = 1
         elif kind == "quiz":
             rounds = min(int(self.config["quiz_rounds"]), len(self.QUIZ_BANK))
             session.update(
@@ -255,6 +303,7 @@ class MiniGamesMod(loader.Module):
             "🪨📄✂️ <b>Камінь, ножиці, папір</b> — вибір прихований\n"
             "🎲 <b>Кубик-дуель</b> — найбільше число перемагає\n"
             "⚪⚫ <b>Шашки</b> — обов'язкове взяття та дамки\n"
+            "♟ <b>Шахи</b> — повні правила, шах, мат і пат\n"
             "🧠 <b>Вікторина</b> — перший правильний отримує бал\n\n"
             "<i>Ігри відкриті для учасників поточного чату.</i>"
         )
@@ -270,6 +319,7 @@ class MiniGamesMod(loader.Module):
             ],
             [
                 {"text": "⚪⚫ Шашки", "callback": self._select_game, "args": (token, "checkers")},
+                {"text": "♟ Шахи", "callback": self._select_game, "args": (token, "chess")},
             ],
             [
                 {"text": "🧠 Вікторина", "callback": self._select_game, "args": (token, "quiz")},
@@ -546,7 +596,7 @@ class MiniGamesMod(loader.Module):
         lines.extend(
             (
                 "",
-                "<i>🟨🟫 — поле · ⚪/⚫ — шашки · 👑 — дамка</i>",
+                "<i>∙ — порожня клітинка · ⚪/⚫ — шашки · 👑 — дамка</i>",
                 "<i>🟦 — вибрано · 🟩 — доступний хід</i>",
             )
         )
@@ -735,6 +785,701 @@ class MiniGamesMod(loader.Module):
             self._render(token) + f"\n\n🏳 {self._name(session, user_id)} здався.",
             reply_markup=self._markup(token),
         )
+
+    @staticmethod
+    def _chess_initial_board():
+        pieces = "rnbqkbnrpppppppp" + "." * 32 + "PPPPPPPPRNBQKBNR"
+        return [piece if piece != "." else "" for piece in pieces]
+
+    @staticmethod
+    def _chess_position(index):
+        return divmod(int(index), 8)
+
+    @staticmethod
+    def _chess_index(row, column):
+        return row * 8 + column
+
+    @staticmethod
+    def _chess_coordinate(index):
+        row, column = divmod(int(index), 8)
+        return f"{'abcdefgh'[column]}{8 - row}"
+
+    @staticmethod
+    def _chess_side(piece):
+        if not piece:
+            return None
+        return 0 if piece.isupper() else 1
+
+    @classmethod
+    def _chess_attacked(cls, board, square, by_side):
+        row, column = cls._chess_position(square)
+        pawn = "P" if int(by_side) == 0 else "p"
+        pawn_row = row + (1 if int(by_side) == 0 else -1)
+        if 0 <= pawn_row < 8:
+            for pawn_column in (column - 1, column + 1):
+                if 0 <= pawn_column < 8:
+                    if board[cls._chess_index(pawn_row, pawn_column)] == pawn:
+                        return True
+
+        knight = "N" if int(by_side) == 0 else "n"
+        for row_step, column_step in CHESS_KNIGHT_STEPS:
+            source_row = row + row_step
+            source_column = column + column_step
+            if 0 <= source_row < 8 and 0 <= source_column < 8:
+                if board[cls._chess_index(source_row, source_column)] == knight:
+                    return True
+
+        king = "K" if int(by_side) == 0 else "k"
+        for row_step, column_step in CHESS_ORTHOGONAL + CHESS_DIAGONAL:
+            source_row = row + row_step
+            source_column = column + column_step
+            if 0 <= source_row < 8 and 0 <= source_column < 8:
+                if board[cls._chess_index(source_row, source_column)] == king:
+                    return True
+
+        for directions, attackers in (
+            (CHESS_ORTHOGONAL, {"r", "q"}),
+            (CHESS_DIAGONAL, {"b", "q"}),
+        ):
+            for row_step, column_step in directions:
+                source_row = row + row_step
+                source_column = column + column_step
+                while 0 <= source_row < 8 and 0 <= source_column < 8:
+                    piece = board[cls._chess_index(source_row, source_column)]
+                    if piece:
+                        if cls._chess_side(piece) == int(by_side) and piece.lower() in attackers:
+                            return True
+                        break
+                    source_row += row_step
+                    source_column += column_step
+        return False
+
+    @classmethod
+    def _chess_in_check(cls, board, side):
+        king = "K" if int(side) == 0 else "k"
+        try:
+            square = board.index(king)
+        except ValueError:
+            return True
+        return cls._chess_attacked(board, square, 1 - int(side))
+
+    @classmethod
+    def _chess_pseudo_moves(
+        cls,
+        board,
+        side,
+        position,
+        castling=None,
+        en_passant=None,
+    ):
+        position = int(position)
+        if not 0 <= position < 64:
+            return []
+        piece = board[position]
+        side = int(side)
+        if cls._chess_side(piece) != side:
+            return []
+        row, column = cls._chess_position(position)
+        moves = []
+
+        def add_if_available(target, special=None):
+            target_piece = board[target]
+            if not target_piece:
+                moves.append((target, special))
+            elif cls._chess_side(target_piece) != side and target_piece.lower() != "k":
+                moves.append((target, special))
+
+        kind = piece.lower()
+        if kind == "p":
+            row_step = -1 if side == 0 else 1
+            start_row = 6 if side == 0 else 1
+            target_row = row + row_step
+            if 0 <= target_row < 8:
+                one_step = cls._chess_index(target_row, column)
+                if not board[one_step]:
+                    moves.append((one_step, None))
+                    two_row = row + row_step * 2
+                    if row == start_row and not board[cls._chess_index(two_row, column)]:
+                        moves.append((cls._chess_index(two_row, column), None))
+                for target_column in (column - 1, column + 1):
+                    if not 0 <= target_column < 8:
+                        continue
+                    target = cls._chess_index(target_row, target_column)
+                    target_piece = board[target]
+                    if (
+                        target_piece
+                        and cls._chess_side(target_piece) != side
+                        and target_piece.lower() != "k"
+                    ):
+                        moves.append((target, None))
+                    elif target == en_passant and not target_piece:
+                        captured = cls._chess_index(row, target_column)
+                        expected = "p" if side == 0 else "P"
+                        if board[captured] == expected:
+                            moves.append((target, "en_passant"))
+            return moves
+
+        if kind == "n":
+            for row_step, column_step in CHESS_KNIGHT_STEPS:
+                target_row = row + row_step
+                target_column = column + column_step
+                if 0 <= target_row < 8 and 0 <= target_column < 8:
+                    add_if_available(cls._chess_index(target_row, target_column))
+            return moves
+
+        if kind in {"b", "r", "q"}:
+            directions = ()
+            if kind in {"r", "q"}:
+                directions += CHESS_ORTHOGONAL
+            if kind in {"b", "q"}:
+                directions += CHESS_DIAGONAL
+            for row_step, column_step in directions:
+                target_row = row + row_step
+                target_column = column + column_step
+                while 0 <= target_row < 8 and 0 <= target_column < 8:
+                    target = cls._chess_index(target_row, target_column)
+                    target_piece = board[target]
+                    if not target_piece:
+                        moves.append((target, None))
+                    else:
+                        if cls._chess_side(target_piece) != side and target_piece.lower() != "k":
+                            moves.append((target, None))
+                        break
+                    target_row += row_step
+                    target_column += column_step
+            return moves
+
+        for row_step, column_step in CHESS_ORTHOGONAL + CHESS_DIAGONAL:
+            target_row = row + row_step
+            target_column = column + column_step
+            if 0 <= target_row < 8 and 0 <= target_column < 8:
+                add_if_available(cls._chess_index(target_row, target_column))
+
+        rights = castling or set()
+        opponent = 1 - side
+        if side == 0 and position == 60 and piece == "K":
+            if (
+                "K" in rights
+                and board[63] == "R"
+                and not board[61]
+                and not board[62]
+                and not any(cls._chess_attacked(board, square, opponent) for square in (60, 61, 62))
+            ):
+                moves.append((62, "castle_k"))
+            if (
+                "Q" in rights
+                and board[56] == "R"
+                and not board[57]
+                and not board[58]
+                and not board[59]
+                and not any(cls._chess_attacked(board, square, opponent) for square in (60, 59, 58))
+            ):
+                moves.append((58, "castle_q"))
+        elif side == 1 and position == 4 and piece == "k":
+            if (
+                "k" in rights
+                and board[7] == "r"
+                and not board[5]
+                and not board[6]
+                and not any(cls._chess_attacked(board, square, opponent) for square in (4, 5, 6))
+            ):
+                moves.append((6, "castle_k"))
+            if (
+                "q" in rights
+                and board[0] == "r"
+                and not board[1]
+                and not board[2]
+                and not board[3]
+                and not any(cls._chess_attacked(board, square, opponent) for square in (4, 3, 2))
+            ):
+                moves.append((2, "castle_q"))
+        return moves
+
+    @classmethod
+    def _chess_apply_to_board(
+        cls,
+        board,
+        source,
+        target,
+        special=None,
+        promotion=None,
+    ):
+        source = int(source)
+        target = int(target)
+        piece = board[source]
+        captured_position = target
+        captured = board[target]
+        board[source] = ""
+        if special == "en_passant":
+            captured_position = target + 8 if piece.isupper() else target - 8
+            captured = board[captured_position]
+            board[captured_position] = ""
+        board[target] = piece
+        if special in {"castle_k", "castle_q"}:
+            if piece == "K":
+                rook_source, rook_target = (63, 61) if special == "castle_k" else (56, 59)
+            else:
+                rook_source, rook_target = (7, 5) if special == "castle_k" else (0, 3)
+            board[rook_target] = board[rook_source]
+            board[rook_source] = ""
+        target_row, _ = cls._chess_position(target)
+        if piece.lower() == "p" and target_row in {0, 7} and promotion:
+            promoted = str(promotion).lower()
+            board[target] = promoted.upper() if piece.isupper() else promoted
+        return piece, captured, captured_position
+
+    @classmethod
+    def _chess_legal_moves(
+        cls,
+        board,
+        side,
+        position,
+        castling=None,
+        en_passant=None,
+    ):
+        legal = []
+        for target, special in cls._chess_pseudo_moves(
+            board,
+            side,
+            position,
+            castling,
+            en_passant,
+        ):
+            candidate = list(board)
+            cls._chess_apply_to_board(
+                candidate,
+                position,
+                target,
+                special,
+                promotion="q",
+            )
+            if not cls._chess_in_check(candidate, side):
+                legal.append((target, special))
+        return legal
+
+    @classmethod
+    def _chess_all_legal_moves(
+        cls,
+        board,
+        side,
+        castling=None,
+        en_passant=None,
+    ):
+        result = {}
+        for position, piece in enumerate(board):
+            if cls._chess_side(piece) != int(side):
+                continue
+            moves = cls._chess_legal_moves(
+                board,
+                side,
+                position,
+                castling,
+                en_passant,
+            )
+            if moves:
+                result[position] = moves
+        return result
+
+    @classmethod
+    def _chess_position_key(cls, session):
+        board = "".join(piece or "." for piece in session["board"])
+        rights = "".join(sorted(session.get("castling", set()))) or "-"
+        en_passant = session.get("en_passant")
+        if en_passant is not None:
+            side = int(session["turn"])
+            target_row, target_column = cls._chess_position(en_passant)
+            source_row = target_row + (1 if side == 0 else -1)
+            pawn = "P" if side == 0 else "p"
+            can_capture = False
+            if 0 <= source_row < 8:
+                for source_column in (target_column - 1, target_column + 1):
+                    if not 0 <= source_column < 8:
+                        continue
+                    source = cls._chess_index(source_row, source_column)
+                    if session["board"][source] != pawn:
+                        continue
+                    can_capture = any(
+                        target == en_passant and special == "en_passant"
+                        for target, special in cls._chess_legal_moves(
+                            session["board"],
+                            side,
+                            source,
+                            session.get("castling", set()),
+                            en_passant,
+                        )
+                    )
+                    if can_capture:
+                        break
+            if not can_capture:
+                en_passant = None
+        return f"{board}|{int(session['turn'])}|{rights}|{en_passant if en_passant is not None else '-'}"
+
+    @staticmethod
+    def _chess_insufficient_material(board):
+        remaining = [
+            (position, piece)
+            for position, piece in enumerate(board)
+            if piece and piece.lower() != "k"
+        ]
+        if not remaining:
+            return True
+        if len(remaining) == 1 and remaining[0][1].lower() in {"b", "n"}:
+            return True
+        if remaining and all(piece.lower() == "b" for _, piece in remaining):
+            square_colors = {
+                sum(divmod(position, 8)) % 2
+                for position, _ in remaining
+            }
+            return len(square_colors) == 1
+        return False
+
+    @staticmethod
+    def _chess_update_castling(
+        session,
+        piece,
+        source,
+        captured,
+        captured_position,
+    ):
+        rights = session["castling"]
+        if piece == "K":
+            rights.difference_update({"K", "Q"})
+        elif piece == "k":
+            rights.difference_update({"k", "q"})
+        rook_rights = {63: "K", 56: "Q", 7: "k", 0: "q"}
+        if piece.lower() == "r":
+            right = rook_rights.get(int(source))
+            if right:
+                rights.discard(right)
+        if captured and captured.lower() == "r":
+            right = rook_rights.get(int(captured_position))
+            if right:
+                rights.discard(right)
+
+    def _chess_finish_turn(self, session, side):
+        opponent = 1 - int(side)
+        session["promotion"] = None
+        session["turn"] = opponent
+        key = self._chess_position_key(session)
+        counts = session["position_counts"]
+        counts[key] = int(counts.get(key, 0)) + 1
+        moves = self._chess_all_legal_moves(
+            session["board"],
+            opponent,
+            session["castling"],
+            session["en_passant"],
+        )
+        if not moves:
+            session["finished"] = True
+            if self._chess_in_check(session["board"], opponent):
+                session["winner"] = session["players"][side]
+                session["finish_reason"] = "checkmate"
+                self._record_result(session, [session["winner"]])
+            else:
+                session["draw"] = True
+                session["draw_reason"] = "stalemate"
+                self._record_result(session, [], draw=True)
+            return
+        draw_reason = None
+        if self._chess_insufficient_material(session["board"]):
+            draw_reason = "material"
+        elif int(session["halfmove_clock"]) >= 100:
+            draw_reason = "fifty_moves"
+        elif counts[key] >= 3:
+            draw_reason = "repetition"
+        if draw_reason:
+            session["draw"] = True
+            session["draw_reason"] = draw_reason
+            session["finished"] = True
+            self._record_result(session, [], draw=True)
+
+    def _render_chess(self, session):
+        white, black = session["players"]
+        black_name = self._name(session, black) if black else "очікується суперник"
+        lines = [
+            "♟ <b>Шахи · 8×8</b>",
+            "",
+            f"♔ {self._name(session, white)}",
+            f"♚ {black_name}",
+            "",
+        ]
+        if session["winner"] is not None:
+            title = "Мат" if session.get("finish_reason") == "checkmate" else "Перемога"
+            lines.append(f"🏆 <b>{title}: {self._name(session, session['winner'])}</b>")
+        elif session["draw"]:
+            reasons = {
+                "stalemate": "Пат",
+                "material": "Недостатньо матеріалу для мату",
+                "fifty_moves": "50 ходів без взяття або ходу пішаком",
+                "repetition": "Триразове повторення позиції",
+            }
+            lines.append(f"🤝 <b>Нічия: {reasons.get(session.get('draw_reason'), 'за правилами гри')}.</b>")
+        else:
+            turn_id = session["players"][session["turn"]]
+            turn_name = self._name(session, turn_id) if turn_id else "другого гравця"
+            lines.append(f"Хід: <b>{turn_name}</b>")
+            if session.get("promotion"):
+                lines.append("👑 <b>Оберіть фігуру для перетворення пішака.</b>")
+            elif session["selected"] is not None:
+                lines.append(
+                    f"🔹 Обрано: <b>{self._chess_coordinate(session['selected'])}</b> · "
+                    "🟩 хід · 🟥 взяття"
+                )
+            if self._chess_in_check(session["board"], session["turn"]):
+                lines.append("⚠️ <b>Шах королю.</b>")
+        if session.get("last_move"):
+            lines.extend(("", f"Останній хід: <b>{session['last_move']}</b>"))
+        lines.extend(
+            (
+                "",
+                "<i>Натисніть свою фігуру, потім підсвічену клітинку.</i>",
+            )
+        )
+        return "\n".join(lines)
+
+    def _markup_chess(self, token, session):
+        legal = {}
+        if (
+            session["selected"] is not None
+            and not session["finished"]
+            and not session.get("promotion")
+        ):
+            legal = dict(
+                self._chess_legal_moves(
+                    session["board"],
+                    session["turn"],
+                    session["selected"],
+                    session["castling"],
+                    session["en_passant"],
+                )
+            )
+        rows = []
+        for row in range(8):
+            buttons = []
+            for column in range(8):
+                position = self._chess_index(row, column)
+                piece = session["board"][position]
+                special = legal.get(position)
+                if position == session["selected"]:
+                    symbol = CHESS_SELECTED_CELL
+                elif position in legal:
+                    symbol = (
+                        CHESS_CAPTURE_CELL
+                        if piece or special == "en_passant"
+                        else CHESS_TARGET_CELL
+                    )
+                else:
+                    symbol = CHESS_SYMBOLS.get(piece, CHESS_EMPTY_CELL)
+                buttons.append(
+                    {
+                        "text": symbol,
+                        "callback": self._chess_click,
+                        "args": (token, position),
+                    }
+                )
+            rows.append(buttons)
+        if session.get("promotion") and not session["finished"]:
+            side = int(session["promotion"]["side"])
+            labels = {"q": "Ферзь", "r": "Тура", "b": "Слон", "n": "Кінь"}
+            rows.append(
+                [
+                    {
+                        "text": f"{CHESS_SYMBOLS[piece.upper() if side == 0 else piece]} {label}",
+                        "callback": self._chess_promote,
+                        "args": (token, piece),
+                    }
+                    for piece, label in labels.items()
+                ]
+            )
+        if session["finished"]:
+            rows.extend(self._footer(token, session))
+        else:
+            rows.append(
+                [
+                    {"text": "🏳 Здатися", "callback": self._chess_resign, "args": (token,)},
+                    {"text": "✖️ Закрити", "callback": self._close, "args": (token,)},
+                ]
+            )
+        return rows
+
+    async def _chess_click(self, call, token, position):
+        session = self._session(token)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        lock = self._locks.setdefault(token, asyncio.Lock())
+        async with lock:
+            user_id, user = self._actor(call)
+            if session["finished"]:
+                await call.answer("Партію вже завершено")
+                return
+            if session.get("promotion"):
+                await call.answer("Спочатку оберіть фігуру для перетворення", show_alert=True)
+                return
+            position = int(position)
+            if not 0 <= position < 64:
+                await call.answer("Некоректна клітинка")
+                return
+
+            side = int(session["turn"])
+            board = session["board"]
+            if session["players"][1] is None:
+                can_join = (
+                    side == 1
+                    and user_id != session["players"][0]
+                    and self._chess_side(board[position]) == 1
+                    and bool(
+                        self._chess_legal_moves(
+                            board,
+                            1,
+                            position,
+                            session["castling"],
+                            session["en_passant"],
+                        )
+                    )
+                )
+                if can_join:
+                    if session.get("invited_id") and user_id != session["invited_id"]:
+                        await call.answer(self.strings["not_yours"], show_alert=True)
+                        return
+                    session["players"][1] = user_id
+                    self._remember_actor(session, user_id, user)
+
+            current = session["players"][side]
+            if user_id != current:
+                await call.answer(
+                    self.strings["wait_opponent"]
+                    if session["players"][1] is None
+                    else self.strings["not_yours"],
+                    show_alert=True,
+                )
+                return
+
+            clicked_piece = board[position]
+            if self._chess_side(clicked_piece) == side:
+                moves = self._chess_legal_moves(
+                    board,
+                    side,
+                    position,
+                    session["castling"],
+                    session["en_passant"],
+                )
+                if not moves:
+                    await call.answer("У цієї фігури немає дозволених ходів", show_alert=True)
+                    return
+                session["selected"] = position
+                await call.edit(self._render(token), reply_markup=self._markup(token))
+                return
+
+            selected = session["selected"]
+            if selected is None:
+                await call.answer("Спочатку оберіть свою фігуру", show_alert=True)
+                return
+            legal = dict(
+                self._chess_legal_moves(
+                    board,
+                    side,
+                    selected,
+                    session["castling"],
+                    session["en_passant"],
+                )
+            )
+            if position not in legal:
+                await call.answer("Цей хід неможливий", show_alert=True)
+                return
+
+            special = legal[position]
+            piece, captured, captured_position = self._chess_apply_to_board(
+                board,
+                selected,
+                position,
+                special,
+            )
+            self._chess_update_castling(
+                session,
+                piece,
+                selected,
+                captured,
+                captured_position,
+            )
+            session["en_passant"] = (
+                (selected + position) // 2
+                if piece.lower() == "p" and abs(selected - position) == 16
+                else None
+            )
+            session["halfmove_clock"] = (
+                0
+                if piece.lower() == "p" or captured
+                else int(session["halfmove_clock"]) + 1
+            )
+            separator = "×" if captured else "–"
+            session["last_move"] = (
+                f"{CHESS_SYMBOLS[piece]} {self._chess_coordinate(selected)}"
+                f"{separator}{self._chess_coordinate(position)}"
+            )
+            session["selected"] = None
+            target_row, _ = self._chess_position(position)
+            if piece.lower() == "p" and target_row in {0, 7}:
+                session["promotion"] = {"position": position, "side": side}
+            else:
+                self._chess_finish_turn(session, side)
+            await call.edit(self._render(token), reply_markup=self._markup(token))
+
+    async def _chess_promote(self, call, token, choice):
+        session = self._session(token)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        lock = self._locks.setdefault(token, asyncio.Lock())
+        async with lock:
+            pending = session.get("promotion")
+            choice = str(choice).lower()
+            if session["finished"] or not pending or choice not in {"q", "r", "b", "n"}:
+                await call.answer("Перетворення вже недоступне", show_alert=True)
+                return
+            user_id, _ = self._actor(call)
+            side = int(pending["side"])
+            if user_id != session["players"][side]:
+                await call.answer(self.strings["not_yours"], show_alert=True)
+                return
+            position = int(pending["position"])
+            promoted = choice.upper() if side == 0 else choice
+            session["board"][position] = promoted
+            session["last_move"] += f"={CHESS_SYMBOLS[promoted]}"
+            self._chess_finish_turn(session, side)
+            labels = {"q": "ферзя", "r": "туру", "b": "слона", "n": "коня"}
+            await call.answer(f"Пішака перетворено на {labels[choice]}")
+            await call.edit(self._render(token), reply_markup=self._markup(token))
+
+    async def _chess_resign(self, call, token):
+        session = self._session(token)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        lock = self._locks.setdefault(token, asyncio.Lock())
+        async with lock:
+            user_id, _ = self._actor(call)
+            players = [player for player in session.get("players", []) if player]
+            if user_id not in players:
+                await call.answer(self.strings["not_yours"], show_alert=True)
+                return
+            if session["finished"]:
+                await call.answer("Партію вже завершено")
+                return
+            opponents = [player for player in players if player != user_id]
+            if not opponents:
+                self._sessions.pop(token, None)
+                self._locks.pop(token, None)
+                await call.edit(self.strings["closed"], reply_markup=[])
+                return
+            session["winner"] = opponents[0]
+            session["finish_reason"] = "resignation"
+            session["finished"] = True
+            self._record_result(session, [opponents[0]])
+            await call.edit(
+                self._render(token) + f"\n\n🏳 {self._name(session, user_id)} здався.",
+                reply_markup=self._markup(token),
+            )
 
     def _render_rps(self, session):
         first, second = session["players"]
@@ -957,7 +1702,7 @@ class MiniGamesMod(loader.Module):
         if user_id not in participants and user_id != session["creator_id"]:
             await call.answer(self.strings["not_yours"], show_alert=True)
             return
-        if session["kind"] in {"ttt", "rps", "dice", "checkers"} and session["players"][1] is not None:
+        if session["kind"] in {"ttt", "rps", "dice", "checkers", "chess"} and session["players"][1] is not None:
             session["players"] = [session["players"][1], session["players"][0]]
             session["invited_id"] = session["players"][1]
         self._reset_game(session)
@@ -1058,6 +1803,11 @@ class MiniGamesMod(loader.Module):
     async def checkers(self, message):
         """⚪⚫ Почати партію в шашки з обов'язковим взяттям"""
         await self._direct_game(message, "checkers")
+
+    @loader.command(ru_doc="Шахи 8×8: .chess [@user] або у відповідь")
+    async def chess(self, message):
+        """♟ Почати шахову партію з повними правилами"""
+        await self._direct_game(message, "chess")
 
     @loader.command(ru_doc="Запустити швидку вікторину для всього чату")
     async def quiz(self, message):

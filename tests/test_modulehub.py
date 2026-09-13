@@ -232,6 +232,7 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.module.REPO_FILES[key], filename)
             self.assertEqual(self.module.MODULES[key]["class"], class_name)
         self.assertIn("checkers", self.module.SAFE_EMPTY)
+        self.assertIn("chess", self.module.SAFE_EMPTY)
 
     async def test_menu_is_owner_only_and_contains_search(self):
         self.module.inline = _Inline()

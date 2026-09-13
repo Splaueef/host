@@ -177,15 +177,15 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session["finished"])
         self.assertEqual(session["winner"], 1)
 
-    def test_checkers_board_uses_visible_emoji_cells(self):
+    def test_checkers_board_uses_current_dot_cells(self):
         token = self.module._new_session("checkers", -100)
         markup = self.module._markup(token)
 
         self.assertEqual(len(markup[:8]), 8)
         self.assertTrue(all(len(row) == 8 for row in markup[:8]))
-        self.assertEqual(markup[0][0]["text"], "🟨")
+        self.assertEqual(markup[0][0]["text"], "∙")
         self.assertEqual(markup[0][1]["text"], "⚫")
-        self.assertEqual(markup[3][0]["text"], "🟫")
+        self.assertEqual(markup[3][0]["text"], "∙")
         self.assertEqual(markup[7][0]["text"], "⚪")
 
     def test_checkers_board_highlights_selection_targets_and_kings(self):
@@ -204,6 +204,186 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(markup[5][2]["text"], "🟦")
         self.assertEqual(markup[4][1]["text"], "🟩")
         self.assertEqual(markup[4][3]["text"], "🟩")
+
+    def test_chess_initial_position_has_twenty_legal_moves(self):
+        board = self.module._chess_initial_board()
+        rights = {"K", "Q", "k", "q"}
+        moves = self.module._chess_all_legal_moves(board, 0, rights)
+
+        self.assertEqual(board[:8], list("rnbqkbnr"))
+        self.assertEqual(board[-8:], list("RNBQKBNR"))
+        self.assertEqual(sum(bool(piece) for piece in board), 32)
+        self.assertEqual(sum(len(options) for options in moves.values()), 20)
+        self.assertEqual(
+            self.module._chess_legal_moves(board, 0, 52, rights),
+            [(44, None), (36, None)],
+        )
+
+    def test_chess_rejects_move_that_exposes_own_king(self):
+        board = [""] * 64
+        board[0] = "k"
+        board[4] = "r"
+        board[52] = "R"
+        board[60] = "K"
+
+        moves = dict(self.module._chess_legal_moves(board, 0, 52, set()))
+
+        self.assertNotIn(51, moves)
+        self.assertIn(44, moves)
+
+    def test_chess_castling_requires_safe_empty_path(self):
+        board = [""] * 64
+        board[0] = "k"
+        board[60] = "K"
+        board[63] = "R"
+
+        self.assertIn(
+            (62, "castle_k"),
+            self.module._chess_legal_moves(board, 0, 60, {"K"}),
+        )
+
+        castled = list(board)
+        self.module._chess_apply_to_board(castled, 60, 62, "castle_k")
+        self.assertEqual(castled[62], "K")
+        self.assertEqual(castled[61], "R")
+        self.assertFalse(castled[60])
+        self.assertFalse(castled[63])
+
+        board[13] = "r"
+        self.assertNotIn(
+            (62, "castle_k"),
+            self.module._chess_legal_moves(board, 0, 60, {"K"}),
+        )
+
+    def test_chess_en_passant_removes_the_passed_pawn(self):
+        board = [""] * 64
+        board[4] = "k"
+        board[27] = "p"
+        board[28] = "P"
+        board[60] = "K"
+
+        self.assertIn(
+            (19, "en_passant"),
+            self.module._chess_legal_moves(board, 0, 28, set(), 19),
+        )
+        self.module._chess_apply_to_board(board, 28, 19, "en_passant")
+        self.assertEqual(board[19], "P")
+        self.assertEqual(board[27], "")
+
+    async def test_chess_fools_mate_finishes_match_and_updates_winner(self):
+        invited = types.SimpleNamespace(id=2, first_name="Guest", last_name=None, username="guest", bot=False)
+        token = self.module._new_session("chess", -100, invited)
+        host = _Call(1, "Host")
+        guest = _Call(2, "Guest")
+
+        async def move(call, source, target):
+            await self.module._chess_click(call, token, source)
+            await self.module._chess_click(call, token, target)
+
+        await move(host, 53, 45)
+        await move(guest, 12, 28)
+        await move(host, 54, 38)
+        await move(guest, 3, 39)
+
+        session = self.module._session(token)
+        self.assertTrue(session["finished"])
+        self.assertEqual(session["finish_reason"], "checkmate")
+        self.assertEqual(session["winner"], 2)
+        self.assertIn("Мат", guest.edits[-1]["text"])
+
+    async def test_chess_promotion_waits_for_piece_choice(self):
+        invited = types.SimpleNamespace(id=2, first_name="Guest", last_name=None, username="guest", bot=False)
+        token = self.module._new_session("chess", -100, invited)
+        session = self.module._session(token)
+        session["board"] = [""] * 64
+        session["board"][7] = "k"
+        session["board"][8] = "P"
+        session["board"][63] = "K"
+        session["castling"] = set()
+        session["position_counts"] = {}
+        host = _Call(1, "Host")
+
+        await self.module._chess_click(host, token, 8)
+        await self.module._chess_click(host, token, 0)
+
+        self.assertIsNotNone(session["promotion"])
+        self.assertEqual(session["turn"], 0)
+        self.assertEqual(len(self.module._markup(token)[8]), 4)
+
+        await self.module._chess_promote(host, token, "q")
+
+        self.assertEqual(session["board"][0], "Q")
+        self.assertIsNone(session["promotion"])
+        self.assertEqual(session["turn"], 1)
+
+    def test_chess_detects_stalemate_and_insufficient_material(self):
+        invited = types.SimpleNamespace(id=2, first_name="Guest", last_name=None, username="guest", bot=False)
+        token = self.module._new_session("chess", -100, invited)
+        session = self.module._session(token)
+        session["board"] = [""] * 64
+        session["board"][0] = "k"
+        session["board"][10] = "Q"
+        session["board"][18] = "K"
+        session["castling"] = set()
+        session["position_counts"] = {}
+
+        self.module._chess_finish_turn(session, 0)
+
+        self.assertTrue(session["draw"])
+        self.assertEqual(session["draw_reason"], "stalemate")
+
+        material = [""] * 64
+        material[0] = "k"
+        material[58] = "B"
+        material[63] = "K"
+        self.assertTrue(self.module._chess_insufficient_material(material))
+
+    def test_chess_detects_fifty_moves_and_repetition(self):
+        invited = types.SimpleNamespace(id=2, first_name="Guest", last_name=None, username="guest", bot=False)
+
+        def session_with_rook():
+            token = self.module._new_session("chess", -100, invited)
+            session = self.module._session(token)
+            session["board"] = [""] * 64
+            session["board"][0] = "k"
+            session["board"][55] = "R"
+            session["board"][63] = "K"
+            session["castling"] = set()
+            session["en_passant"] = None
+            session["position_counts"] = {}
+            return session
+
+        fifty = session_with_rook()
+        fifty["halfmove_clock"] = 100
+        self.module._chess_finish_turn(fifty, 0)
+        self.assertEqual(fifty["draw_reason"], "fifty_moves")
+
+        repeated = session_with_rook()
+        repeated["turn"] = 1
+        key = self.module._chess_position_key(repeated)
+        repeated["position_counts"] = {key: 2}
+        repeated["turn"] = 0
+        self.module._chess_finish_turn(repeated, 0)
+        self.assertEqual(repeated["draw_reason"], "repetition")
+
+    def test_chess_board_highlights_moves_and_captures(self):
+        token = self.module._new_session("chess", -100)
+        session = self.module._session(token)
+        session["board"] = [""] * 64
+        session["board"][4] = "k"
+        session["board"][44] = "p"
+        session["board"][52] = "R"
+        session["board"][60] = "K"
+        session["castling"] = set()
+        session["selected"] = 52
+
+        markup = self.module._markup(token)
+
+        self.assertEqual(len(markup[:8]), 8)
+        self.assertTrue(all(len(row) == 8 for row in markup[:8]))
+        self.assertEqual(markup[6][4]["text"], "🟦")
+        self.assertEqual(markup[5][4]["text"], "🟥")
+        self.assertEqual(markup[6][3]["text"], "🟩")
 
     async def test_rps_choices_are_hidden_until_both_players_answer(self):
         invited = types.SimpleNamespace(id=2, first_name="Guest", last_name=None, username="guest", bot=False)
