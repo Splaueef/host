@@ -178,6 +178,16 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.module.MODULES["scheduler"]["class"], "MessageSchedulerMod"
         )
+
+    def test_catalog_contains_hidden_gifts(self):
+        self.assertEqual(
+            self.module.REPO_FILES["hiddengifts"], "hidden_gifts.py"
+        )
+        self.assertEqual(
+            self.module.MODULES["hiddengifts"]["class"], "HiddenGiftsMod"
+        )
+        self.assertIn("hgift", self.module.SAFE_EMPTY)
+        self.assertIn("hgiftcheck", self.module.SAFE_EMPTY)
         self.assertTrue(
             any("scheduler" in keys for _, keys in self.module.SECTIONS)
         )

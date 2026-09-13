@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 2.1.0
+# meta version: 2.1.1
 # meta description: 🧭 Центр команд, конфігурації та встановлення модулів Hikka.
 # scope: inline
 # scope: hikka_only
@@ -52,6 +52,7 @@ class ModuleHubMod(loader.Module):
         "backup": "backup.py",
         "quiet": "quietschedule.py",
         "scheduler": "messagescheduler.py",
+        "hiddengifts": "hidden_gifts.py",
         "sysinfo": "sysinfo.py",
         "timeinfo": "timeinfo.py",
         "teledocs": "teledocs.py",
@@ -144,6 +145,12 @@ class ModuleHubMod(loader.Module):
             "icon": "📨",
             "description": "Різні повідомлення у вибрані чати за розкладом.",
         },
+        "hiddengifts": {
+            "class": "HiddenGiftsMod",
+            "name": "HiddenGifts",
+            "icon": "🎁",
+            "description": "Безпечне надсилання прихованих історичних подарунків.",
+        },
         "sysinfo": {
             "class": "InfoMod",
             "name": "SysInfo",
@@ -181,7 +188,10 @@ class ModuleHubMod(loader.Module):
         ("🤖 AI та медіа", ("vdlt", "dailynews", "mistral", "gemma", "math")),
         ("🐺 RotKranz", ("werwolf",)),
         ("🛠 Система", ("nekospy", "systemd", "backup", "quiet", "sysinfo")),
-        ("🧰 Інструменти", ("scheduler", "timeinfo", "teledocs", "purge", "eval")),
+        (
+            "🧰 Інструменти",
+            ("scheduler", "hiddengifts", "timeinfo", "teledocs", "purge", "eval"),
+        ),
     )
 
     SAFE_EMPTY = {
@@ -248,6 +258,8 @@ class ModuleHubMod(loader.Module):
         "qhelp",
         "qlist",
         "ms",
+        "hgift",
+        "hgiftcheck",
         "sysinfo",
         "time",
         "timezone",

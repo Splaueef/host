@@ -73,6 +73,29 @@ uptime та версії Python/Telethon. Команда модуля — `.sysi
 .dlmod https://raw.githubusercontent.com/Splaueef/host/main/alwaysonline.py
 ```
 
+## HiddenGifts
+
+`hidden_gifts.py` відкриває owner-only каталог із 11 прихованих історичних
+Telegram-подарунків, зокрема білого ведмедика із серцем. Модуль використовує
+офіційний MTProto-процес `payments.getPaymentForm` → `payments.sendStarsForm`:
+спочатку Telegram перевіряє подарунок і повертає актуальну ціну в Stars, а
+списання можливе лише після окремого підтвердження. Перед оплатою форма
+перевіряється повторно; якщо сума змінилася, платіж зупиняється.
+
+```text
+.hgift @username
+.hgift @username | Зі святом!
+.hgiftcheck @username
+```
+
+У приватному чаті одержувача можна не вказувати; у групі команда також працює
+у відповідь на повідомлення користувача. Налаштування `hide_name_by_default`
+визначає початковий стан анонімності, який можна змінити у вікні підтвердження.
+
+```text
+.dlmod https://raw.githubusercontent.com/Splaueef/host/main/hidden_gifts.py
+```
+
 Original projects that used these resources include:
 
 - https://github.com/hikariatama/Hikka
