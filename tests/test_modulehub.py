@@ -227,6 +227,7 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
             "minigames": ("minigames.py", "MiniGamesMod"),
             "alwaysonline": ("alwaysonline.py", "AlwaysOnlineMod"),
             "giftmonitor": ("gift_monitor.py", "GiftMonitorMod"),
+            "hikkanet": ("hikkanet.py", "HikkaNetMod"),
         }
         for key, (filename, class_name) in expected.items():
             self.assertEqual(self.module.REPO_FILES[key], filename)

@@ -30,6 +30,24 @@ The purpose of this repository is to maintain hosting-related files used by cust
 .dlmod https://raw.githubusercontent.com/Splaueef/host/main/modulehub.py
 ```
 
+## HikkaNet та окремий Hikka Hub сервіс
+
+`hikkanet.py` підключає Hikka до окремого API-процесу з каталогу
+`hikka_hub/`. Сервіс слухає задані IP та порт і дає авторизованим Hikka
+heartbeat, список online-вузлів, обмін подіями й JSON-даними, власні метрики та
+загальну статистику.
+
+Кожна інсталяція має окремі `instance_id`, `key_id` і `key_secret`, прив'язані
+до Telegram ID її власника. Усі API-запити підписуються HMAC-SHA256 і мають
+timestamp та одноразовий nonce; ключ однієї Hikka можна відкликати або ротувати
+без відключення інших. Повна інструкція Docker, systemd, видачі ключів і API:
+[`hikka_hub/README.md`](hikka_hub/README.md).
+
+```text
+.dlmod https://raw.githubusercontent.com/Splaueef/host/main/hikkanet.py
+.hknet
+```
+
 ## GroupAdmin
 
 `group_admin.py` додає owner-only панель керування групою або каналом. Якщо
