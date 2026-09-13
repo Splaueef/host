@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 2.2.0
+# meta version: 2.2.1
 # meta description: 🧭 Центр команд, конфігурації та встановлення модулів Hikka.
 # scope: inline
 # scope: hikka_only
@@ -298,6 +298,7 @@ class ModuleHubMod(loader.Module):
         "ttt",
         "rps",
         "dicegame",
+        "checkers",
         "quiz",
         "gstatus",
         "gmarket",

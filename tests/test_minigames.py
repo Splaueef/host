@@ -122,6 +122,70 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.module._winner_ttt([0, None, None, None, 0, None, None, None, 0]), 0)
         self.assertIsNone(self.module._winner_ttt([0, 1, 0, 1, 0, 1, 1, 0, 1]))
 
+    def test_checkers_initial_board_has_twelve_pieces_per_side(self):
+        board = self.module._checker_initial_board()
+
+        self.assertEqual(len(board), 64)
+        self.assertEqual(sum(piece > 0 for piece in board), 12)
+        self.assertEqual(sum(piece < 0 for piece in board), 12)
+        self.assertTrue(all(not piece or (divmod(index, 8)[0] + divmod(index, 8)[1]) % 2 for index, piece in enumerate(board)))
+
+    def test_checkers_enforces_capture_and_allows_man_to_capture_backwards(self):
+        board = [0] * 64
+        board[42] = 1
+        board[35] = -1
+        board[46] = 1
+
+        self.assertEqual(self.module._checker_moves_for(board, 0, 42), [(28, 35)])
+        self.assertEqual(self.module._checker_moves_for(board, 0, 46), [])
+
+        backward = [0] * 64
+        backward[17] = 1
+        backward[26] = -1
+        self.assertIn((35, 26), self.module._checker_captures(backward, 17))
+
+    def test_flying_king_can_land_anywhere_beyond_captured_piece(self):
+        board = [0] * 64
+        board[49] = 2
+        board[35] = -1
+
+        self.assertEqual(
+            self.module._checker_captures(board, 49),
+            [(28, 35), (21, 35), (14, 35), (7, 35)],
+        )
+
+    async def test_checkers_multi_capture_continues_and_promotes_to_king(self):
+        invited = types.SimpleNamespace(id=2, first_name="Guest", last_name=None, username="guest", bot=False)
+        token = self.module._new_session("checkers", -100, invited)
+        session = self.module._session(token)
+        session["board"] = [0] * 64
+        session["board"][33] = 1
+        session["board"][26] = -1
+        session["board"][12] = -1
+        call = _Call(1, "Host")
+
+        await self.module._checker_click(call, token, 33)
+        await self.module._checker_click(call, token, 19)
+
+        self.assertEqual(session["forced_piece"], 19)
+        self.assertFalse(session["finished"])
+
+        await self.module._checker_click(call, token, 5)
+
+        self.assertEqual(session["board"][5], 2)
+        self.assertEqual(session["captures"], [2, 0])
+        self.assertTrue(session["finished"])
+        self.assertEqual(session["winner"], 1)
+
+    def test_checkers_board_is_rendered_as_eight_button_rows(self):
+        token = self.module._new_session("checkers", -100)
+        markup = self.module._markup(token)
+
+        self.assertEqual(len(markup[:8]), 8)
+        self.assertTrue(all(len(row) == 8 for row in markup[:8]))
+        self.assertEqual(markup[0][1]["text"], "●")
+        self.assertEqual(markup[7][0]["text"], "○")
+
     async def test_rps_choices_are_hidden_until_both_players_answer(self):
         invited = types.SimpleNamespace(id=2, first_name="Guest", last_name=None, username="guest", bot=False)
         token = self.module._new_session("rps", -100, invited)
