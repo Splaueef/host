@@ -18,6 +18,18 @@ def _integer(name: str, default: int, minimum: int, maximum: int) -> int:
     return value
 
 
+def _boolean(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be a boolean")
+
+
 @dataclass(frozen=True)
 class Settings:
     bind: str
@@ -28,6 +40,8 @@ class Settings:
     request_body_limit: int
     event_retention_hours: int
     offline_after_seconds: int
+    module_updates_enabled: bool = True
+    module_update_interval: int = 300
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -47,5 +61,10 @@ class Settings:
             offline_after_seconds=_integer(
                 "HIKKA_HUB_OFFLINE_AFTER", 120, 30, 3600
             ),
+            module_updates_enabled=_boolean(
+                "HIKKA_HUB_MODULE_UPDATES", True
+            ),
+            module_update_interval=_integer(
+                "HIKKA_HUB_MODULE_UPDATE_INTERVAL", 300, 60, 86400
+            ),
         )
-

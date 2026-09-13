@@ -90,6 +90,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
     instance_id TEXT,
     details_json TEXT NOT NULL DEFAULT '{}'
 );
+
+CREATE TABLE IF NOT EXISTS service_state (
+    state_key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 """
 
 
@@ -232,6 +238,42 @@ class Store:
                 (topic, sender_instance_id, payload_json, now, now + ttl_seconds),
             )
             return {"id": cursor.lastrowid, "created_at": now, "expires_at": now + ttl_seconds}
+
+        return await self._run(operation)
+
+    async def get_service_state(self, state_key: str) -> Optional[dict[str, Any]]:
+        def operation():
+            row = self._db.execute(
+                "SELECT value_json, updated_at FROM service_state WHERE state_key=?",
+                (state_key,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "value": json.loads(row["value_json"]),
+                "updated_at": int(row["updated_at"]),
+            }
+
+        return await self._run(operation)
+
+    async def set_service_state(self, state_key: str, value: Any) -> dict[str, int]:
+        now = int(time.time())
+        value_json = json.dumps(
+            value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        )
+
+        def operation():
+            self._db.execute(
+                """
+                INSERT INTO service_state(state_key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(state_key) DO UPDATE SET
+                    value_json=excluded.value_json,
+                    updated_at=excluded.updated_at
+                """,
+                (state_key, value_json, now),
+            )
+            return {"updated_at": now}
 
         return await self._run(operation)
 

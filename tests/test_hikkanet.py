@@ -121,6 +121,7 @@ class HikkaNetHelperTests(unittest.TestCase):
             "api_publish",
             "api_events",
             "api_instances",
+            "api_module_versions",
             "api_get",
             "api_put",
             "api_delete",

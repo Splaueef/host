@@ -206,7 +206,7 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
 
     def test_auto_update_defaults_are_enabled_and_bounded(self):
         self.assertTrue(self.module.config["auto_update"])
-        self.assertEqual(self.module.config["auto_update_interval"], 21600)
+        self.assertEqual(self.module.config["update_poll_interval"], 60)
         self.assertTrue(self.module.config["auto_update_notify"])
         self.assertEqual(self.module.config["auto_update_exclude"], [])
 
@@ -236,7 +236,17 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
         }
         manifest["minigames.py"] = "1.4.0"
         manifest["stats.py"] = "1.6.0"
-        self.module._fetch_update_manifest = mock.AsyncMock(return_value=manifest)
+        network = _loaded("HikkaNetMod", {})
+        network.__version__ = (1, 2, 0)
+        network._configured = lambda: True
+        network.api_module_versions = mock.AsyncMock(
+            return_value={
+                "schema": 1,
+                "repository": "Splaueef/host",
+                "modules": manifest,
+            }
+        )
+        self.module.allmodules.modules.insert(0, network)
         invoked = []
 
         async def invoke(command, source, peer=None):
@@ -250,7 +260,8 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(invoked), 1)
         self.assertTrue(invoked[0][1].endswith("/minigames.py"))
         self.assertEqual([item["key"] for item in report["updated"]], ["minigames"])
-        self.assertEqual(report["current"], 1)
+        self.assertEqual(report["current"], 2)
+        network.api_module_versions.assert_awaited_once()
 
     async def test_auto_update_respects_excluded_modules(self):
         games = _loaded("MiniGamesMod", {})
@@ -261,13 +272,105 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
             filename: "1.0.0" for filename in self.module.REPO_FILES.values()
         }
         manifest["minigames.py"] = "9.0.0"
-        self.module._fetch_update_manifest = mock.AsyncMock(return_value=manifest)
+        network = _loaded("HikkaNetMod", {})
+        network.__version__ = (1, 2, 0)
+        network._configured = lambda: True
+        network.api_module_versions = mock.AsyncMock(
+            return_value={
+                "schema": 1,
+                "repository": "Splaueef/host",
+                "modules": manifest,
+            }
+        )
+        self.module.allmodules.modules.insert(0, network)
         self.module.invoke = mock.AsyncMock()
 
         report = await self.module.check_module_updates()
 
         self.assertEqual(report["skipped"], ["minigames"])
         self.module.invoke.assert_not_awaited()
+
+    async def test_update_event_installs_only_named_module_and_advances_cursor(self):
+        games = _loaded("MiniGamesMod", {})
+        games.__version__ = (1, 3, 0)
+        daily = _loaded("DailyStatMod", {})
+        daily.__version__ = (1, 5, 0)
+        manifest = {
+            filename: "1.0.0" for filename in self.module.REPO_FILES.values()
+        }
+        manifest.update({"minigames.py": "1.4.0", "stats.py": "1.6.0"})
+        network = _loaded("HikkaNetMod", {})
+        network._configured = lambda: True
+        network.api_module_versions = mock.AsyncMock(
+            return_value={
+                "schema": 1,
+                "repository": "Splaueef/host",
+                "modules": manifest,
+            }
+        )
+        network.api_events = mock.AsyncMock(
+            return_value={
+                "events": [
+                    {
+                        "id": 17,
+                        "topic": "system.module_updates",
+                        "sender_instance_id": "hikka-hub",
+                        "payload": {
+                            "schema": 1,
+                            "repository": "Splaueef/host",
+                            "changed": [
+                                {"filename": "minigames.py", "version": "1.4.0"}
+                            ],
+                        },
+                    }
+                ],
+                "next_after_id": 17,
+            }
+        )
+        self.module.allmodules.modules = [network, games, daily]
+        invoked = []
+
+        async def invoke(command, source, peer=None):
+            invoked.append((command, source, peer))
+            games.__version__ = (1, 4, 0)
+
+        self.module.invoke = invoke
+
+        report = await self.module._poll_module_update_events()
+
+        self.assertEqual([item["key"] for item in report["updated"]], ["minigames"])
+        self.assertEqual(len(invoked), 1)
+        self.assertEqual(self.module.get("modulehub_update_event_id"), 17)
+
+    async def test_update_event_rejects_non_server_sender(self):
+        network = _loaded("HikkaNetMod", {})
+        network._configured = lambda: True
+        network.api_module_versions = mock.AsyncMock()
+        network.api_events = mock.AsyncMock(
+            return_value={
+                "events": [
+                    {
+                        "id": 9,
+                        "topic": "system.module_updates",
+                        "sender_instance_id": "hikka-one",
+                        "payload": {
+                            "schema": 1,
+                            "repository": "Splaueef/host",
+                            "changed": [
+                                {"filename": "minigames.py", "version": "99.0.0"}
+                            ],
+                        },
+                    }
+                ]
+            }
+        )
+        self.module.allmodules.modules = [network]
+
+        report = await self.module._poll_module_update_events()
+
+        self.assertIsNone(report)
+        self.assertEqual(self.module.get("modulehub_update_event_id"), 9)
+        network.api_module_versions.assert_not_awaited()
 
 
     def test_catalog_contains_message_scheduler(self):

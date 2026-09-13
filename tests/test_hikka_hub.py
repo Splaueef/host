@@ -7,7 +7,13 @@ from pathlib import Path
 
 from aiohttp.test_utils import TestClient, TestServer
 
-from hikka_hub.app import create_app
+from hikka_hub.app import (
+    MODULE_REPOSITORY,
+    MODULE_STATE_KEY,
+    MODULE_UPDATE_TOPIC,
+    _process_module_manifest,
+    create_app,
+)
 from hikka_hub.config import Settings
 from hikka_hub.security import derive_hmac_key, sign_with_secret
 from hikka_hub.storage import Store
@@ -26,6 +32,8 @@ class HikkaHubApiTests(unittest.IsolatedAsyncioTestCase):
             request_body_limit=131072,
             event_retention_hours=168,
             offline_after_seconds=120,
+            module_updates_enabled=False,
+            module_update_interval=300,
         )
         self.store = Store(self.database)
         self.credentials = {
@@ -177,6 +185,69 @@ class HikkaHubApiTests(unittest.IsolatedAsyncioTestCase):
         target = f"/v1/events?after_id={event_id}&limit=50&topic=deploy"
         response = await self._request("GET", target, who="two")
         self.assertEqual((await response.json())["data"]["events"], [])
+
+    async def test_clients_cannot_publish_reserved_system_events(self):
+        response = await self._request(
+            "POST",
+            "/v1/events",
+            {
+                "topic": MODULE_UPDATE_TOPIC,
+                "payload": {"filename": "minigames.py"},
+                "ttl_seconds": 600,
+            },
+        )
+
+        self.assertEqual(response.status, 403)
+        self.assertEqual((await response.json())["error"]["code"], "reserved_topic")
+
+    async def test_module_version_endpoint_uses_server_cache(self):
+        response = await self._request("GET", "/v1/modules/versions")
+        self.assertEqual(response.status, 503)
+
+        await self.store.set_service_state(
+            MODULE_STATE_KEY,
+            {
+                "schema": 1,
+                "repository": MODULE_REPOSITORY,
+                "modules": {"minigames.py": "1.4.0"},
+            },
+        )
+        response = await self._request("GET", "/v1/modules/versions", who="two")
+        data = (await response.json())["data"]
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(data["repository"], MODULE_REPOSITORY)
+        self.assertEqual(data["modules"], {"minigames.py": "1.4.0"})
+        self.assertIsInstance(data["updated_at"], int)
+
+    async def test_manifest_change_emits_one_internal_update_event(self):
+        app = self.client.server.app
+
+        first = await _process_module_manifest(
+            app, {"minigames.py": "1.4.0"}, detected_at=100
+        )
+        unchanged = await _process_module_manifest(
+            app, {"minigames.py": "1.4.0"}, detected_at=101
+        )
+        changed = await _process_module_manifest(
+            app, {"minigames.py": "1.5.0"}, detected_at=102
+        )
+        events = await self.store.list_events(0, MODULE_UPDATE_TOPIC, 10)
+
+        self.assertEqual(first, [])
+        self.assertEqual(unchanged, [])
+        self.assertEqual(changed[0]["filename"], "minigames.py")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["sender_instance_id"], "hikka-hub")
+        self.assertEqual(events[0]["payload"]["detected_at"], 102)
+        self.assertEqual(
+            events[0]["payload"]["changed"][0],
+            {
+                "filename": "minigames.py",
+                "previous_version": "1.4.0",
+                "version": "1.5.0",
+            },
+        )
 
     async def test_latest_events_returns_tail_in_chronological_order(self):
         ids = []
