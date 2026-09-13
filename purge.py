@@ -1,4 +1,5 @@
 #    Friendly Telegram (telegram userbot)
+# meta version: 1.0.0
 #    Copyright (C) 2018-2019 The Authors
 
 #    This program is free software: you can redistribute it and/or modify

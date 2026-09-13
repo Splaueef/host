@@ -1,6 +1,6 @@
 # meta developer: @Huai_Baike
-# meta version: 3.0.0
-# meta description: 🧭 Центр команд, локальна шина та синхронізація статистики Hikka.
+# meta version: 3.1.0
+# meta description: 🧭 Центр команд, автооновлення та синхронізація статистики Hikka.
 # scope: inline
 # scope: hikka_only
 
@@ -13,6 +13,8 @@ import math
 import re
 import time
 from urllib.parse import urlparse
+
+import aiohttp
 
 from .. import loader, utils
 
@@ -36,6 +38,18 @@ class ModuleHubMod(loader.Module):
     CONFIG_PAGE_SIZE = 8
     SYNC_INTERVAL = 60
     SNAPSHOT_TTL = 300
+    UPDATE_INITIAL_DELAY = 90
+    UPDATE_MANIFEST_URL = (
+        "https://raw.githubusercontent.com/Splaueef/host/"
+        "main/module_versions.json"
+    )
+    VERSION_RE = re.compile(r"^\d+(?:\.\d+){1,3}$")
+    META_VERSION_RE = re.compile(
+        r"(?m)^#\s*meta\s+version:\s*v?(\d+(?:\.\d+){1,3})\s*$"
+    )
+    TUPLE_VERSION_RE = re.compile(
+        r"(?m)^__version__\s*=\s*\(([\d\s,]+)\)"
+    )
     REPO_BASE = "https://github.com/Splaueef/host/raw/main"
     TRUSTED_INSTALL_HOSTS = {
         "github.com",
@@ -482,13 +496,48 @@ class ModuleHubMod(loader.Module):
         "ms",
     }
 
+    def __init__(self):
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue(
+                "auto_update",
+                True,
+                "Автоматично оновлювати встановлені модулі каталогу",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "auto_update_interval",
+                21600,
+                "Інтервал перевірки оновлень у секундах",
+                validator=loader.validators.Integer(
+                    minimum=900, maximum=604800
+                ),
+            ),
+            loader.ConfigValue(
+                "auto_update_notify",
+                True,
+                "Повідомляти у Збережені повідомлення про оновлення та помилки",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "auto_update_exclude",
+                [],
+                "Ключі модулів, які ModuleHub не повинен оновлювати",
+                validator=loader.validators.Series(loader.validators.String()),
+            ),
+        )
+
     async def client_ready(self, client, db):
         self._client = client
         self._ensure_bus_state()
         self._sync_stop.clear()
-        self._sync_task = asyncio.create_task(
-            self._sync_worker(), name="modulehub-hikkanet-sync"
-        )
+        if not self._sync_task or self._sync_task.done():
+            self._sync_task = asyncio.create_task(
+                self._sync_worker(), name="modulehub-hikkanet-sync"
+            )
+        if not self._update_task or self._update_task.done():
+            self._update_task = asyncio.create_task(
+                self._auto_update_worker(), name="modulehub-auto-update"
+            )
 
     async def on_unload(self):
         self._ensure_bus_state()
@@ -498,16 +547,27 @@ class ModuleHubMod(loader.Module):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._sync_task
         self._sync_task = None
+        if self._update_task:
+            self._update_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._update_task
+        self._update_task = None
 
     def _ensure_bus_state(self):
         if not hasattr(self, "_sync_stop"):
             self._sync_stop = asyncio.Event()
         if not hasattr(self, "_sync_task"):
             self._sync_task = None
+        if not hasattr(self, "_update_task"):
+            self._update_task = None
+        if not hasattr(self, "_update_lock"):
+            self._update_lock = asyncio.Lock()
         if not hasattr(self, "_last_sync"):
             self._last_sync = 0
         if not hasattr(self, "_last_sync_error"):
             self._last_sync_error = ""
+        if not hasattr(self, "_last_update_error"):
+            self._last_update_error = ""
 
     def _storage_get(self, key, default):
         getter = getattr(self, "get", None)
@@ -520,6 +580,309 @@ class ModuleHubMod(loader.Module):
         setter = getattr(self, "set", None)
         if callable(setter):
             setter(key, value)
+
+    @classmethod
+    def _version_text(cls, value):
+        if isinstance(value, (tuple, list)) and value:
+            try:
+                value = ".".join(str(max(0, int(item))) for item in value)
+            except (TypeError, ValueError):
+                return ""
+        value = str(value or "").strip().lstrip("v")
+        return value if cls.VERSION_RE.fullmatch(value) else ""
+
+    @classmethod
+    def _version_tuple(cls, value):
+        value = cls._version_text(value)
+        if not value:
+            return None
+        parts = tuple(int(item) for item in value.split("."))
+        return parts + (0,) * (4 - len(parts))
+
+    @classmethod
+    def _source_version(cls, source):
+        source = str(source or "")
+        matched = cls.META_VERSION_RE.search(source)
+        if matched:
+            return matched.group(1)
+        matched = cls.TUPLE_VERSION_RE.search(source)
+        if not matched:
+            return ""
+        try:
+            return ".".join(
+                str(int(item.strip()))
+                for item in matched.group(1).split(",")
+                if item.strip()
+            )
+        except ValueError:
+            return ""
+
+    def _runtime_module_version(self, module, key, stored_versions=None):
+        python_module = inspect.getmodule(module.__class__)
+        for target in (module, python_module):
+            version = self._version_text(getattr(target, "__version__", ""))
+            if version:
+                return version
+        if python_module is not None:
+            with contextlib.suppress(Exception):
+                version = self._source_version(inspect.getsource(python_module))
+                if version:
+                    return version
+        stored_versions = stored_versions or {}
+        return self._version_text(stored_versions.get(key, ""))
+
+    async def _fetch_update_manifest(self):
+        timeout = aiohttp.ClientTimeout(total=20)
+        url = f"{self.UPDATE_MANIFEST_URL}?t={int(time.time()) // 300}"
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            headers={"User-Agent": "ModuleHub/3.1 (Hikka module updater)"},
+        ) as session:
+            async with session.get(url, allow_redirects=True) as response:
+                final = urlparse(str(response.url))
+                if (
+                    response.status != 200
+                    or final.scheme != "https"
+                    or (final.hostname or "").lower()
+                    not in self.TRUSTED_INSTALL_HOSTS
+                ):
+                    raise RuntimeError(
+                        f"Не вдалося отримати manifest (HTTP {response.status})"
+                    )
+                raw = await response.content.read(131073)
+        if len(raw) > 131072:
+            raise RuntimeError("Manifest оновлень завеликий")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RuntimeError("Manifest оновлень пошкоджений") from error
+        modules = payload.get("modules") if isinstance(payload, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != 1
+            or not isinstance(modules, dict)
+        ):
+            raise RuntimeError("Непідтримуваний формат manifest")
+        result = {}
+        for filename, raw_version in modules.items():
+            if not isinstance(filename, str) or filename not in set(
+                self.REPO_FILES.values()
+            ) | {"modulehub.py"}:
+                continue
+            version = self._version_text(raw_version)
+            if not version:
+                raise RuntimeError(f"Некоректна версія для {filename}")
+            result[filename] = version
+        missing = set(self.REPO_FILES.values()) - set(result)
+        if missing:
+            raise RuntimeError(
+                "Manifest не містить: " + ", ".join(sorted(missing))
+            )
+        return result
+
+    def _excluded_update_keys(self):
+        raw_values = list(self.config["auto_update_exclude"] or [])
+        excluded = set()
+        for raw in raw_values:
+            value = str(raw or "").strip().casefold()
+            for key, filename in self.REPO_FILES.items():
+                spec = self.MODULES[key]
+                aliases = {
+                    key.casefold(),
+                    filename.casefold(),
+                    (filename[:-3] if filename.endswith(".py") else filename).casefold(),
+                    spec["name"].casefold(),
+                    spec["class"].casefold(),
+                }
+                if value in aliases:
+                    excluded.add(key)
+                    break
+        return excluded
+
+    async def check_module_updates(self, apply=True, peer="me"):
+        """Check trusted catalog versions and optionally install newer ones."""
+        self._ensure_bus_state()
+        if self._update_lock.locked():
+            raise RuntimeError("Перевірка оновлень уже виконується")
+        async with self._update_lock:
+            manifest = await self._fetch_update_manifest()
+            stored = self._storage_get("modulehub_versions", {})
+            stored = dict(stored) if isinstance(stored, dict) else {}
+            excluded = self._excluded_update_keys()
+            candidates = []
+            report = {
+                "checked_at": int(time.time()),
+                "checked": 0,
+                "current": 0,
+                "available": [],
+                "updated": [],
+                "skipped": [],
+                "failed": [],
+            }
+            for key, filename in self.REPO_FILES.items():
+                module = self._find_module(key)
+                if module is None:
+                    continue
+                if key in excluded:
+                    report["skipped"].append(key)
+                    continue
+                report["checked"] += 1
+                remote_version = manifest[filename]
+                local_version = self._runtime_module_version(module, key, stored)
+                local_tuple = self._version_tuple(local_version)
+                remote_tuple = self._version_tuple(remote_version)
+                if local_tuple is not None and local_tuple >= remote_tuple:
+                    report["current"] += 1
+                    stored[key] = local_version
+                    continue
+                candidate = {
+                    "key": key,
+                    "from": local_version or "невідомо",
+                    "to": remote_version,
+                }
+                report["available"].append(candidate)
+                candidates.append(candidate)
+
+            if apply:
+                for candidate in candidates:
+                    key = candidate["key"]
+                    try:
+                        await self.invoke(
+                            "dlmod", self._catalog_source(key), peer=peer or "me"
+                        )
+                        refreshed = self._find_module(key)
+                        if refreshed is None:
+                            raise RuntimeError("Loader не завантажив модуль")
+                        detected = self._runtime_module_version(refreshed, key)
+                        if (
+                            detected
+                            and self._version_tuple(detected)
+                            < self._version_tuple(candidate["to"])
+                        ):
+                            raise RuntimeError(
+                                f"Loader залишив версію {detected}"
+                            )
+                        stored[key] = candidate["to"]
+                        report["updated"].append(candidate)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        logger.exception("ModuleHub: auto-update failed for %s", key)
+                        report["failed"].append(
+                            {
+                                **candidate,
+                                "error": str(error).replace("\n", " ")[:240],
+                            }
+                        )
+            self._storage_set("modulehub_versions", stored)
+            self._storage_set("modulehub_update_report", report)
+            self._last_update_error = ""
+            self._storage_set("modulehub_update_error_notice", {})
+            if report["updated"]:
+                with contextlib.suppress(Exception):
+                    self.report_stat(
+                        self, "modules.updated", len(report["updated"])
+                    )
+            return report
+
+    @staticmethod
+    def _update_report_text(report, automatic=True):
+        updated = report.get("updated", []) if isinstance(report, dict) else []
+        failed = report.get("failed", []) if isinstance(report, dict) else []
+        lines = [
+            "♻️ <b>ModuleHub · автооновлення</b>",
+            "",
+            f"Перевірено: <b>{int(report.get('checked', 0))}</b>",
+            f"Актуальні: <b>{int(report.get('current', 0))}</b>",
+            f"Оновлено: <b>{len(updated)}</b>",
+        ]
+        if updated:
+            lines.extend(
+                [
+                    "",
+                    *[
+                        f"✅ <b>{utils.escape_html(item['key'])}</b>: "
+                        f"<code>{utils.escape_html(item['from'])}</code> → "
+                        f"<code>{utils.escape_html(item['to'])}</code>"
+                        for item in updated[:25]
+                    ],
+                ]
+            )
+        if failed:
+            lines.extend(
+                [
+                    "",
+                    *[
+                        f"❌ <b>{utils.escape_html(item['key'])}</b>: "
+                        f"<code>{utils.escape_html(item['error'])}</code>"
+                        for item in failed[:10]
+                    ],
+                ]
+            )
+        if not updated and not failed:
+            lines.extend(["", "✅ Усі встановлені модулі вже актуальні."])
+        if automatic:
+            lines.extend(
+                [
+                    "",
+                    "<i>ModuleHub оновлює лише вже встановлені модулі "
+                    "з Splaueef/host.</i>",
+                ]
+            )
+        return "\n".join(lines)
+
+    async def _notify_update_report(self, report):
+        if not self.config["auto_update_notify"]:
+            return
+        if not report.get("updated") and not report.get("failed"):
+            return
+        await self._client.send_message(
+            "me", self._update_report_text(report), parse_mode="html"
+        )
+
+    async def _auto_update_worker(self):
+        await self._wait_for_sync(self.UPDATE_INITIAL_DELAY)
+        while not self._sync_stop.is_set():
+            failed = False
+            if self.config["auto_update"]:
+                try:
+                    report = await self.check_module_updates(apply=True, peer="me")
+                    await self._notify_update_report(report)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    failed = True
+                    self._last_update_error = str(error).replace("\n", " ")[:240]
+                    logger.warning(
+                        "ModuleHub automatic update failed: %s",
+                        self._last_update_error,
+                    )
+                    notice = self._storage_get(
+                        "modulehub_update_error_notice", {}
+                    )
+                    notice = notice if isinstance(notice, dict) else {}
+                    now = int(time.time())
+                    should_notify = (
+                        notice.get("error") != self._last_update_error
+                        or now - int(notice.get("sent_at", 0) or 0) >= 21600
+                    )
+                    if self.config["auto_update_notify"] and should_notify:
+                        with contextlib.suppress(Exception):
+                            await self._client.send_message(
+                                "me",
+                                "❌ <b>ModuleHub не перевірив оновлення</b>\n\n"
+                                f"<code>{utils.escape_html(self._last_update_error)}</code>",
+                                parse_mode="html",
+                            )
+                            self._storage_set(
+                                "modulehub_update_error_notice",
+                                {
+                                    "error": self._last_update_error,
+                                    "sent_at": now,
+                                },
+                            )
+            interval = int(self.config["auto_update_interval"])
+            await self._wait_for_sync(min(interval, 900) if failed else interval)
 
     @staticmethod
     def _slug(value, fallback="other", maximum=32):
@@ -865,11 +1228,13 @@ class ModuleHubMod(loader.Module):
         )
 
     def _home_text(self):
+        update_state = "увімкнено" if self.config["auto_update"] else "вимкнено"
         return (
             "🧭 <b>ModuleHub · головне меню</b>\n\n"
             f"✅ Активно: <b>{self._loaded_count()}</b> із "
             f"<b>{len(self.MODULES)}</b> основних модулів.\n"
             "📦 Каталог дозволяє встановлювати й оновлювати модулі.\n"
+            f"♻️ Автооновлення: <b>{update_state}</b>.\n"
             "⚙️ Налаштування працюють і для інших модулів Hikka.\n"
             "🔐 Кнопки доступні лише власнику Hikka.\n\n"
             "<i>Оберіть розділ. Меню автоматично бере актуальні "
@@ -919,6 +1284,13 @@ class ModuleHubMod(loader.Module):
                 ],
                 [
                     {
+                        "text": "♻️ Автооновлення",
+                        "callback": self._updates_page,
+                        "args": (reply_id,),
+                    }
+                ],
+                [
+                    {
                         "text": "🔄 Оновити",
                         "callback": self._home,
                         "args": (reply_id,),
@@ -932,6 +1304,128 @@ class ModuleHubMod(loader.Module):
             ]
         )
         return rows
+
+    def _updates_markup(self, reply_id=None):
+        enabled = bool(self.config["auto_update"])
+        return [
+            [
+                {
+                    "text": "🔎 Перевірити й оновити зараз",
+                    "callback": self._run_updates_callback,
+                    "args": (reply_id,),
+                }
+            ],
+            [
+                {
+                    "text": (
+                        "⏸ Вимкнути автооновлення"
+                        if enabled
+                        else "▶️ Увімкнути автооновлення"
+                    ),
+                    "callback": self._toggle_auto_updates,
+                    "args": (not enabled, reply_id),
+                }
+            ],
+            [
+                {
+                    "text": "🏠 Головна",
+                    "callback": self._home,
+                    "args": (reply_id,),
+                },
+                {"text": "✖️", "action": "close"},
+            ],
+        ]
+
+    def _updates_status_text(self, note=None):
+        report = self._storage_get("modulehub_update_report", {})
+        report = report if isinstance(report, dict) else {}
+        interval = int(self.config["auto_update_interval"])
+        if interval % 3600 == 0:
+            interval_text = f"{interval // 3600} год"
+        elif interval % 60 == 0:
+            interval_text = f"{interval // 60} хв"
+        else:
+            interval_text = f"{interval} сек"
+        checked_at = int(report.get("checked_at", 0) or 0)
+        checked_text = (
+            time.strftime("%d.%m.%Y %H:%M:%S", time.localtime(checked_at))
+            if checked_at
+            else "ще не виконувалась"
+        )
+        excluded = self._excluded_update_keys()
+        lines = [
+            "♻️ <b>ModuleHub · оновлення</b>",
+            "",
+            f"Автоматично: <b>{'🟢 увімкнено' if self.config['auto_update'] else '⚫️ вимкнено'}</b>",
+            f"Інтервал: <b>{interval_text}</b>",
+            f"Остання перевірка: <code>{checked_text}</code>",
+            f"Виключено: <b>{len(excluded)}</b>",
+        ]
+        if report:
+            lines.extend(
+                [
+                    "",
+                    f"Перевірено модулів: <b>{int(report.get('checked', 0))}</b>",
+                    f"Оновлено востаннє: <b>{len(report.get('updated', []))}</b>",
+                    f"Помилок: <b>{len(report.get('failed', []))}</b>",
+                ]
+            )
+        if self._last_update_error:
+            lines.extend(
+                [
+                    "",
+                    "Помилка перевірки: "
+                    f"<code>{utils.escape_html(self._last_update_error)}</code>",
+                ]
+            )
+        if note:
+            lines.extend(["", note])
+        lines.extend(
+            [
+                "",
+                "<i>Оновлюються тільки вже встановлені модулі каталогу "
+                "Splaueef/host. Відсутні модулі автоматично не встановлюються.</i>",
+            ]
+        )
+        return "\n".join(lines)
+
+    async def _updates_page(self, call, reply_id=None):
+        await call.edit(
+            self._updates_status_text(),
+            reply_markup=self._updates_markup(reply_id),
+        )
+
+    async def _toggle_auto_updates(self, call, enabled, reply_id=None):
+        self.config["auto_update"] = bool(enabled)
+        await call.answer(
+            "Автооновлення увімкнено" if enabled else "Автооновлення вимкнено"
+        )
+        await self._updates_page(call, reply_id)
+
+    async def _run_updates_callback(self, call, reply_id=None):
+        if self._update_lock.locked():
+            await call.answer("Перевірка вже виконується", show_alert=True)
+            return
+        await call.edit(
+            "🔎 <b>Перевіряю версії модулів…</b>\n\n"
+            "<i>Оновлення встановлюються послідовно з Splaueef/host.</i>",
+            reply_markup=[],
+        )
+        try:
+            report = await self.check_module_updates(
+                apply=True, peer=self._chat_id(call) or "me"
+            )
+            note = self._update_report_text(report, automatic=False)
+        except Exception as error:
+            self._last_update_error = str(error).replace("\n", " ")[:240]
+            note = (
+                "❌ <b>Не вдалося перевірити оновлення</b>\n"
+                f"<code>{utils.escape_html(self._last_update_error)}</code>"
+            )
+        await call.edit(
+            self._updates_status_text(note),
+            reply_markup=self._updates_markup(reply_id),
+        )
 
     def _search_results(self, query):
         needle = str(query or "").strip().casefold()

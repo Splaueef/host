@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "modules": {
+    "alwaysonline.py": "1.1.0",
+    "analysis.py": "1.0.0",
+    "backup.py": "1.0.0",
+    "contactstatus.py": "3.5.0",
+    "dailynews.py": "2.1.1",
+    "eval.py": "1.0.0",
+    "gemmaself.py": "4.1.1",
+    "gift_monitor.py": "3.0.0",
+    "group_admin.py": "1.0.0",
+    "hidden_gifts.py": "1.1.0",
+    "hikkanet.py": "1.1.0",
+    "hikkanetchat.py": "1.0.0",
+    "math.py": "1.0.0",
+    "messagescheduler.py": "1.0.0",
+    "minigames.py": "1.4.0",
+    "mistralAI.py": "4.5.0",
+    "modulehub.py": "3.1.0",
+    "nekospy.py": "1.4.0",
+    "purge.py": "1.0.0",
+    "quietschedule.py": "1.0.0",
+    "rkapi.py": "9.0.0",
+    "stats.py": "1.6.0",
+    "sysinfo.py": "2.0.0",
+    "systemd.py": "1.0.0",
+    "teledocs.py": "1.0.0",
+    "timeinfo.py": "1.0.0",
+    "vdlt.py": "6.10.0"
+  }
+}
