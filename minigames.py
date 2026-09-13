@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 1.1.2
+# meta version: 1.1.3
 # meta description: Інтерактивні мініігри для чатів із кнопками та рейтингом
 # scope: inline
 # scope: hikka_only
