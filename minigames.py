@@ -1,10 +1,10 @@
 # meta developer: @Huai_Baike
-# meta version: 1.0.0
+# meta version: 1.1.0
 # meta description: Інтерактивні мініігри для чатів із кнопками та рейтингом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (1, 0, 0)
+__version__ = (1, 1, 0)
 
 import asyncio
 import contextlib
@@ -27,6 +27,9 @@ WIN_LINES = (
     (0, 4, 8),
     (2, 4, 6),
 )
+CHECKER_DIRECTIONS = ((-1, -1), (-1, 1), (1, -1), (1, 1))
+CHECKER_SYMBOLS = {1: "○", 2: "♔", -1: "●", -2: "♚"}
+CHECKER_DRAW_PLY = 80
 
 
 @loader.tds
@@ -158,6 +161,17 @@ class MiniGamesMod(loader.Module):
             session.update(choices={}, winner=None, draw=False)
         elif kind == "dice":
             session.update(rolls={}, winner=None, draw=False)
+        elif kind == "checkers":
+            session.update(
+                board=self._checker_initial_board(),
+                turn=0,
+                selected=None,
+                forced_piece=None,
+                winner=None,
+                draw=False,
+                quiet_ply=0,
+                captures=[0, 0],
+            )
         elif kind == "quiz":
             rounds = min(int(self.config["quiz_rounds"]), len(self.QUIZ_BANK))
             session.update(
@@ -236,6 +250,7 @@ class MiniGamesMod(loader.Module):
             "❌⭕ <b>Хрестики-нулики</b> — класика для двох\n"
             "🪨📄✂️ <b>Камінь, ножиці, папір</b> — вибір прихований\n"
             "🎲 <b>Кубик-дуель</b> — найбільше число перемагає\n"
+            "⚪⚫ <b>Шашки</b> — обов'язкове взяття та дамки\n"
             "🧠 <b>Вікторина</b> — перший правильний отримує бал\n\n"
             "<i>Ігри відкриті для учасників поточного чату.</i>"
         )
@@ -248,6 +263,9 @@ class MiniGamesMod(loader.Module):
             [
                 {"text": "🪨📄✂️ КНП", "callback": self._select_game, "args": (token, "rps")},
                 {"text": "🎲 Кубик", "callback": self._select_game, "args": (token, "dice")},
+            ],
+            [
+                {"text": "⚪⚫ Шашки", "callback": self._select_game, "args": (token, "checkers")},
             ],
             [
                 {"text": "🧠 Вікторина", "callback": self._select_game, "args": (token, "quiz")},
@@ -354,6 +372,355 @@ class MiniGamesMod(loader.Module):
             else:
                 session["turn"] = 1 - session["turn"]
             await call.edit(self._render(token), reply_markup=self._markup(token))
+
+    @staticmethod
+    def _checker_initial_board():
+        board = [0] * 64
+        for row in range(8):
+            for column in range(8):
+                if (row + column) % 2 == 0:
+                    continue
+                if row < 3:
+                    board[row * 8 + column] = -1
+                elif row > 4:
+                    board[row * 8 + column] = 1
+        return board
+
+    @staticmethod
+    def _checker_position(index):
+        index = int(index)
+        return divmod(index, 8)
+
+    @staticmethod
+    def _checker_index(row, column):
+        return row * 8 + column
+
+    @staticmethod
+    def _checker_coordinate(index):
+        row, column = divmod(int(index), 8)
+        return f"{'abcdefgh'[column]}{8 - row}"
+
+    @staticmethod
+    def _checker_owned(piece, side):
+        return piece > 0 if int(side) == 0 else piece < 0
+
+    @classmethod
+    def _checker_captures(cls, board, position):
+        position = int(position)
+        piece = board[position]
+        if not piece:
+            return []
+        row, column = cls._checker_position(position)
+        captures = []
+        if abs(piece) == 1:
+            for row_step, column_step in CHECKER_DIRECTIONS:
+                middle_row = row + row_step
+                middle_column = column + column_step
+                target_row = row + row_step * 2
+                target_column = column + column_step * 2
+                if not (
+                    0 <= middle_row < 8
+                    and 0 <= middle_column < 8
+                    and 0 <= target_row < 8
+                    and 0 <= target_column < 8
+                ):
+                    continue
+                middle = cls._checker_index(middle_row, middle_column)
+                target = cls._checker_index(target_row, target_column)
+                if board[middle] and board[middle] * piece < 0 and board[target] == 0:
+                    captures.append((target, middle))
+            return captures
+
+        for row_step, column_step in CHECKER_DIRECTIONS:
+            current_row = row + row_step
+            current_column = column + column_step
+            captured = None
+            while 0 <= current_row < 8 and 0 <= current_column < 8:
+                target = cls._checker_index(current_row, current_column)
+                target_piece = board[target]
+                if target_piece == 0:
+                    if captured is not None:
+                        captures.append((target, captured))
+                elif target_piece * piece > 0 or captured is not None:
+                    break
+                else:
+                    captured = target
+                current_row += row_step
+                current_column += column_step
+        return captures
+
+    @classmethod
+    def _checker_regular_moves(cls, board, position):
+        position = int(position)
+        piece = board[position]
+        if not piece:
+            return []
+        row, column = cls._checker_position(position)
+        moves = []
+        if abs(piece) == 1:
+            directions = ((-1, -1), (-1, 1)) if piece > 0 else ((1, -1), (1, 1))
+            for row_step, column_step in directions:
+                target_row = row + row_step
+                target_column = column + column_step
+                if 0 <= target_row < 8 and 0 <= target_column < 8:
+                    target = cls._checker_index(target_row, target_column)
+                    if board[target] == 0:
+                        moves.append((target, None))
+            return moves
+
+        for row_step, column_step in CHECKER_DIRECTIONS:
+            current_row = row + row_step
+            current_column = column + column_step
+            while 0 <= current_row < 8 and 0 <= current_column < 8:
+                target = cls._checker_index(current_row, current_column)
+                if board[target] != 0:
+                    break
+                moves.append((target, None))
+                current_row += row_step
+                current_column += column_step
+        return moves
+
+    @classmethod
+    def _checker_all_captures(cls, board, side):
+        result = {}
+        for position, piece in enumerate(board):
+            if not cls._checker_owned(piece, side):
+                continue
+            captures = cls._checker_captures(board, position)
+            if captures:
+                result[position] = captures
+        return result
+
+    @classmethod
+    def _checker_moves_for(cls, board, side, position):
+        if not 0 <= int(position) < 64 or not cls._checker_owned(board[int(position)], side):
+            return []
+        captures = cls._checker_all_captures(board, side)
+        if captures:
+            return captures.get(int(position), [])
+        return cls._checker_regular_moves(board, int(position))
+
+    @classmethod
+    def _checker_has_move(cls, board, side):
+        if cls._checker_all_captures(board, side):
+            return True
+        return any(
+            cls._checker_regular_moves(board, position)
+            for position, piece in enumerate(board)
+            if cls._checker_owned(piece, side)
+        )
+
+    def _render_checkers(self, session):
+        white, black = session["players"]
+        black_name = self._name(session, black) if black else "очікується суперник"
+        white_count = sum(1 for piece in session["board"] if piece > 0)
+        black_count = sum(1 for piece in session["board"] if piece < 0)
+        lines = [
+            "⚪⚫ <b>Шашки · 8×8</b>",
+            "",
+            f"○ {self._name(session, white)} — <b>{white_count}</b>",
+            f"● {black_name} — <b>{black_count}</b>",
+            "",
+        ]
+        if session["winner"] is not None:
+            lines.append(f"🏆 Переміг: <b>{self._name(session, session['winner'])}</b>")
+        elif session["draw"]:
+            lines.append("🤝 <b>Нічия: 40 ходів без взяття.</b>")
+        else:
+            turn_id = session["players"][session["turn"]]
+            turn_name = self._name(session, turn_id) if turn_id else "другого гравця"
+            lines.append(f"Хід: <b>{turn_name}</b>")
+            if session["selected"] is not None:
+                lines.append(
+                    f"🔸 Обрано: <b>{self._checker_coordinate(session['selected'])}</b> · "
+                    "натисніть ✦"
+                )
+            if session["forced_piece"] is not None:
+                lines.append("⚔️ <b>Продовжуйте серію взяття.</b>")
+            elif self._checker_all_captures(session["board"], session["turn"]):
+                lines.append("⚔️ <b>Є обов'язкове взяття.</b>")
+        lines.extend(("", "<i>○/● — шашки · ♔/♚ — дамки · ✦ — доступний хід</i>"))
+        return "\n".join(lines)
+
+    def _markup_checkers(self, token, session):
+        legal_targets = set()
+        if session["selected"] is not None and not session["finished"]:
+            legal_targets = {
+                target
+                for target, _ in self._checker_moves_for(
+                    session["board"], session["turn"], session["selected"]
+                )
+            }
+        rows = []
+        for row in range(8):
+            buttons = []
+            for column in range(8):
+                position = self._checker_index(row, column)
+                piece = session["board"][position]
+                if position == session["selected"]:
+                    symbol = f"›{CHECKER_SYMBOLS.get(piece, '·')}"
+                elif position in legal_targets:
+                    symbol = "✦"
+                elif piece:
+                    symbol = CHECKER_SYMBOLS[piece]
+                else:
+                    symbol = "·" if (row + column) % 2 else "▫"
+                buttons.append(
+                    {
+                        "text": symbol,
+                        "callback": self._checker_click,
+                        "args": (token, position),
+                    }
+                )
+            rows.append(buttons)
+        if session["finished"]:
+            rows.extend(self._footer(token, session))
+        else:
+            rows.append(
+                [
+                    {"text": "🏳 Здатися", "callback": self._checker_resign, "args": (token,)},
+                    {"text": "✖️ Закрити", "callback": self._close, "args": (token,)},
+                ]
+            )
+        return rows
+
+    async def _checker_click(self, call, token, position):
+        session = self._session(token)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        lock = self._locks.setdefault(token, asyncio.Lock())
+        async with lock:
+            user_id, user = self._actor(call)
+            if session["finished"]:
+                await call.answer("Гру вже завершено")
+                return
+            position = int(position)
+            if not 0 <= position < 64:
+                await call.answer("Некоректна клітинка")
+                return
+
+            side = int(session["turn"])
+            board = session["board"]
+            if session["players"][1] is None:
+                can_join = (
+                    side == 1
+                    and user_id != session["players"][0]
+                    and self._checker_owned(board[position], 1)
+                    and bool(self._checker_moves_for(board, 1, position))
+                )
+                if can_join:
+                    if session.get("invited_id") and user_id != session["invited_id"]:
+                        await call.answer(self.strings["not_yours"], show_alert=True)
+                        return
+                    session["players"][1] = user_id
+                    self._remember_actor(session, user_id, user)
+
+            current = session["players"][side]
+            if user_id != current:
+                await call.answer(
+                    self.strings["wait_opponent"]
+                    if session["players"][1] is None
+                    else self.strings["not_yours"],
+                    show_alert=True,
+                )
+                return
+
+            selected = session["selected"]
+            clicked_piece = board[position]
+            if self._checker_owned(clicked_piece, side):
+                if session["forced_piece"] is not None and position != session["forced_piece"]:
+                    await call.answer("⚔️ Потрібно продовжити взяття цією ж шашкою", show_alert=True)
+                    return
+                moves = self._checker_moves_for(board, side, position)
+                if not moves:
+                    message = (
+                        "⚔️ Треба бити іншою шашкою"
+                        if self._checker_all_captures(board, side)
+                        else "У цієї шашки немає доступних ходів"
+                    )
+                    await call.answer(message, show_alert=True)
+                    return
+                session["selected"] = position
+                await call.edit(self._render(token), reply_markup=self._markup(token))
+                return
+
+            if selected is None:
+                await call.answer("Спочатку оберіть свою шашку", show_alert=True)
+                return
+            legal = {
+                target: captured
+                for target, captured in self._checker_moves_for(board, side, selected)
+            }
+            if position not in legal:
+                await call.answer("Ця клітинка недоступна", show_alert=True)
+                return
+
+            captured = legal[position]
+            piece = board[selected]
+            board[selected] = 0
+            board[position] = piece
+            if captured is not None:
+                board[captured] = 0
+                session["captures"][side] += 1
+                session["quiet_ply"] = 0
+            else:
+                session["quiet_ply"] += 1
+
+            target_row, _ = self._checker_position(position)
+            if piece == 1 and target_row == 0:
+                board[position] = 2
+            elif piece == -1 and target_row == 7:
+                board[position] = -2
+
+            if captured is not None and self._checker_captures(board, position):
+                session["selected"] = position
+                session["forced_piece"] = position
+                await call.answer("⚔️ Є ще одне взяття")
+                await call.edit(self._render(token), reply_markup=self._markup(token))
+                return
+
+            session["selected"] = None
+            session["forced_piece"] = None
+            opponent = 1 - side
+            if not any(self._checker_owned(value, opponent) for value in board) or not self._checker_has_move(board, opponent):
+                session["winner"] = session["players"][side]
+                session["finished"] = True
+                self._record_result(session, [session["winner"]])
+            elif session["quiet_ply"] >= CHECKER_DRAW_PLY:
+                session["draw"] = True
+                session["finished"] = True
+                self._record_result(session, [], draw=True)
+            else:
+                session["turn"] = opponent
+            await call.edit(self._render(token), reply_markup=self._markup(token))
+
+    async def _checker_resign(self, call, token):
+        session = self._session(token)
+        user_id, _ = self._actor(call)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        players = [player for player in session.get("players", []) if player]
+        if user_id not in players:
+            await call.answer(self.strings["not_yours"], show_alert=True)
+            return
+        if session["finished"]:
+            await call.answer("Гру вже завершено")
+            return
+        opponents = [player for player in players if player != user_id]
+        if not opponents:
+            self._sessions.pop(token, None)
+            self._locks.pop(token, None)
+            await call.edit(self.strings["closed"], reply_markup=[])
+            return
+        session["winner"] = opponents[0]
+        session["finished"] = True
+        self._record_result(session, [opponents[0]])
+        await call.edit(
+            self._render(token) + f"\n\n🏳 {self._name(session, user_id)} здався.",
+            reply_markup=self._markup(token),
+        )
 
     def _render_rps(self, session):
         first, second = session["players"]
@@ -576,7 +943,7 @@ class MiniGamesMod(loader.Module):
         if user_id not in participants and user_id != session["creator_id"]:
             await call.answer(self.strings["not_yours"], show_alert=True)
             return
-        if session["kind"] in {"ttt", "rps", "dice"} and session["players"][1] is not None:
+        if session["kind"] in {"ttt", "rps", "dice", "checkers"} and session["players"][1] is not None:
             session["players"] = [session["players"][1], session["players"][0]]
             session["invited_id"] = session["players"][1]
         self._reset_game(session)
@@ -672,6 +1039,11 @@ class MiniGamesMod(loader.Module):
     async def dicegame(self, message):
         """🎲 Почати дуель на кубиках"""
         await self._direct_game(message, "dice")
+
+    @loader.command(ru_doc="Шашки 8×8: .checkers [@user] або у відповідь")
+    async def checkers(self, message):
+        """⚪⚫ Почати партію в шашки з обов'язковим взяттям"""
+        await self._direct_game(message, "checkers")
 
     @loader.command(ru_doc="Запустити швидку вікторину для всього чату")
     async def quiz(self, message):
