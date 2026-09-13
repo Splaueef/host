@@ -177,14 +177,33 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session["finished"])
         self.assertEqual(session["winner"], 1)
 
-    def test_checkers_board_is_rendered_as_eight_button_rows(self):
+    def test_checkers_board_uses_visible_emoji_cells(self):
         token = self.module._new_session("checkers", -100)
         markup = self.module._markup(token)
 
         self.assertEqual(len(markup[:8]), 8)
         self.assertTrue(all(len(row) == 8 for row in markup[:8]))
-        self.assertEqual(markup[0][1]["text"], "●")
-        self.assertEqual(markup[7][0]["text"], "○")
+        self.assertEqual(markup[0][0]["text"], "🟨")
+        self.assertEqual(markup[0][1]["text"], "⚫")
+        self.assertEqual(markup[3][0]["text"], "🟫")
+        self.assertEqual(markup[7][0]["text"], "⚪")
+
+    def test_checkers_board_highlights_selection_targets_and_kings(self):
+        token = self.module._new_session("checkers", -100)
+        session = self.module._session(token)
+        session["board"] = [0] * 64
+        session["board"][42] = 2
+        session["board"][23] = -2
+
+        markup = self.module._markup(token)
+        self.assertEqual(markup[5][2]["text"], "⚪👑")
+        self.assertEqual(markup[2][7]["text"], "⚫👑")
+
+        session["selected"] = 42
+        markup = self.module._markup(token)
+        self.assertEqual(markup[5][2]["text"], "🟦")
+        self.assertEqual(markup[4][1]["text"], "🟩")
+        self.assertEqual(markup[4][3]["text"], "🟩")
 
     async def test_rps_choices_are_hidden_until_both_players_answer(self):
         invited = types.SimpleNamespace(id=2, first_name="Guest", last_name=None, username="guest", bot=False)
