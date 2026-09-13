@@ -30,6 +30,40 @@ The purpose of this repository is to maintain hosting-related files used by cust
 .dlmod https://raw.githubusercontent.com/Splaueef/host/main/modulehub.py
 ```
 
+## GroupAdmin
+
+`group_admin.py` додає owner-only панель керування групою або каналом. Якщо
+відкрити `.gadmin` у відповідь на повідомлення користувача, у панелі з'являться
+кнопки mute/unmute, warn/unwarn, kick, ban і unban. Окремі екрани керують slow
+mode, дозволами звичайних учасників і закріпленням повідомлень. Небезпечні дії
+потребують підтвердження, а паралельні натискання захищені блокуванням.
+
+Командні скорочення мають префікс `g`, щоб не перезаписувати стандартні модулі
+Hikka: `.gban`, `.gkick`, `.gmute`, `.gwarn`, `.gslowmode`, `.glock` тощо.
+
+```text
+.dlmod https://raw.githubusercontent.com/Splaueef/host/main/group_admin.py
+```
+
+## MiniGames
+
+`minigames.py` містить публічні для учасників чату inline-ігри: хрестики-нулики,
+камінь–ножиці–папір із прихованим вибором, кубик-дуель і швидку вікторину.
+Завершені матчі потрапляють у локальний рейтинг чату. Меню відкривається
+командою `.games`; суперника можна запросити відповіддю або через `@username`.
+
+```text
+.ttt @username
+.rps
+.dicegame
+.quiz
+.gametop
+```
+
+```text
+.dlmod https://raw.githubusercontent.com/Splaueef/host/main/minigames.py
+```
+
 ## MessageScheduler
 
 `messagescheduler.py` надсилає повідомлення від акаунта Hikka в окремі чати,
