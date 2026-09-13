@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 3.1.0
+# meta version: 3.2.0
 # meta description: 🧭 Центр команд, автооновлення та синхронізація статистики Hikka.
 # scope: inline
 # scope: hikka_only
@@ -13,8 +13,6 @@ import math
 import re
 import time
 from urllib.parse import urlparse
-
-import aiohttp
 
 from .. import loader, utils
 
@@ -38,11 +36,10 @@ class ModuleHubMod(loader.Module):
     CONFIG_PAGE_SIZE = 8
     SYNC_INTERVAL = 60
     SNAPSHOT_TTL = 300
-    UPDATE_INITIAL_DELAY = 90
-    UPDATE_MANIFEST_URL = (
-        "https://raw.githubusercontent.com/Splaueef/host/"
-        "main/module_versions.json"
-    )
+    UPDATE_INITIAL_DELAY = 30
+    UPDATE_RECONCILE_INTERVAL = 3600
+    UPDATE_EVENT_TOPIC = "system.module_updates"
+    UPDATE_REPOSITORY = "Splaueef/host"
     VERSION_RE = re.compile(r"^\d+(?:\.\d+){1,3}$")
     META_VERSION_RE = re.compile(
         r"(?m)^#\s*meta\s+version:\s*v?(\d+(?:\.\d+){1,3})\s*$"
@@ -505,11 +502,11 @@ class ModuleHubMod(loader.Module):
                 validator=loader.validators.Boolean(),
             ),
             loader.ConfigValue(
-                "auto_update_interval",
-                21600,
-                "Інтервал перевірки оновлень у секундах",
+                "update_poll_interval",
+                60,
+                "Інтервал читання подій оновлення з HikkaNet у секундах",
                 validator=loader.validators.Integer(
-                    minimum=900, maximum=604800
+                    minimum=30, maximum=3600
                 ),
             ),
             loader.ConfigValue(
@@ -631,38 +628,15 @@ class ModuleHubMod(loader.Module):
         stored_versions = stored_versions or {}
         return self._version_text(stored_versions.get(key, ""))
 
-    async def _fetch_update_manifest(self):
-        timeout = aiohttp.ClientTimeout(total=20)
-        url = f"{self.UPDATE_MANIFEST_URL}?t={int(time.time()) // 300}"
-        async with aiohttp.ClientSession(
-            timeout=timeout,
-            headers={"User-Agent": "ModuleHub/3.1 (Hikka module updater)"},
-        ) as session:
-            async with session.get(url, allow_redirects=True) as response:
-                final = urlparse(str(response.url))
-                if (
-                    response.status != 200
-                    or final.scheme != "https"
-                    or (final.hostname or "").lower()
-                    not in self.TRUSTED_INSTALL_HOSTS
-                ):
-                    raise RuntimeError(
-                        f"Не вдалося отримати manifest (HTTP {response.status})"
-                    )
-                raw = await response.content.read(131073)
-        if len(raw) > 131072:
-            raise RuntimeError("Manifest оновлень завеликий")
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise RuntimeError("Manifest оновлень пошкоджений") from error
+    def _validate_update_manifest(self, payload):
         modules = payload.get("modules") if isinstance(payload, dict) else None
         if (
             not isinstance(payload, dict)
             or payload.get("schema") != 1
+            or payload.get("repository") != self.UPDATE_REPOSITORY
             or not isinstance(modules, dict)
         ):
-            raise RuntimeError("Непідтримуваний формат manifest")
+            raise RuntimeError("HikkaNet повернув непідтримуваний manifest")
         result = {}
         for filename, raw_version in modules.items():
             if not isinstance(filename, str) or filename not in set(
@@ -671,14 +645,21 @@ class ModuleHubMod(loader.Module):
                 continue
             version = self._version_text(raw_version)
             if not version:
-                raise RuntimeError(f"Некоректна версія для {filename}")
+                raise RuntimeError(f"HikkaNet повернув некоректну версію {filename}")
             result[filename] = version
         missing = set(self.REPO_FILES.values()) - set(result)
         if missing:
             raise RuntimeError(
-                "Manifest не містить: " + ", ".join(sorted(missing))
+                "Manifest HikkaNet не містить: " + ", ".join(sorted(missing))
             )
         return result
+
+    async def _fetch_network_manifest(self):
+        network = self._network_module()
+        if network is None:
+            raise RuntimeError("HikkaNet не налаштовано")
+        payload = await network.api_module_versions()
+        return self._validate_update_manifest(payload)
 
     def _excluded_update_keys(self):
         raw_values = list(self.config["auto_update_exclude"] or [])
@@ -699,19 +680,29 @@ class ModuleHubMod(loader.Module):
                     break
         return excluded
 
-    async def check_module_updates(self, apply=True, peer="me"):
-        """Check trusted catalog versions and optionally install newer ones."""
+    async def check_module_updates(
+        self, apply=True, peer="me", only_filenames=None
+    ):
+        """Read trusted catalog versions from HikkaNet and install newer ones."""
         self._ensure_bus_state()
         if self._update_lock.locked():
             raise RuntimeError("Перевірка оновлень уже виконується")
         async with self._update_lock:
-            manifest = await self._fetch_update_manifest()
+            manifest = await self._fetch_network_manifest()
             stored = self._storage_get("modulehub_versions", {})
             stored = dict(stored) if isinstance(stored, dict) else {}
             excluded = self._excluded_update_keys()
+            selected = None
+            if only_filenames is not None:
+                selected = {
+                    str(filename)
+                    for filename in only_filenames
+                    if str(filename) in set(self.REPO_FILES.values())
+                }
             candidates = []
             report = {
                 "checked_at": int(time.time()),
+                "source": "hikkanet",
                 "checked": 0,
                 "current": 0,
                 "available": [],
@@ -720,6 +711,8 @@ class ModuleHubMod(loader.Module):
                 "failed": [],
             }
             for key, filename in self.REPO_FILES.items():
+                if selected is not None and filename not in selected:
+                    continue
                 module = self._find_module(key)
                 if module is None:
                     continue
@@ -840,14 +833,100 @@ class ModuleHubMod(loader.Module):
             "me", self._update_report_text(report), parse_mode="html"
         )
 
+    def _update_event_filenames(self, response, after_id):
+        if not isinstance(response, dict) or not isinstance(
+            response.get("events"), list
+        ):
+            raise RuntimeError("HikkaNet повернув некоректний список подій")
+        filenames = set()
+        next_after_id = max(0, int(after_id))
+        known_files = set(self.REPO_FILES.values()) | {"modulehub.py"}
+        for event in response["events"]:
+            if not isinstance(event, dict):
+                continue
+            try:
+                next_after_id = max(next_after_id, int(event.get("id", 0)))
+            except (TypeError, ValueError):
+                continue
+            if (
+                event.get("topic") != self.UPDATE_EVENT_TOPIC
+                or event.get("sender_instance_id") != "hikka-hub"
+            ):
+                continue
+            payload = event.get("payload")
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema") != 1
+                or payload.get("repository") != self.UPDATE_REPOSITORY
+                or not isinstance(payload.get("changed"), list)
+            ):
+                continue
+            for item in payload["changed"]:
+                if not isinstance(item, dict):
+                    continue
+                filename = item.get("filename")
+                version = self._version_text(item.get("version"))
+                if filename in known_files and version:
+                    filenames.add(filename)
+        return filenames, next_after_id, len(response["events"])
+
+    async def _poll_module_update_events(self, peer="me"):
+        network = self._network_module()
+        if network is None:
+            raise RuntimeError("HikkaNet не налаштовано")
+        try:
+            cursor = max(
+                0, int(self._storage_get("modulehub_update_event_id", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            cursor = 0
+        response = await network.api_events(
+            after_id=cursor,
+            topic=self.UPDATE_EVENT_TOPIC,
+            limit=100,
+        )
+        filenames, next_cursor, event_count = self._update_event_filenames(
+            response, cursor
+        )
+        report = None
+        selected = filenames & set(self.REPO_FILES.values())
+        if selected:
+            report = await self.check_module_updates(
+                apply=True,
+                peer=peer,
+                only_filenames=selected,
+            )
+            report["events"] = event_count
+        if next_cursor > cursor:
+            self._storage_set("modulehub_update_event_id", next_cursor)
+        return report
+
     async def _auto_update_worker(self):
         await self._wait_for_sync(self.UPDATE_INITIAL_DELAY)
         while not self._sync_stop.is_set():
             failed = False
             if self.config["auto_update"]:
                 try:
-                    report = await self.check_module_updates(apply=True, peer="me")
-                    await self._notify_update_report(report)
+                    now = int(time.time())
+                    last_reconcile = int(
+                        self._storage_get(
+                            "modulehub_last_update_reconcile", 0
+                        )
+                        or 0
+                    )
+                    if now - last_reconcile >= self.UPDATE_RECONCILE_INTERVAL:
+                        report = await self.check_module_updates(
+                            apply=True, peer="me"
+                        )
+                        self._storage_set(
+                            "modulehub_last_update_reconcile", now
+                        )
+                        await self._notify_update_report(report)
+                    event_report = await self._poll_module_update_events(
+                        peer="me"
+                    )
+                    if event_report is not None:
+                        await self._notify_update_report(event_report)
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
@@ -881,8 +960,8 @@ class ModuleHubMod(loader.Module):
                                     "sent_at": now,
                                 },
                             )
-            interval = int(self.config["auto_update_interval"])
-            await self._wait_for_sync(min(interval, 900) if failed else interval)
+            interval = int(self.config["update_poll_interval"])
+            await self._wait_for_sync(max(interval, 300) if failed else interval)
 
     @staticmethod
     def _slug(value, fallback="other", maximum=32):
@@ -1339,7 +1418,7 @@ class ModuleHubMod(loader.Module):
     def _updates_status_text(self, note=None):
         report = self._storage_get("modulehub_update_report", {})
         report = report if isinstance(report, dict) else {}
-        interval = int(self.config["auto_update_interval"])
+        interval = int(self.config["update_poll_interval"])
         if interval % 3600 == 0:
             interval_text = f"{interval // 3600} год"
         elif interval % 60 == 0:
@@ -1357,7 +1436,7 @@ class ModuleHubMod(loader.Module):
             "♻️ <b>ModuleHub · оновлення</b>",
             "",
             f"Автоматично: <b>{'🟢 увімкнено' if self.config['auto_update'] else '⚫️ вимкнено'}</b>",
-            f"Інтервал: <b>{interval_text}</b>",
+            f"Події HikkaNet: кожні <b>{interval_text}</b>",
             f"Остання перевірка: <code>{checked_text}</code>",
             f"Виключено: <b>{len(excluded)}</b>",
         ]
@@ -1383,8 +1462,9 @@ class ModuleHubMod(loader.Module):
         lines.extend(
             [
                 "",
-                "<i>Оновлюються тільки вже встановлені модулі каталогу "
-                "Splaueef/host. Відсутні модулі автоматично не встановлюються.</i>",
+                "<i>Hikka Hub перевіряє Splaueef/host, а ModuleHub читає "
+                "захищені системні події. Оновлюються тільки вже встановлені "
+                "модулі; відсутні автоматично не встановлюються.</i>",
             ]
         )
         return "\n".join(lines)
@@ -1407,7 +1487,7 @@ class ModuleHubMod(loader.Module):
             await call.answer("Перевірка вже виконується", show_alert=True)
             return
         await call.edit(
-            "🔎 <b>Перевіряю версії модулів…</b>\n\n"
+            "🔎 <b>Отримую версії модулів із HikkaNet…</b>\n\n"
             "<i>Оновлення встановлюються послідовно з Splaueef/host.</i>",
             reply_markup=[],
         )

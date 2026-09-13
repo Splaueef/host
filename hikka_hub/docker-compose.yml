@@ -1,7 +1,7 @@
 services:
   hikka-hub:
     build: .
-    image: hikka-hub:1.0.0
+    image: hikka-hub:1.2.0
     container_name: hikka-hub
     restart: unless-stopped
     ports:
@@ -15,6 +15,8 @@ services:
       HIKKA_HUB_BODY_LIMIT: "131072"
       HIKKA_HUB_EVENT_RETENTION_HOURS: "168"
       HIKKA_HUB_OFFLINE_AFTER: "120"
+      HIKKA_HUB_MODULE_UPDATES: "true"
+      HIKKA_HUB_MODULE_UPDATE_INTERVAL: "300"
     volumes:
       - hikka_hub_data:/data
     security_opt:

@@ -14,7 +14,9 @@ import time
 import uuid
 from collections import defaultdict, deque
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
+import aiohttp
 from aiohttp import web
 
 from . import __version__
@@ -32,6 +34,15 @@ from .storage import Store
 logger = logging.getLogger("hikka_hub")
 NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 PUBLIC_PATHS = {"/", "/health"}
+MODULE_MANIFEST_URL = (
+    "https://raw.githubusercontent.com/Splaueef/host/main/module_versions.json"
+)
+MODULE_REPOSITORY = "Splaueef/host"
+MODULE_STATE_KEY = "module_versions"
+MODULE_UPDATE_TOPIC = "system.module_updates"
+MODULE_MANIFEST_LIMIT = 131072
+MODULE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_]+\.py$")
+MODULE_VERSION_RE = re.compile(r"^\d+(?:\.\d+){1,3}$")
 
 
 class ApiError(Exception):
@@ -273,6 +284,124 @@ def _query_bool(request: web.Request, name: str, default: bool = False) -> bool:
     raise ApiError(400, "invalid_query", f"{name} must be a boolean")
 
 
+def _version_tuple(value: str) -> tuple[int, int, int, int]:
+    parts = tuple(int(item) for item in value.split("."))
+    return parts + (0,) * (4 - len(parts))
+
+
+def _validate_module_manifest(payload: Any) -> dict[str, str]:
+    modules = payload.get("modules") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != 1
+        or not isinstance(modules, dict)
+        or not 1 <= len(modules) <= 512
+    ):
+        raise ValueError("unsupported module manifest")
+    result = {}
+    for filename, version in modules.items():
+        if (
+            not isinstance(filename, str)
+            or not MODULE_FILENAME_RE.fullmatch(filename)
+            or not isinstance(version, str)
+            or not MODULE_VERSION_RE.fullmatch(version)
+        ):
+            raise ValueError("invalid module manifest entry")
+        result[filename] = version
+    return result
+
+
+async def _fetch_module_manifest(
+    session: aiohttp.ClientSession,
+) -> dict[str, str]:
+    url = f"{MODULE_MANIFEST_URL}?t={int(time.time()) // 300}"
+    async with session.get(url, allow_redirects=True) as response:
+        final = urlsplit(str(response.url))
+        if (
+            response.status != 200
+            or final.scheme != "https"
+            or (final.hostname or "").lower() != "raw.githubusercontent.com"
+        ):
+            raise RuntimeError(f"module manifest returned HTTP {response.status}")
+        raw = await response.content.read(MODULE_MANIFEST_LIMIT + 1)
+    if len(raw) > MODULE_MANIFEST_LIMIT:
+        raise RuntimeError("module manifest is too large")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("module manifest is not valid JSON") from exc
+    try:
+        return _validate_module_manifest(payload)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+async def _process_module_manifest(
+    app: web.Application,
+    modules: dict[str, str],
+    detected_at: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Cache one manifest and emit an event only for newer module versions."""
+    modules = _validate_module_manifest({"schema": 1, "modules": modules})
+    detected_at = int(time.time()) if detected_at is None else int(detected_at)
+    state_value = {
+        "schema": 1,
+        "repository": MODULE_REPOSITORY,
+        "modules": modules,
+    }
+    store = app[STORE_KEY]
+    previous_state = await store.get_service_state(MODULE_STATE_KEY)
+    if previous_state is None:
+        await store.set_service_state(MODULE_STATE_KEY, state_value)
+        logger.info("Stored initial module version manifest (%s modules)", len(modules))
+        return []
+
+    previous_value = previous_state.get("value", {})
+    previous_modules = (
+        previous_value.get("modules", {})
+        if isinstance(previous_value, dict)
+        else {}
+    )
+    changed = []
+    for filename, version in sorted(modules.items()):
+        previous_version = previous_modules.get(filename)
+        if previous_version is None or (
+            isinstance(previous_version, str)
+            and MODULE_VERSION_RE.fullmatch(previous_version)
+            and _version_tuple(version) > _version_tuple(previous_version)
+        ):
+            changed.append(
+                {
+                    "filename": filename,
+                    "previous_version": previous_version,
+                    "version": version,
+                }
+            )
+
+    if changed:
+        ttl_seconds = app[SETTINGS_KEY].event_retention_hours * 3600
+        await store.add_event(
+            MODULE_UPDATE_TOPIC,
+            "hikka-hub",
+            {
+                "schema": 1,
+                "repository": MODULE_REPOSITORY,
+                "changed": changed,
+                "detected_at": detected_at,
+            },
+            ttl_seconds,
+        )
+        logger.info(
+            "Published module update event: %s",
+            ", ".join(item["filename"] for item in changed),
+        )
+
+    # Persist only after the event is durable. A crash can therefore duplicate an
+    # idempotent update notification, but cannot silently lose one.
+    await store.set_service_state(MODULE_STATE_KEY, state_value)
+    return changed
+
+
 async def root(request: web.Request) -> web.Response:
     return _response(
         {
@@ -336,9 +465,45 @@ async def instances(request: web.Request) -> web.Response:
     return _response({"instances": items, "active_within": active_within})
 
 
+async def module_versions(request: web.Request) -> web.Response:
+    state = await request.app[STORE_KEY].get_service_state(MODULE_STATE_KEY)
+    if state is None:
+        raise ApiError(
+            503,
+            "module_manifest_unavailable",
+            "Module version manifest has not been loaded yet",
+        )
+    value = state.get("value")
+    try:
+        modules = _validate_module_manifest(value)
+    except ValueError:
+        logger.error("Cached module version manifest is invalid")
+        raise ApiError(
+            503,
+            "module_manifest_unavailable",
+            "Module version manifest is unavailable",
+        ) from None
+    if value.get("repository") != MODULE_REPOSITORY:
+        raise ApiError(
+            503,
+            "module_manifest_unavailable",
+            "Module version manifest is unavailable",
+        )
+    return _response(
+        {
+            "schema": 1,
+            "repository": MODULE_REPOSITORY,
+            "modules": modules,
+            "updated_at": int(state["updated_at"]),
+        }
+    )
+
+
 async def publish_event(request: web.Request) -> web.Response:
     payload = await _json_object(request)
     topic = _identifier(payload.get("topic"), "topic")
+    if topic == "system" or topic.startswith("system."):
+        raise ApiError(403, "reserved_topic", "system.* topics are reserved")
     ttl_max = request.app[SETTINGS_KEY].event_retention_hours * 3600
     try:
         ttl_seconds = int(payload.get("ttl_seconds", min(86400, ttl_max)))
@@ -512,11 +677,35 @@ async def _cleanup_context(app: web.Application):
             except Exception:
                 logger.exception("Periodic cleanup failed")
 
-    task = asyncio.create_task(worker(), name="hikka-hub-cleanup")
+    async def module_update_worker():
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            headers={"User-Agent": f"Hikka-Hub/{__version__} module watcher"},
+        ) as session:
+            while True:
+                try:
+                    modules = await _fetch_module_manifest(session)
+                    await _process_module_manifest(app, modules)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Module manifest check failed")
+                await asyncio.sleep(app[SETTINGS_KEY].module_update_interval)
+
+    tasks = [asyncio.create_task(worker(), name="hikka-hub-cleanup")]
+    if app[SETTINGS_KEY].module_updates_enabled:
+        tasks.append(
+            asyncio.create_task(
+                module_update_worker(), name="hikka-hub-module-updates"
+            )
+        )
     yield
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
     await app[STORE_KEY].close()
 
 
@@ -542,6 +731,7 @@ def create_app(
             web.get("/v1/me", me),
             web.post("/v1/heartbeat", heartbeat),
             web.get("/v1/instances", instances),
+            web.get("/v1/modules/versions", module_versions),
             web.post("/v1/events", publish_event),
             web.get("/v1/events", get_events),
             web.put("/v1/kv/{namespace}/{item_key}", put_item),

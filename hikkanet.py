@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 1.1.0
+# meta version: 1.2.0
 # meta description: 🔐 Захищена мережа обміну даними між окремими Hikka.
 # scope: inline
 # scope: hikka_only
@@ -32,7 +32,7 @@ from .. import loader, utils
 
 
 logger = logging.getLogger(__name__)
-__version__ = (1, 1, 0)
+__version__ = (1, 2, 0)
 _PROTOCOL = "HIKKA-HUB-V1"
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$")
@@ -491,6 +491,7 @@ class HikkaNetMod(loader.Module):
                     "kv",
                     "metrics",
                     "metrics_batch",
+                    "module_updates",
                     "presence",
                 ],
             },
@@ -541,6 +542,10 @@ class HikkaNetMod(loader.Module):
             "/v1/instances",
             params={"active_within": max(30, min(int(active_within), 3600))},
         )
+
+    async def api_module_versions(self):
+        """Return the server-cached trusted module version manifest."""
+        return await self._request("GET", "/v1/modules/versions")
 
     async def api_get(self, namespace, item_key=None, prefix="", limit=50):
         namespace = _identifier(namespace, "namespace")
