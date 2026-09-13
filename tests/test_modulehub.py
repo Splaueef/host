@@ -2,10 +2,12 @@
 
 import html
 import importlib.util
+import json
 import pathlib
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 class _Module:
@@ -19,6 +21,22 @@ class _Module:
 
     def get_prefix(self):
         return "."
+
+
+class _LoaderValidator:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+class _LoaderConfigValue:
+    def __init__(self, name, default, doc, validator=None):
+        self.name = name
+        self.default = default
+
+
+class _LoaderModuleConfig(dict):
+    def __init__(self, *values):
+        super().__init__((value.name, value.default) for value in values)
 
 
 def _decorator(*args, **kwargs):
@@ -37,8 +55,16 @@ def _load_module():
     loader = types.ModuleType("hubhost.loader")
     utils = types.ModuleType("hubhost.utils")
     loader.Module = _Module
+    loader.ModuleConfig = _LoaderModuleConfig
+    loader.ConfigValue = _LoaderConfigValue
     loader.tds = lambda value: value
     loader.command = _decorator
+    loader.validators = types.SimpleNamespace(
+        Boolean=_LoaderValidator,
+        Integer=_LoaderValidator,
+        String=_LoaderValidator,
+        Series=_LoaderValidator,
+    )
     utils.escape_html = lambda value: html.escape(str(value), quote=False)
 
     async def answer(message, text):
@@ -178,6 +204,71 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("", commands)
         self.assertNotIn("hub", commands)
 
+    def test_auto_update_defaults_are_enabled_and_bounded(self):
+        self.assertTrue(self.module.config["auto_update"])
+        self.assertEqual(self.module.config["auto_update_interval"], 21600)
+        self.assertTrue(self.module.config["auto_update_notify"])
+        self.assertEqual(self.module.config["auto_update_exclude"], [])
+
+    def test_version_manifest_covers_every_module_source(self):
+        root = pathlib.Path(__file__).parents[1]
+        manifest = json.loads(
+            (root / "module_versions.json").read_text(encoding="utf-8")
+        )
+        root_modules = {path.name for path in root.glob("*.py")}
+
+        self.assertEqual(manifest["schema"], 1)
+        self.assertEqual(set(manifest["modules"]), root_modules)
+        for filename, expected in manifest["modules"].items():
+            source = (root / filename).read_text(encoding="utf-8")
+            self.assertEqual(
+                self.module._source_version(source), expected, filename
+            )
+
+    async def test_auto_update_installs_only_newer_loaded_modules(self):
+        games = _loaded("MiniGamesMod", {})
+        games.__version__ = (1, 3, 0)
+        daily = _loaded("DailyStatMod", {})
+        daily.__version__ = (1, 6, 0)
+        self.module.allmodules.modules = [games, daily]
+        manifest = {
+            filename: "1.0.0" for filename in self.module.REPO_FILES.values()
+        }
+        manifest["minigames.py"] = "1.4.0"
+        manifest["stats.py"] = "1.6.0"
+        self.module._fetch_update_manifest = mock.AsyncMock(return_value=manifest)
+        invoked = []
+
+        async def invoke(command, source, peer=None):
+            invoked.append((command, source, peer))
+            games.__version__ = (1, 4, 0)
+
+        self.module.invoke = invoke
+
+        report = await self.module.check_module_updates(peer="me")
+
+        self.assertEqual(len(invoked), 1)
+        self.assertTrue(invoked[0][1].endswith("/minigames.py"))
+        self.assertEqual([item["key"] for item in report["updated"]], ["minigames"])
+        self.assertEqual(report["current"], 1)
+
+    async def test_auto_update_respects_excluded_modules(self):
+        games = _loaded("MiniGamesMod", {})
+        games.__version__ = (1, 0, 0)
+        self.module.allmodules.modules = [games]
+        self.module.config["auto_update_exclude"] = ["minigames"]
+        manifest = {
+            filename: "1.0.0" for filename in self.module.REPO_FILES.values()
+        }
+        manifest["minigames.py"] = "9.0.0"
+        self.module._fetch_update_manifest = mock.AsyncMock(return_value=manifest)
+        self.module.invoke = mock.AsyncMock()
+
+        report = await self.module.check_module_updates()
+
+        self.assertEqual(report["skipped"], ["minigames"])
+        self.module.invoke.assert_not_awaited()
+
 
     def test_catalog_contains_message_scheduler(self):
         self.assertEqual(
@@ -311,6 +402,9 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
         buttons = _buttons(form["reply_markup"])
         search = next(button for button in buttons if button["text"].startswith("🔎"))
         self.assertEqual(search["args"], (77,))
+        self.assertTrue(
+            any(button["text"] == "♻️ Автооновлення" for button in buttons)
+        )
         self.assertTrue(any(button.get("url") == "https://t.me/RotKranzUK" for button in buttons))
 
     async def test_module_commands_are_discovered_and_paginated(self):

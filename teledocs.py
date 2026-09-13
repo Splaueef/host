@@ -1,4 +1,5 @@
 #             █ █ ▀ █▄▀ ▄▀█ █▀█ ▀
+# meta version: 1.0.0
 #             █▀█ █ █ █ █▀█ █▀▄ █
 #              © Copyright 2022
 #           https://t.me/hikariatama

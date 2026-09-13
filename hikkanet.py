@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 1.0.0
+# meta version: 1.1.0
 # meta description: 🔐 Захищена мережа обміну даними між окремими Hikka.
 # scope: inline
 # scope: hikka_only

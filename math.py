@@ -1,4 +1,5 @@
 # meta developer: @Huai_Baike
+# meta version: 1.0.0
 # meta syntax: .m <приклад>
 # requires: sympy pint aiohttp matplotlib numpy scipy Pillow
 
