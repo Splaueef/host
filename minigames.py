@@ -1,10 +1,10 @@
 # meta developer: @Huai_Baike
-# meta version: 1.1.0
+# meta version: 1.1.1
 # meta description: Інтерактивні мініігри для чатів із кнопками та рейтингом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (1, 1, 0)
+__version__ = (1, 1, 1)
 
 import asyncio
 import contextlib
@@ -28,7 +28,11 @@ WIN_LINES = (
     (2, 4, 6),
 )
 CHECKER_DIRECTIONS = ((-1, -1), (-1, 1), (1, -1), (1, 1))
-CHECKER_SYMBOLS = {1: "○", 2: "♔", -1: "●", -2: "♚"}
+CHECKER_SYMBOLS = {1: "⚪", 2: "⚪👑", -1: "⚫", -2: "⚫👑"}
+CHECKER_LIGHT_CELL = "🟨"
+CHECKER_DARK_CELL = "🟫"
+CHECKER_SELECTED_CELL = "🟦"
+CHECKER_TARGET_CELL = "🟩"
 CHECKER_DRAW_PLY = 80
 
 
@@ -518,8 +522,8 @@ class MiniGamesMod(loader.Module):
         lines = [
             "⚪⚫ <b>Шашки · 8×8</b>",
             "",
-            f"○ {self._name(session, white)} — <b>{white_count}</b>",
-            f"● {black_name} — <b>{black_count}</b>",
+            f"⚪ {self._name(session, white)} — <b>{white_count}</b>",
+            f"⚫ {black_name} — <b>{black_count}</b>",
             "",
         ]
         if session["winner"] is not None:
@@ -533,13 +537,19 @@ class MiniGamesMod(loader.Module):
             if session["selected"] is not None:
                 lines.append(
                     f"🔸 Обрано: <b>{self._checker_coordinate(session['selected'])}</b> · "
-                    "натисніть ✦"
+                    "натисніть 🟩"
                 )
             if session["forced_piece"] is not None:
                 lines.append("⚔️ <b>Продовжуйте серію взяття.</b>")
             elif self._checker_all_captures(session["board"], session["turn"]):
                 lines.append("⚔️ <b>Є обов'язкове взяття.</b>")
-        lines.extend(("", "<i>○/● — шашки · ♔/♚ — дамки · ✦ — доступний хід</i>"))
+        lines.extend(
+            (
+                "",
+                "<i>🟨🟫 — поле · ⚪/⚫ — шашки · 👑 — дамка</i>",
+                "<i>🟦 — вибрано · 🟩 — доступний хід</i>",
+            )
+        )
         return "\n".join(lines)
 
     def _markup_checkers(self, token, session):
@@ -558,13 +568,17 @@ class MiniGamesMod(loader.Module):
                 position = self._checker_index(row, column)
                 piece = session["board"][position]
                 if position == session["selected"]:
-                    symbol = f"›{CHECKER_SYMBOLS.get(piece, '·')}"
+                    symbol = CHECKER_SELECTED_CELL
                 elif position in legal_targets:
-                    symbol = "✦"
+                    symbol = CHECKER_TARGET_CELL
                 elif piece:
                     symbol = CHECKER_SYMBOLS[piece]
                 else:
-                    symbol = "·" if (row + column) % 2 else "▫"
+                    symbol = (
+                        CHECKER_DARK_CELL
+                        if (row + column) % 2
+                        else CHECKER_LIGHT_CELL
+                    )
                 buttons.append(
                     {
                         "text": symbol,
