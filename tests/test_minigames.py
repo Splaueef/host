@@ -561,17 +561,48 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         )
         first_square = table["cells"][1][1]["text"]
         self.assertEqual(first_square["type"], "button")
-        self.assertEqual(first_square["button"]["text"], "\u00a0")
         self.assertEqual(
-            first_square["button"]["icon_custom_emoji_id"],
+            first_square["button"]["text"],
+            {
+                "type": "custom_emoji",
+                "custom_emoji_id": "5470104136693362691",
+                "alternative_text": "♜",
+            },
+        )
+        self.assertEqual(
+            first_square["button"]["text"]["custom_emoji_id"],
             "5470104136693362691",
         )
         self.assertEqual(first_square["button"]["style"], "link")
         self.assertTrue(first_square["button"]["callback_data"].startswith("rich-"))
-        self.assertEqual(table["cells"][3][1]["text"]["button"]["text"], "\u00a0")
         self.assertEqual(
-            table["cells"][3][1]["text"]["button"]["icon_custom_emoji_id"],
+            table["cells"][3][1]["text"]["button"]["text"],
+            {
+                "type": "custom_emoji",
+                "custom_emoji_id": "5220005833110199517",
+                "alternative_text": "▫️",
+            },
+        )
+        self.assertEqual(
+            table["cells"][3][1]["text"]["button"]["text"]["custom_emoji_id"],
             "5220005833110199517",
+        )
+        board_emoji_ids = {
+            cell["text"]["button"]["text"]["custom_emoji_id"]
+            for row in table["cells"][1:9]
+            for cell in row[1:9]
+        }
+        self.assertEqual(
+            board_emoji_ids,
+            set(minigames.CHESS_PREMIUM_EMOJI_IDS.values())
+            | {minigames.CHESS_CELL_PREMIUM_EMOJI_ID},
+        )
+        self.assertTrue(
+            all(
+                "icon_custom_emoji_id" not in cell["text"]["button"]
+                for row in table["cells"][1:9]
+                for cell in row[1:9]
+            )
         )
         self.assertIn("blockquote", [block["type"] for block in blocks])
 
