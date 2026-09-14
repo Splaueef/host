@@ -1,10 +1,10 @@
 # meta developer: @Huai_Baike
-# meta version: 2.3.1
+# meta version: 2.3.2
 # meta description: Локальні та глобальні HikkaNet-ігри з рейтингом і матчмейкінгом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (2, 3, 1)
+__version__ = (2, 3, 2)
 
 import asyncio
 import contextlib
@@ -172,6 +172,9 @@ class MiniGamesMod(loader.Module):
         self._network_task = None
         self._network_stop = asyncio.Event()
         self._rich_warning_shown = False
+        self._rich_emoji_warning_shown = False
+        self._chess_emoji_alternatives = {}
+        self._chess_emoji_alternatives_retry_at = 0.0
 
     async def client_ready(self, client, db):
         self._client = client
@@ -1572,21 +1575,24 @@ class MiniGamesMod(loader.Module):
     def _chess_rich_button(
         button,
         *,
+        text=None,
         style=None,
         disabled=False,
         custom_emoji_id=None,
         alternative_text=None,
     ):
-        if custom_emoji_id:
+        if custom_emoji_id and alternative_text:
             result = {
                 "text": {
                     "type": "custom_emoji",
                     "custom_emoji_id": str(custom_emoji_id),
-                    "alternative_text": str(alternative_text or "▫️"),
+                    "alternative_text": str(alternative_text),
                 }
             }
         else:
-            result = {"text": str(button.get("text", ""))}
+            result = {
+                "text": str(button.get("text", "") if text is None else text)
+            }
         if disabled:
             result["disabled"] = {}
             return result
@@ -1690,13 +1696,15 @@ class MiniGamesMod(loader.Module):
                     session, row, column, legal
                 )
                 source = markup[display_row + 1][display_column]
+                alternative_text = self._chess_emoji_alternatives.get(
+                    str(emoji_id)
+                )
                 rich_button = self._chess_rich_button(
                     source,
+                    text=symbol,
                     style=style,
-                    custom_emoji_id=emoji_id,
-                    alternative_text=(
-                        symbol if symbol != CHESS_RICH_EMPTY_CELL else "▫️"
-                    ),
+                    custom_emoji_id=emoji_id if alternative_text else None,
+                    alternative_text=alternative_text,
                 )
                 cells.append(
                     self._chess_rich_table_cell(
@@ -1774,6 +1782,90 @@ class MiniGamesMod(loader.Module):
         blocks.append({"type": "footer", "text": " · ".join(footer)})
         return {"blocks": blocks, "skip_entity_detection": True}
 
+    def _inline_bot_token(self):
+        inline = getattr(self, "inline", None)
+        return getattr(inline, "_token", None) or getattr(
+            getattr(inline, "bot", None), "token", None
+        )
+
+    async def _ensure_chess_emoji_alternatives(self):
+        emoji_ids = tuple(
+            dict.fromkeys(
+                (
+                    *CHESS_PREMIUM_EMOJI_IDS.values(),
+                    CHESS_CELL_PREMIUM_EMOJI_ID,
+                )
+            )
+        )
+        if all(
+            emoji_id in self._chess_emoji_alternatives
+            for emoji_id in emoji_ids
+        ):
+            return True
+        if time.monotonic() < self._chess_emoji_alternatives_retry_at:
+            return False
+        token = self._inline_bot_token()
+        if not token:
+            return False
+
+        self._chess_emoji_alternatives_retry_at = time.monotonic() + 300
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as client:
+                async with client.post(
+                    f"https://api.telegram.org/bot{token}/getCustomEmojiStickers",
+                    json={"custom_emoji_ids": list(emoji_ids)},
+                ) as response:
+                    data = await response.json(content_type=None)
+            if not isinstance(data, dict) or not data.get("ok"):
+                description = (
+                    data.get("description")
+                    if isinstance(data, dict)
+                    else "неочікувана відповідь Telegram"
+                )
+                raise ValueError(str(description))
+
+            resolved = {}
+            for sticker in data.get("result") or []:
+                if not isinstance(sticker, dict):
+                    continue
+                emoji_id = str(sticker.get("custom_emoji_id") or "")
+                alternative = str(sticker.get("emoji") or "").strip()
+                if emoji_id in emoji_ids and alternative:
+                    resolved[emoji_id] = alternative
+            self._chess_emoji_alternatives.update(resolved)
+
+            complete = all(
+                emoji_id in self._chess_emoji_alternatives
+                for emoji_id in emoji_ids
+            )
+            self._chess_emoji_alternatives_retry_at = time.monotonic() + (
+                6 * 3600 if complete else 300
+            )
+            if not complete and not self._rich_emoji_warning_shown:
+                logger.warning(
+                    "Telegram повернув метадані лише для %d/%d шахових emoji; "
+                    "для решти використано звичайні символи",
+                    len(self._chess_emoji_alternatives),
+                    len(emoji_ids),
+                )
+                self._rich_emoji_warning_shown = True
+            return complete
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            ValueError,
+            TypeError,
+        ) as error:
+            if not self._rich_emoji_warning_shown:
+                logger.warning(
+                    "Не вдалося перевірити шахові custom emoji (%s); "
+                    "використано звичайні символи",
+                    error.__class__.__name__,
+                )
+                self._rich_emoji_warning_shown = True
+            return False
+
     async def _edit_rich_chess_message(self, call, record, rich_message):
         inline_message_id = (
             getattr(call, "inline_message_id", None)
@@ -1783,10 +1875,7 @@ class MiniGamesMod(loader.Module):
         message_id = record.get("rich_message_id")
         if not inline_message_id and (chat_id is None or message_id is None):
             return False
-        inline = getattr(self, "inline", None)
-        token = getattr(inline, "_token", None)
-        if not token:
-            token = getattr(getattr(inline, "bot", None), "token", None)
+        token = self._inline_bot_token()
         if not token:
             return False
         payload = {
@@ -1850,6 +1939,7 @@ class MiniGamesMod(loader.Module):
                 network_game = None
             if not self._register_rich_chess_callbacks(call, record, markup):
                 return False
+            await self._ensure_chess_emoji_alternatives()
             rich_message = self._build_rich_chess_message(
                 session, markup, network_game=network_game
             )
