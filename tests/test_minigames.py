@@ -317,6 +317,15 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
             [(44, None), (36, None)],
         )
 
+    def test_chess_has_premium_emoji_for_every_piece_and_empty_cell(self):
+        self.assertEqual(
+            set(minigames.CHESS_PREMIUM_EMOJI_IDS), set(minigames.CHESS_SYMBOLS)
+        )
+        self.assertEqual(len(set(minigames.CHESS_PREMIUM_EMOJI_IDS.values())), 12)
+        self.assertEqual(
+            minigames.CHESS_CELL_PREMIUM_EMOJI_ID, "5220005833110199517"
+        )
+
     def test_chess_rejects_move_that_exposes_own_king(self):
         board = [""] * 64
         board[0] = "k"
@@ -552,10 +561,18 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         )
         first_square = table["cells"][1][1]["text"]
         self.assertEqual(first_square["type"], "button")
-        self.assertEqual(first_square["button"]["text"], "♜")
+        self.assertEqual(first_square["button"]["text"], "\u00a0")
+        self.assertEqual(
+            first_square["button"]["icon_custom_emoji_id"],
+            "5470104136693362691",
+        )
         self.assertEqual(first_square["button"]["style"], "link")
         self.assertTrue(first_square["button"]["callback_data"].startswith("rich-"))
         self.assertEqual(table["cells"][3][1]["text"]["button"]["text"], "\u00a0")
+        self.assertEqual(
+            table["cells"][3][1]["text"]["button"]["icon_custom_emoji_id"],
+            "5220005833110199517",
+        )
         self.assertIn("blockquote", [block["type"] for block in blocks])
 
         controls = [block for block in blocks if block["type"] == "buttons"]

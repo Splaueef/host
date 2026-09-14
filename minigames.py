@@ -1,10 +1,10 @@
 # meta developer: @Huai_Baike
-# meta version: 2.2.0
+# meta version: 2.3.0
 # meta description: Локальні та глобальні HikkaNet-ігри з рейтингом і матчмейкінгом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (2, 2, 0)
+__version__ = (2, 3, 0)
 
 import asyncio
 import contextlib
@@ -61,6 +61,21 @@ CHESS_SYMBOLS = {
     "n": "♞",
     "p": "♟",
 }
+CHESS_PREMIUM_EMOJI_IDS = {
+    "P": "5469921214036223278",
+    "p": "5469995525560381442",
+    "N": "5469865151828110432",
+    "n": "5469892403395602271",
+    "B": "5469665856755638615",
+    "b": "5469961088512598930",
+    "R": "5469768635323032101",
+    "r": "5470104136693362691",
+    "Q": "5467752654983702502",
+    "q": "5469713225949948533",
+    "K": "5467393935020170256",
+    "k": "5470074673217787995",
+}
+CHESS_CELL_PREMIUM_EMOJI_ID = "5220005833110199517"
 CHESS_KNIGHT_STEPS = (
     (-2, -1),
     (-2, 1),
@@ -1507,12 +1522,20 @@ class MiniGamesMod(loader.Module):
         piece_symbol = CHESS_SYMBOLS.get(piece, "")
         special = legal.get(position)
         if position == session.get("selected"):
-            return piece_symbol or "◆", "primary"
+            return piece_symbol or CHESS_RICH_EMPTY_CELL, "primary", (
+                CHESS_PREMIUM_EMOJI_IDS.get(piece) or CHESS_CELL_PREMIUM_EMOJI_ID
+            )
         if position in legal:
             if piece or special == "en_passant":
-                return piece_symbol or "×", "danger"
-            return "•", "success"
-        return piece_symbol or CHESS_RICH_EMPTY_CELL, "link"
+                return piece_symbol or CHESS_RICH_EMPTY_CELL, "danger", (
+                    CHESS_PREMIUM_EMOJI_IDS.get(piece) or CHESS_CELL_PREMIUM_EMOJI_ID
+                )
+            return CHESS_RICH_EMPTY_CELL, "success", CHESS_CELL_PREMIUM_EMOJI_ID
+        return (
+            piece_symbol or CHESS_RICH_EMPTY_CELL,
+            "link",
+            CHESS_PREMIUM_EMOJI_IDS.get(piece) or CHESS_CELL_PREMIUM_EMOJI_ID,
+        )
 
     @staticmethod
     def _chess_plain_name(session, user_id):
@@ -1546,8 +1569,12 @@ class MiniGamesMod(loader.Module):
         return cell
 
     @staticmethod
-    def _chess_rich_button(button, *, style=None, disabled=False):
+    def _chess_rich_button(
+        button, *, style=None, disabled=False, icon_custom_emoji_id=None
+    ):
         result = {"text": str(button.get("text", ""))}
+        if icon_custom_emoji_id:
+            result["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
         if disabled:
             result["disabled"] = {}
             return result
@@ -1647,10 +1674,16 @@ class MiniGamesMod(loader.Module):
             rank = str(8 - row)
             cells = [self._chess_rich_table_cell(rank, header=True)]
             for display_column, column in enumerate(column_order):
-                symbol, style = self._chess_rich_cell(session, row, column, legal)
+                _symbol, style, emoji_id = self._chess_rich_cell(
+                    session, row, column, legal
+                )
                 source = markup[display_row + 1][display_column]
-                rich_button = self._chess_rich_button(source, style=style)
-                rich_button["text"] = symbol
+                rich_button = self._chess_rich_button(
+                    source, style=style, icon_custom_emoji_id=emoji_id
+                )
+                # Telegram requires button text even when a custom emoji icon is set.
+                # A non-breaking space leaves the premium piece/cell as the visual.
+                rich_button["text"] = CHESS_RICH_EMPTY_CELL
                 cells.append(
                     self._chess_rich_table_cell(
                         {"type": "button", "button": rich_button}
