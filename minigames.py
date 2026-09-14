@@ -1,10 +1,10 @@
 # meta developer: @Huai_Baike
-# meta version: 2.3.0
+# meta version: 2.3.1
 # meta description: Локальні та глобальні HikkaNet-ігри з рейтингом і матчмейкінгом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (2, 3, 0)
+__version__ = (2, 3, 1)
 
 import asyncio
 import contextlib
@@ -1570,11 +1570,23 @@ class MiniGamesMod(loader.Module):
 
     @staticmethod
     def _chess_rich_button(
-        button, *, style=None, disabled=False, icon_custom_emoji_id=None
+        button,
+        *,
+        style=None,
+        disabled=False,
+        custom_emoji_id=None,
+        alternative_text=None,
     ):
-        result = {"text": str(button.get("text", ""))}
-        if icon_custom_emoji_id:
-            result["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
+        if custom_emoji_id:
+            result = {
+                "text": {
+                    "type": "custom_emoji",
+                    "custom_emoji_id": str(custom_emoji_id),
+                    "alternative_text": str(alternative_text or "▫️"),
+                }
+            }
+        else:
+            result = {"text": str(button.get("text", ""))}
         if disabled:
             result["disabled"] = {}
             return result
@@ -1674,16 +1686,18 @@ class MiniGamesMod(loader.Module):
             rank = str(8 - row)
             cells = [self._chess_rich_table_cell(rank, header=True)]
             for display_column, column in enumerate(column_order):
-                _symbol, style, emoji_id = self._chess_rich_cell(
+                symbol, style, emoji_id = self._chess_rich_cell(
                     session, row, column, legal
                 )
                 source = markup[display_row + 1][display_column]
                 rich_button = self._chess_rich_button(
-                    source, style=style, icon_custom_emoji_id=emoji_id
+                    source,
+                    style=style,
+                    custom_emoji_id=emoji_id,
+                    alternative_text=(
+                        symbol if symbol != CHESS_RICH_EMPTY_CELL else "▫️"
+                    ),
                 )
-                # Telegram requires button text even when a custom emoji icon is set.
-                # A non-breaking space leaves the premium piece/cell as the visual.
-                rich_button["text"] = CHESS_RICH_EMPTY_CELL
                 cells.append(
                     self._chess_rich_table_cell(
                         {"type": "button", "button": rich_button}
