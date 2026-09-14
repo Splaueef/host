@@ -528,6 +528,24 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         await self.module._chess_cancel_finish(host, token)
         self.assertIsNone(session["finish_confirm"])
 
+    def test_chess_rich_board_never_hides_pieces_without_emoji_metadata(self):
+        token = self.module._new_session("chess", -100)
+        session = self.module._session(token)
+        rich_message = self.module._build_rich_chess_message(
+            session, self.module._markup(token)
+        )
+
+        table = next(
+            block
+            for block in rich_message["blocks"]
+            if block["type"] == "table"
+        )
+        self.assertEqual(table["cells"][1][1]["text"]["button"]["text"], "♜")
+        self.assertEqual(
+            table["cells"][3][1]["text"]["button"]["text"],
+            minigames.CHESS_RICH_EMPTY_CELL,
+        )
+
     async def test_chess_renders_as_interactive_telegram_rich_message(self):
         token = self.module._new_session("chess", -100)
         session = self.module._session(token)
@@ -535,6 +553,13 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         call.unit_id = "rich-unit"
         call.inline_message_id = "inline-message-id"
         self.module.inline = _RichInline()
+        self.module._chess_emoji_alternatives = {
+            **{
+                emoji_id: "♟️"
+                for emoji_id in minigames.CHESS_PREMIUM_EMOJI_IDS.values()
+            },
+            minigames.CHESS_CELL_PREMIUM_EMOJI_ID: "▫️",
+        }
         rendered = []
 
         async def capture_rich_edit(target, record, rich_message):
@@ -566,7 +591,7 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
             {
                 "type": "custom_emoji",
                 "custom_emoji_id": "5470104136693362691",
-                "alternative_text": "♜",
+                "alternative_text": "♟️",
             },
         )
         self.assertEqual(
