@@ -1,10 +1,10 @@
 # meta developer: @Huai_Baike
-# meta version: 2.3.2
+# meta version: 2.3.3
 # meta description: Локальні та глобальні HikkaNet-ігри з рейтингом і матчмейкінгом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (2, 3, 2)
+__version__ = (2, 3, 3)
 
 import asyncio
 import contextlib
@@ -76,6 +76,7 @@ CHESS_PREMIUM_EMOJI_IDS = {
     "k": "5470074673217787995",
 }
 CHESS_CELL_PREMIUM_EMOJI_ID = "5220005833110199517"
+CHESS_MOVE_PREMIUM_EMOJI_ID = "5463362846219836734"
 CHESS_KNIGHT_STEPS = (
     (-2, -1),
     (-2, 1),
@@ -1533,7 +1534,7 @@ class MiniGamesMod(loader.Module):
                 return piece_symbol or CHESS_RICH_EMPTY_CELL, "danger", (
                     CHESS_PREMIUM_EMOJI_IDS.get(piece) or CHESS_CELL_PREMIUM_EMOJI_ID
                 )
-            return CHESS_RICH_EMPTY_CELL, "success", CHESS_CELL_PREMIUM_EMOJI_ID
+            return CHESS_TARGET_CELL, "link", CHESS_MOVE_PREMIUM_EMOJI_ID
         return (
             piece_symbol or CHESS_RICH_EMPTY_CELL,
             "link",
@@ -1794,6 +1795,7 @@ class MiniGamesMod(loader.Module):
                 (
                     *CHESS_PREMIUM_EMOJI_IDS.values(),
                     CHESS_CELL_PREMIUM_EMOJI_ID,
+                    CHESS_MOVE_PREMIUM_EMOJI_ID,
                 )
             )
         )

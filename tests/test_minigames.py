@@ -325,6 +325,9 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             minigames.CHESS_CELL_PREMIUM_EMOJI_ID, "5220005833110199517"
         )
+        self.assertEqual(
+            minigames.CHESS_MOVE_PREMIUM_EMOJI_ID, "5463362846219836734"
+        )
 
     def test_chess_rejects_move_that_exposes_own_king(self):
         board = [""] * 64
@@ -549,6 +552,7 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
     async def test_chess_renders_as_interactive_telegram_rich_message(self):
         token = self.module._new_session("chess", -100)
         session = self.module._session(token)
+        session["selected"] = 52
         call = _Call(1, "Host")
         call.unit_id = "rich-unit"
         call.inline_message_id = "inline-message-id"
@@ -559,6 +563,7 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
                 for emoji_id in minigames.CHESS_PREMIUM_EMOJI_IDS.values()
             },
             minigames.CHESS_CELL_PREMIUM_EMOJI_ID: "▫️",
+            minigames.CHESS_MOVE_PREMIUM_EMOJI_ID: "🟩",
         }
         rendered = []
 
@@ -612,6 +617,16 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
             table["cells"][3][1]["text"]["button"]["text"]["custom_emoji_id"],
             "5220005833110199517",
         )
+        move_square = table["cells"][5][5]["text"]["button"]
+        self.assertEqual(
+            move_square["text"],
+            {
+                "type": "custom_emoji",
+                "custom_emoji_id": "5463362846219836734",
+                "alternative_text": "🟩",
+            },
+        )
+        self.assertEqual(move_square["style"], "link")
         board_emoji_ids = {
             cell["text"]["button"]["text"]["custom_emoji_id"]
             for row in table["cells"][1:9]
@@ -620,7 +635,10 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             board_emoji_ids,
             set(minigames.CHESS_PREMIUM_EMOJI_IDS.values())
-            | {minigames.CHESS_CELL_PREMIUM_EMOJI_ID},
+            | {
+                minigames.CHESS_CELL_PREMIUM_EMOJI_ID,
+                minigames.CHESS_MOVE_PREMIUM_EMOJI_ID,
+            },
         )
         self.assertTrue(
             all(
