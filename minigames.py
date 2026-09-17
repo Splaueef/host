@@ -1,16 +1,17 @@
 # meta developer: @Huai_Baike
-# meta version: 2.3.3
+# meta version: 2.4.0
 # meta description: Локальні та глобальні HikkaNet-ігри з рейтингом і матчмейкінгом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (2, 3, 3)
+__version__ = (2, 4, 0)
 
 import asyncio
 import contextlib
 import html
 import logging
 import random
+import re
 import secrets
 import time
 
@@ -509,8 +510,8 @@ class MiniGamesMod(loader.Module):
             self._locks.pop(token, None)
             await utils.answer(message, self.strings["inline_failed"])
             return
-        if kind == "chess" and callable(getattr(opened, "edit", None)):
-            await self._edit_chess_panel(opened, token)
+        if callable(getattr(opened, "edit", None)):
+            await self._edit_game_panel(opened, token)
 
     def _render(self, token):
         session = self._session(token)
@@ -583,10 +584,7 @@ class MiniGamesMod(loader.Module):
         session["players"] = [session["creator_id"], None]
         session["invited_id"] = None
         self._reset_game(session, kind)
-        if kind == "chess":
-            await self._edit_chess_panel(call, token)
-        else:
-            await call.edit(self._render(token), reply_markup=self._markup(token))
+        await self._edit_game_panel(call, token)
 
     @staticmethod
     def _winner_ttt(board):
@@ -671,7 +669,7 @@ class MiniGamesMod(loader.Module):
                 self._record_result(session, [], draw=True)
             else:
                 session["turn"] = 1 - session["turn"]
-            await call.edit(self._render(token), reply_markup=self._markup(token))
+            await self._edit_game_panel(call, token)
 
     @staticmethod
     def _checker_initial_board():
@@ -952,7 +950,7 @@ class MiniGamesMod(loader.Module):
                     await call.answer(message, show_alert=True)
                     return
                 session["selected"] = position
-                await call.edit(self._render(token), reply_markup=self._markup(token))
+                await self._edit_game_panel(call, token)
                 return
 
             if selected is None:
@@ -987,7 +985,7 @@ class MiniGamesMod(loader.Module):
                 session["selected"] = position
                 session["forced_piece"] = position
                 await call.answer("⚔️ Є ще одне взяття")
-                await call.edit(self._render(token), reply_markup=self._markup(token))
+                await self._edit_game_panel(call, token)
                 return
 
             session["selected"] = None
@@ -1003,7 +1001,7 @@ class MiniGamesMod(loader.Module):
                 self._record_result(session, [], draw=True)
             else:
                 session["turn"] = opponent
-            await call.edit(self._render(token), reply_markup=self._markup(token))
+            await self._edit_game_panel(call, token)
 
     async def _checker_resign(self, call, token):
         session = self._session(token)
@@ -1027,10 +1025,7 @@ class MiniGamesMod(loader.Module):
         session["winner"] = opponents[0]
         session["finished"] = True
         self._record_result(session, [opponents[0]])
-        await call.edit(
-            self._render(token) + f"\n\n🏳 {self._name(session, user_id)} здався.",
-            reply_markup=self._markup(token),
-        )
+        await self._edit_game_panel(call, token)
 
     @staticmethod
     def _chess_initial_board():
@@ -1531,9 +1526,10 @@ class MiniGamesMod(loader.Module):
             )
         if position in legal:
             if piece or special == "en_passant":
-                return piece_symbol or CHESS_RICH_EMPTY_CELL, "danger", (
-                    CHESS_PREMIUM_EMOJI_IDS.get(piece) or CHESS_CELL_PREMIUM_EMOJI_ID
-                )
+                # Telegram for iOS currently loses the tap target for a danger
+                # table button whose label is a custom emoji. Keep the capture
+                # marker in the text and use the regular link hit area instead.
+                return f"{CHESS_CAPTURE_CELL}{piece_symbol}", "link", None
             return CHESS_TARGET_CELL, "link", CHESS_MOVE_PREMIUM_EMOJI_ID
         return (
             piece_symbol or CHESS_RICH_EMPTY_CELL,
@@ -1547,6 +1543,223 @@ class MiniGamesMod(loader.Module):
             return "очікується суперник"
         value = session.get("names", {}).get(str(user_id), f"ID {user_id}")
         return " ".join(str(value).split())[:48] or f"ID {user_id}"
+
+    @staticmethod
+    def _rich_plain_text(value):
+        value = re.sub(r"(?i)<br\s*/?>", "\n", str(value or ""))
+        value = re.sub(r"<[^>]+>", "", value)
+        return html.unescape(value).strip()
+
+    def _rich_text_blocks(self, rendered, network_game=None):
+        plain = self._rich_plain_text(rendered)
+        lines = plain.splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        title = lines.pop(0).strip() if lines else "🎮 MiniGames"
+        if network_game:
+            kind = str(network_game.get("kind", ""))
+            title = f"🌐 HikkaNet · {NETWORK_LABELS.get(kind, kind)}"
+
+        blocks = [{"type": "heading", "text": title, "size": 4}]
+        if network_game:
+            game_id = str(network_game.get("game_id", ""))
+            status = self._network_status(network_game.get("status", ""))
+            blocks.append(
+                {
+                    "type": "paragraph",
+                    "text": {"type": "bold", "text": f"ID: {game_id} · {status}"},
+                }
+            )
+
+        paragraph = []
+        for line in lines:
+            if line.strip():
+                paragraph.append(line.strip())
+                continue
+            if paragraph:
+                blocks.append({"type": "paragraph", "text": "\n".join(paragraph)})
+                paragraph = []
+        if paragraph:
+            blocks.append({"type": "paragraph", "text": "\n".join(paragraph)})
+        return blocks
+
+    def _append_rich_controls(self, blocks, markup, *, skip_callbacks=()):
+        skipped = set(skip_callbacks)
+        for row in markup:
+            buttons = []
+            for button in row:
+                callback_name = getattr(button.get("callback"), "__name__", "")
+                if callback_name in skipped:
+                    continue
+                rich_button = self._chess_rich_button(
+                    button,
+                    style=self._chess_rich_control_style(button.get("text")),
+                )
+                if "disabled" in rich_button and button.get("action") == "close":
+                    continue
+                buttons.append(rich_button)
+            if buttons:
+                blocks.append({"type": "buttons", "buttons": buttons, "align": "center"})
+
+    def _build_rich_generic_message(self, rendered, markup, network_game=None):
+        blocks = self._rich_text_blocks(rendered, network_game)
+        self._append_rich_controls(blocks, markup)
+        return {"blocks": blocks, "skip_entity_detection": True}
+
+    def _build_rich_ttt_message(self, session, markup, network_game=None):
+        blocks = self._rich_text_blocks(self._render_ttt(session), network_game)
+        table = []
+        for row in markup[:3]:
+            cells = []
+            for source in row:
+                label = str(source.get("text", "·"))
+                style = "primary" if label == "❌" else "success" if label == "⭕" else "link"
+                cells.append(
+                    self._chess_rich_table_cell(
+                        {
+                            "type": "button",
+                            "button": self._chess_rich_button(
+                                source, text=label, style=style
+                            ),
+                        }
+                    )
+                )
+            table.append(cells)
+        blocks.append(
+            {
+                "type": "table",
+                "cells": table,
+                "is_bordered": True,
+                "is_compact": True,
+            }
+        )
+        self._append_rich_controls(blocks, markup[3:])
+        return {"blocks": blocks, "skip_entity_detection": True}
+
+    def _build_rich_checkers_message(self, session, markup, network_game=None):
+        blocks = self._rich_text_blocks(self._render_checkers(session), network_game)
+        files = "abcdefgh"
+        table = [
+            [self._chess_rich_table_cell(CHESS_RICH_EMPTY_CELL, header=True)]
+            + [self._chess_rich_table_cell(letter, header=True) for letter in files]
+            + [self._chess_rich_table_cell(CHESS_RICH_EMPTY_CELL, header=True)]
+        ]
+        for row_index, row in enumerate(markup[:8]):
+            rank = str(8 - row_index)
+            cells = [self._chess_rich_table_cell(rank, header=True)]
+            for source in row:
+                label = str(source.get("text", CHECKER_LIGHT_CELL))
+                style = (
+                    "primary"
+                    if label == CHECKER_SELECTED_CELL
+                    else "success"
+                    if label == CHECKER_TARGET_CELL
+                    else "link"
+                )
+                cells.append(
+                    self._chess_rich_table_cell(
+                        {
+                            "type": "button",
+                            "button": self._chess_rich_button(
+                                source, text=label, style=style
+                            ),
+                        }
+                    )
+                )
+            cells.append(self._chess_rich_table_cell(rank, header=True))
+            table.append(cells)
+        table.append(
+            [self._chess_rich_table_cell(CHESS_RICH_EMPTY_CELL, header=True)]
+            + [self._chess_rich_table_cell(letter, header=True) for letter in files]
+            + [self._chess_rich_table_cell(CHESS_RICH_EMPTY_CELL, header=True)]
+        )
+        blocks.append(
+            {
+                "type": "table",
+                "cells": table,
+                "is_bordered": True,
+                "is_striped": True,
+                "is_compact": True,
+            }
+        )
+        self._append_rich_controls(blocks, markup[8:])
+        return {"blocks": blocks, "skip_entity_detection": True}
+
+    def _build_rich_go_message(self, session, markup, network_game=None):
+        rendered = re.sub(r"<pre>.*?</pre>", "", self._render_go(session), flags=re.DOTALL)
+        blocks = self._rich_text_blocks(rendered, network_game)
+        size = int(session["go_size"])
+        columns = GO_COLUMNS[:size]
+        selected_row = session.get("selected_row")
+        place_buttons = {}
+        for row in markup:
+            for source in row:
+                callback_name = getattr(source.get("callback"), "__name__", "")
+                if callback_name in {"_go_place", "_net_go_place"}:
+                    args = tuple(source.get("args", ()))
+                    if args:
+                        place_buttons[int(args[-1])] = source
+
+        table = [
+            [self._chess_rich_table_cell(CHESS_RICH_EMPTY_CELL, header=True)]
+            + [self._chess_rich_table_cell(letter, header=True) for letter in columns]
+        ]
+        hoshi = self._go_hoshi(size)
+        last_move = session.get("last_move")
+        for row_index in range(size):
+            cells = [self._chess_rich_table_cell(str(size - row_index), header=True)]
+            for column in range(size):
+                position = self._go_index(row_index, column, size)
+                stone = session["board"][position]
+                if position == last_move and stone:
+                    label = GO_LAST_STONES[stone]
+                elif stone:
+                    label = GO_STONES[stone]
+                else:
+                    label = "+" if (row_index, column) in hoshi else "·"
+                source = place_buttons.get(column) if selected_row == row_index else None
+                if source is None:
+                    content = label
+                else:
+                    content = {
+                        "type": "button",
+                        "button": self._chess_rich_button(
+                            source,
+                            text=label,
+                            style="primary" if stone else "link",
+                        ),
+                    }
+                cells.append(self._chess_rich_table_cell(content))
+            table.append(cells)
+        blocks.append(
+            {
+                "type": "table",
+                "cells": table,
+                "is_bordered": True,
+                "is_compact": True,
+            }
+        )
+        self._append_rich_controls(
+            blocks,
+            markup,
+            skip_callbacks=("_go_place", "_net_go_place"),
+        )
+        return {"blocks": blocks, "skip_entity_detection": True}
+
+    def _build_rich_game_message(self, session, markup, network_game=None):
+        kind = str(session.get("kind", ""))
+        if kind == "chess":
+            return self._build_rich_chess_message(session, markup, network_game)
+        if kind == "ttt":
+            return self._build_rich_ttt_message(session, markup, network_game)
+        if kind == "checkers":
+            return self._build_rich_checkers_message(session, markup, network_game)
+        if kind in {"go9", "go13"}:
+            return self._build_rich_go_message(session, markup, network_game)
+        renderer = getattr(self, f"_render_{kind}")
+        return self._build_rich_generic_message(
+            renderer(session), markup, network_game
+        )
 
     def _chess_rich_status(self, session):
         if session.get("winner") is not None:
@@ -1619,7 +1832,7 @@ class MiniGamesMod(loader.Module):
             return "primary"
         return None
 
-    def _register_rich_chess_callbacks(self, call, record, markup):
+    def _register_rich_callbacks(self, call, record, markup):
         generator = getattr(getattr(self, "inline", None), "generate_markup", None)
         if not callable(generator):
             return False
@@ -1666,6 +1879,9 @@ class MiniGamesMod(loader.Module):
             record["rich_chat_id"] = int(chat_id)
             record["rich_message_id"] = int(message_id)
         return True
+
+    def _register_rich_chess_callbacks(self, call, record, markup):
+        return self._register_rich_callbacks(call, record, markup)
 
     def _build_rich_chess_message(self, session, markup, network_game=None):
         legal = {}
@@ -1917,46 +2133,55 @@ class MiniGamesMod(loader.Module):
                 self._rich_warning_shown = True
         return False
 
-    async def _try_edit_rich_chess(self, call, token, *, network=False):
+    async def _try_edit_rich_game(self, call, token, *, network=False):
         try:
             if network:
                 record = self._network_view(token)
                 if record is None:
                     return False
                 game = record["game"]
-                if game.get("kind") != "chess" or game.get("status") not in {
-                    "active",
-                    "finished",
-                }:
-                    return False
-                session = self._network_as_local_session(record)
                 markup = self._markup_network(token)
-                network_game = game
+                if game.get("status") in {"active", "finished"}:
+                    session = self._network_as_local_session(record)
+                else:
+                    session = None
             else:
                 record = self._session(token)
-                if record is None or record.get("kind") != "chess":
+                if record is None:
                     return False
                 session = record
                 markup = self._markup(token)
-                network_game = None
-            if not self._register_rich_chess_callbacks(call, record, markup):
+                game = None
+            if not self._register_rich_callbacks(call, record, markup):
                 return False
-            await self._ensure_chess_emoji_alternatives()
-            rich_message = self._build_rich_chess_message(
-                session, markup, network_game=network_game
-            )
+            if session is not None:
+                if session.get("kind") == "chess":
+                    await self._ensure_chess_emoji_alternatives()
+                rich_message = self._build_rich_game_message(
+                    session, markup, network_game=game
+                )
+            else:
+                rich_message = self._build_rich_generic_message(
+                    self._render_network(token), markup
+                )
             return await self._edit_rich_chess_message(call, record, rich_message)
         except Exception:
-            logger.debug("Не вдалося зібрати Rich Message для шахів", exc_info=True)
+            logger.debug("Не вдалося зібрати Rich Message для MiniGames", exc_info=True)
             return False
 
-    async def _edit_chess_panel(self, call, token):
-        if await self._try_edit_rich_chess(call, token):
+    async def _try_edit_rich_chess(self, call, token, *, network=False):
+        return await self._try_edit_rich_game(call, token, network=network)
+
+    async def _edit_game_panel(self, call, token):
+        if await self._try_edit_rich_game(call, token):
             return True
         return await call.edit(self._render(token), reply_markup=self._markup(token))
 
+    async def _edit_chess_panel(self, call, token):
+        return await self._edit_game_panel(call, token)
+
     async def _edit_network_panel(self, call, token):
-        if await self._try_edit_rich_chess(call, token, network=True):
+        if await self._try_edit_rich_game(call, token, network=True):
             return True
         return await call.edit(
             self._render_network(token), reply_markup=self._markup_network(token)
@@ -2509,7 +2734,7 @@ class MiniGamesMod(loader.Module):
             await call.answer(self.strings["not_yours"], show_alert=True)
             return
         self._reset_game(session, kind)
-        await call.edit(self._render(token), reply_markup=self._markup(token))
+        await self._edit_game_panel(call, token)
 
     def _render_go(self, session):
         size = int(session["go_size"])
@@ -2655,7 +2880,7 @@ class MiniGamesMod(loader.Module):
                 )
                 return
             session["selected_row"] = row
-            await call.edit(self._render(token), reply_markup=self._markup(token))
+            await self._edit_game_panel(call, token)
 
     async def _go_clear_row(self, call, token):
         session = self._session(token)
@@ -2669,7 +2894,7 @@ class MiniGamesMod(loader.Module):
                 await call.answer(self.strings["not_yours"], show_alert=True)
                 return
             session["selected_row"] = None
-            await call.edit(self._render(token), reply_markup=self._markup(token))
+            await self._edit_game_panel(call, token)
 
     async def _go_place(self, call, token, column):
         session = self._session(token)
@@ -2724,7 +2949,7 @@ class MiniGamesMod(loader.Module):
                 self._go_finish(session)
             else:
                 session["turn"] = 1 - side
-            await call.edit(self._render(token), reply_markup=self._markup(token))
+            await self._edit_game_panel(call, token)
 
     async def _go_pass(self, call, token):
         session = self._session(token)
@@ -2757,7 +2982,7 @@ class MiniGamesMod(loader.Module):
             else:
                 session["turn"] = 1 - side
             await call.answer("⏭ Пас")
-            await call.edit(self._render(token), reply_markup=self._markup(token))
+            await self._edit_game_panel(call, token)
 
     async def _go_resign(self, call, token):
         session = self._session(token)
@@ -2784,10 +3009,7 @@ class MiniGamesMod(loader.Module):
             session["finish_reason"] = "resignation"
             session["finished"] = True
             self._record_result(session, [opponents[0]])
-            await call.edit(
-                self._render(token) + f"\n\n🏳 {self._name(session, user_id)} здався.",
-                reply_markup=self._markup(token),
-            )
+            await self._edit_game_panel(call, token)
 
     def _render_rps(self, session):
         first, second = session["players"]
@@ -2858,7 +3080,7 @@ class MiniGamesMod(loader.Module):
                     session["winner"] = first if self.RPS_BEATS[first_choice] == second_choice else second
                     self._record_result(session, [session["winner"]])
             await call.answer("✅ Вибір прийнято")
-            await call.edit(self._render(token), reply_markup=self._markup(token))
+            await self._edit_game_panel(call, token)
 
     def _render_dice(self, session):
         first, second = session["players"]
@@ -2917,7 +3139,7 @@ class MiniGamesMod(loader.Module):
                 else:
                     session["winner"] = first if first_roll > second_roll else second
                     self._record_result(session, [session["winner"]])
-            await call.edit(self._render(token), reply_markup=self._markup(token))
+            await self._edit_game_panel(call, token)
 
     def _render_quiz(self, session):
         if session["finished"]:
@@ -2985,7 +3207,7 @@ class MiniGamesMod(loader.Module):
                 top_score = max(session["scores"].values(), default=0)
                 winners = [int(uid) for uid, score in session["scores"].items() if score == top_score and score > 0]
                 self._record_result(session, winners, draw=len(winners) > 1)
-            await call.edit(self._render(token), reply_markup=self._markup(token))
+            await self._edit_game_panel(call, token)
 
     def _footer(self, token, session):
         if session["finished"]:
@@ -3022,10 +3244,7 @@ class MiniGamesMod(loader.Module):
             session["players"] = [session["players"][1], session["players"][0]]
             session["invited_id"] = session["players"][1]
         self._reset_game(session)
-        if session["kind"] == "chess":
-            await self._edit_chess_panel(call, token)
-        else:
-            await call.edit(self._render(token), reply_markup=self._markup(token))
+        await self._edit_game_panel(call, token)
 
     async def _close(self, call, token):
         session = self._session(token)
@@ -3131,10 +3350,7 @@ class MiniGamesMod(loader.Module):
         if session is None:
             await call.answer(self.strings["expired"], show_alert=True)
             return
-        if session["kind"] == "chess":
-            await self._edit_chess_panel(call, token)
-        else:
-            await call.edit(self._render(token), reply_markup=self._markup(token))
+        await self._edit_game_panel(call, token)
 
     def _purge_network_views(self):
         now = time.monotonic()
@@ -3453,10 +3669,7 @@ class MiniGamesMod(loader.Module):
         if session is None:
             await call.answer(self.strings["expired"], show_alert=True)
             return
-        if session["kind"] == "chess":
-            await self._edit_chess_panel(call, token)
-        else:
-            await call.edit(self._render(token), reply_markup=self._markup(token))
+        await self._edit_game_panel(call, token)
 
     async def _net_switch(self, call, game):
         token = self._new_network_view(game, handle=call)
@@ -3546,9 +3759,7 @@ class MiniGamesMod(loader.Module):
             return
         try:
             view["game"] = await self._network().api_game_cancel(view["game_id"])
-            await call.edit(
-                self._render_network(token), reply_markup=self._markup_network(token)
-            )
+            await self._edit_network_panel(call, token)
         except Exception as error:
             await call.answer(str(error)[:180], show_alert=True)
 
@@ -3672,9 +3883,7 @@ class MiniGamesMod(loader.Module):
                 return
             view["selected"] = position
             view["handle"] = call
-            await call.edit(
-                self._render_network(token), reply_markup=self._markup_network(token)
-            )
+            await self._edit_network_panel(call, token)
             return
         selected = view.get("selected")
         if selected is None:
@@ -3855,9 +4064,7 @@ class MiniGamesMod(loader.Module):
             return
         view["selected_row"] = row
         view["handle"] = call
-        await call.edit(
-            self._render_network(token), reply_markup=self._markup_network(token)
-        )
+        await self._edit_network_panel(call, token)
 
     async def _net_go_clear_row(self, call, token):
         if not await self._network_owner_only(call):
@@ -3866,9 +4073,7 @@ class MiniGamesMod(loader.Module):
         if view is None or not await self._net_require_turn(call, view):
             return
         view["selected_row"] = None
-        await call.edit(
-            self._render_network(token), reply_markup=self._markup_network(token)
-        )
+        await self._edit_network_panel(call, token)
 
     async def _net_go_place(self, call, token, column):
         if not await self._network_owner_only(call):
