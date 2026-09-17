@@ -1,10 +1,10 @@
 # meta developer: @Huai_Baike
-# meta version: 2.4.0
+# meta version: 2.4.1
 # meta description: Локальні та глобальні HikkaNet-ігри з рейтингом і матчмейкінгом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (2, 4, 0)
+__version__ = (2, 4, 1)
 
 import asyncio
 import contextlib
@@ -1686,16 +1686,20 @@ class MiniGamesMod(loader.Module):
         return {"blocks": blocks, "skip_entity_detection": True}
 
     def _build_rich_go_message(self, session, markup, network_game=None):
-        rendered = re.sub(r"<pre>.*?</pre>", "", self._render_go(session), flags=re.DOTALL)
+        rendered = re.sub(
+            r"<pre>.*?</pre>",
+            "",
+            self._render_go(session, direct=True),
+            flags=re.DOTALL,
+        )
         blocks = self._rich_text_blocks(rendered, network_game)
         size = int(session["go_size"])
         columns = GO_COLUMNS[:size]
-        selected_row = session.get("selected_row")
         place_buttons = {}
         for row in markup:
             for source in row:
                 callback_name = getattr(source.get("callback"), "__name__", "")
-                if callback_name in {"_go_place", "_net_go_place"}:
+                if callback_name in {"_go_rich_place", "_net_go_rich_place"}:
                     args = tuple(source.get("args", ()))
                     if args:
                         place_buttons[int(args[-1])] = source
@@ -1717,7 +1721,7 @@ class MiniGamesMod(loader.Module):
                     label = GO_STONES[stone]
                 else:
                     label = "+" if (row_index, column) in hoshi else "·"
-                source = place_buttons.get(column) if selected_row == row_index else None
+                source = place_buttons.get(position)
                 if source is None:
                     content = label
                 else:
@@ -1742,9 +1746,37 @@ class MiniGamesMod(loader.Module):
         self._append_rich_controls(
             blocks,
             markup,
-            skip_callbacks=("_go_place", "_net_go_place"),
+            skip_callbacks=(
+                "_go_rich_place",
+                "_net_go_rich_place",
+                "_go_select_row",
+                "_net_go_select_row",
+                "_go_clear_row",
+                "_net_go_clear_row",
+                "_go_place",
+                "_net_go_place",
+            ),
         )
         return {"blocks": blocks, "skip_entity_detection": True}
+
+    def _go_rich_markup(self, token, session, markup, *, network=False):
+        if session.get("finished"):
+            return markup
+        callback = self._net_go_rich_place if network else self._go_rich_place
+        size = int(session["go_size"])
+        buttons = [
+            {
+                "text": self._go_coordinate(position, size),
+                "callback": callback,
+                "args": (token, position),
+            }
+            for position in range(size * size)
+        ]
+        point_rows = [
+            buttons[index : index + 7]
+            for index in range(0, len(buttons), 7)
+        ]
+        return point_rows + markup
 
     def _build_rich_game_message(self, session, markup, network_game=None):
         kind = str(session.get("kind", ""))
@@ -2152,6 +2184,10 @@ class MiniGamesMod(loader.Module):
                 session = record
                 markup = self._markup(token)
                 game = None
+            if session is not None and session.get("kind") in {"go9", "go13"}:
+                markup = self._go_rich_markup(
+                    token, session, markup, network=network
+                )
             if not self._register_rich_callbacks(call, record, markup):
                 return False
             if session is not None:
@@ -2736,7 +2772,7 @@ class MiniGamesMod(loader.Module):
         self._reset_game(session, kind)
         await self._edit_game_panel(call, token)
 
-    def _render_go(self, session):
+    def _render_go(self, session, *, direct=False):
         size = int(session["go_size"])
         black, white = session["players"]
         white_name = self._name(session, white) if white else "очікується суперник"
@@ -2756,7 +2792,9 @@ class MiniGamesMod(loader.Module):
             turn_name = self._name(session, turn_id) if turn_id else "другого гравця"
             stone = GO_STONES[1 if session["turn"] == 0 else -1]
             lines.append(f"Хід {session['move_number'] + 1}: {stone} <b>{turn_name}</b>")
-            if session["selected_row"] is None:
+            if direct:
+                lines.append("Торкніться <b>вільної точки</b> прямо на дошці.")
+            elif session["selected_row"] is None:
                 lines.append("Оберіть <b>номер рядка</b> кнопкою нижче.")
             else:
                 row_label = size - int(session["selected_row"])
@@ -2896,6 +2934,69 @@ class MiniGamesMod(loader.Module):
             session["selected_row"] = None
             await self._edit_game_panel(call, token)
 
+    def _go_apply_move(self, session, position):
+        size = int(session["go_size"])
+        board, captured, error = self._go_try_move(
+            session["board"],
+            size,
+            session["turn"],
+            int(position),
+            session["history"],
+        )
+        if error:
+            return error
+        side = int(session["turn"])
+        stone = 1 if side == 0 else -1
+        session["board"] = board
+        session["history"].add(self._go_board_key(board))
+        session["captures"][side] += captured
+        session["consecutive_passes"] = 0
+        session["move_number"] += 1
+        session["last_move"] = int(position)
+        session["last_action"] = (
+            f"{GO_STONES[stone]} {self._go_coordinate(position, size)}"
+        )
+        session["selected_row"] = None
+        if all(board):
+            self._go_finish(session)
+        else:
+            session["turn"] = 1 - side
+        return None
+
+    @staticmethod
+    def _go_move_error(error):
+        return {
+            "invalid": "Некоректна точка",
+            "occupied": "Ця точка вже зайнята",
+            "suicide": "Самогубний хід заборонений",
+            "ko": "Не можна повторювати попередню позицію",
+        }.get(str(error), "Цей хід неможливий")
+
+    async def _go_rich_place(self, call, token, position):
+        session = self._session(token)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        lock = self._locks.setdefault(token, asyncio.Lock())
+        async with lock:
+            user_id, user = self._actor(call)
+            if session["finished"]:
+                await call.answer("Партію вже завершено")
+                return
+            if not self._go_authorized(session, user_id, user):
+                await call.answer(
+                    self.strings["wait_opponent"]
+                    if session["players"][1] is None
+                    else self.strings["not_yours"],
+                    show_alert=True,
+                )
+                return
+            error = self._go_apply_move(session, int(position))
+            if error:
+                await call.answer(self._go_move_error(error), show_alert=True)
+                return
+            await self._edit_game_panel(call, token)
+
     async def _go_place(self, call, token, column):
         session = self._session(token)
         if session is None:
@@ -2919,36 +3020,10 @@ class MiniGamesMod(loader.Module):
                 await call.answer("Некоректний стовпець", show_alert=True)
                 return
             position = self._go_index(session["selected_row"], column, size)
-            board, captured, error = self._go_try_move(
-                session["board"],
-                size,
-                session["turn"],
-                position,
-                session["history"],
-            )
+            error = self._go_apply_move(session, position)
             if error:
-                errors = {
-                    "invalid": "Некоректна точка",
-                    "occupied": "Ця точка вже зайнята",
-                    "suicide": "Самогубний хід заборонений",
-                    "ko": "Не можна повторювати попередню позицію",
-                }
-                await call.answer(errors[error], show_alert=True)
+                await call.answer(self._go_move_error(error), show_alert=True)
                 return
-            side = int(session["turn"])
-            stone = 1 if side == 0 else -1
-            session["board"] = board
-            session["history"].add(self._go_board_key(board))
-            session["captures"][side] += captured
-            session["consecutive_passes"] = 0
-            session["move_number"] += 1
-            session["last_move"] = position
-            session["last_action"] = f"{GO_STONES[stone]} {self._go_coordinate(position, size)}"
-            session["selected_row"] = None
-            if all(board):
-                self._go_finish(session)
-            else:
-                session["turn"] = 1 - side
             await self._edit_game_panel(call, token)
 
     async def _go_pass(self, call, token):
@@ -4091,6 +4166,23 @@ class MiniGamesMod(loader.Module):
             call,
             token,
             {"type": "place", "position": int(row) * size + column},
+        )
+
+    async def _net_go_rich_place(self, call, token, position):
+        if not await self._network_owner_only(call):
+            return
+        view = self._network_view(token)
+        if view is None or not await self._net_require_turn(call, view):
+            return
+        size = int(view["game"].get("state", {}).get("go_size", 0))
+        position = int(position)
+        if not 0 <= position < size * size:
+            await call.answer("Некоректна точка", show_alert=True)
+            return
+        await self._net_submit(
+            call,
+            token,
+            {"type": "place", "position": position},
         )
 
     async def _net_go_pass(self, call, token):
