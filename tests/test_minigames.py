@@ -682,6 +682,88 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
             first_square["button"]["callback_data"],
         )
 
+    async def test_every_local_game_uses_telegram_rich_messages(self):
+        self.module.inline = _RichInline()
+        rendered = []
+
+        async def capture_rich_edit(target, record, rich_message):
+            rendered.append((record["kind"], rich_message))
+            return True
+
+        self.module._edit_rich_chess_message = capture_rich_edit
+
+        for kind in (
+            "menu",
+            "gomenu",
+            "ttt",
+            "rps",
+            "dice",
+            "checkers",
+            "go9",
+            "go13",
+            "quiz",
+        ):
+            with self.subTest(kind=kind):
+                token = self.module._new_session(kind, -100)
+                call = _Call(1, "Host")
+                call.unit_id = "rich-unit"
+                call.inline_message_id = f"inline-{kind}"
+
+                result = await self.module._edit_game_panel(call, token)
+
+                self.assertTrue(result)
+                self.assertFalse(call.edits)
+                self.assertEqual(rendered[-1][0], kind)
+                blocks = rendered[-1][1]["blocks"]
+                self.assertEqual(blocks[0]["type"], "heading")
+                self.assertTrue(
+                    any(block["type"] in {"buttons", "table"} for block in blocks)
+                )
+
+        by_kind = dict(rendered)
+        self.assertEqual(
+            len(next(block for block in by_kind["ttt"]["blocks"] if block["type"] == "table")["cells"]),
+            3,
+        )
+        self.assertEqual(
+            len(next(block for block in by_kind["checkers"]["blocks"] if block["type"] == "table")["cells"]),
+            10,
+        )
+        self.assertEqual(
+            len(next(block for block in by_kind["go13"]["blocks"] if block["type"] == "table")["cells"]),
+            14,
+        )
+
+    def test_chess_capture_cell_is_tappable_on_iphone(self):
+        token = self.module._new_session("chess", -100)
+        session = self.module._session(token)
+        session["board"] = [""] * 64
+        session["board"][4] = "k"
+        session["board"][44] = "p"
+        session["board"][52] = "R"
+        session["board"][60] = "K"
+        session["castling"] = set()
+        session["selected"] = 52
+        call = _Call(1, "Host")
+        call.unit_id = "rich-unit"
+        call.inline_message_id = "inline-message-id"
+        self.module.inline = _RichInline()
+        markup = self.module._markup(token)
+        self.assertTrue(
+            self.module._register_rich_callbacks(call, session, markup)
+        )
+
+        rich_message = self.module._build_rich_chess_message(session, markup)
+
+        table = next(
+            block for block in rich_message["blocks"] if block["type"] == "table"
+        )
+        capture = table["cells"][6][5]["text"]["button"]
+        self.assertEqual(capture["text"], "🔴♟")
+        self.assertEqual(capture["style"], "link")
+        self.assertTrue(capture["callback_data"].startswith("rich-"))
+        self.assertNotIsInstance(capture["text"], dict)
+
     def test_go_creates_nine_and_thirteen_line_boards(self):
         for kind, size, button_rows in (("go9", 9, (7, 2)), ("go13", 13, (7, 6))):
             with self.subTest(kind=kind):
@@ -914,6 +996,51 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.module._network_view(token)["game"]["revision"], 5)
         self.assertIn("Хід", call.edits[-1]["text"])
+
+    async def test_hikkanet_non_chess_game_uses_rich_message(self):
+        game = {
+            "game_id": "ng_ttt0123456789",
+            "kind": "ttt",
+            "status": "active",
+            "my_slot": 0,
+            "revision": 4,
+            "players": [
+                {"slot": 0, "instance_id": "hikka-one", "display_name": "Host"},
+                {"slot": 1, "instance_id": "hikka-two", "display_name": "Guest"},
+            ],
+            "state": {
+                "board": [None] * 9,
+                "turn": 0,
+                "winner": None,
+                "draw": False,
+                "finished": False,
+            },
+        }
+        token = self.module._new_network_view(game)
+        call = _Call(1, "Host")
+        call.unit_id = "rich-unit"
+        call.inline_message_id = "inline-network-ttt"
+        self.module.inline = _RichInline()
+        rendered = []
+
+        async def capture_rich_edit(target, record, rich_message):
+            rendered.append(rich_message)
+            return True
+
+        self.module._edit_rich_chess_message = capture_rich_edit
+
+        result = await self.module._edit_network_panel(call, token)
+
+        self.assertTrue(result)
+        self.assertFalse(call.edits)
+        self.assertIn("HikkaNet", rendered[0]["blocks"][0]["text"])
+        table = next(
+            block for block in rendered[0]["blocks"] if block["type"] == "table"
+        )
+        self.assertEqual(len(table["cells"]), 3)
+        self.assertTrue(
+            table["cells"][0][0]["text"]["button"]["callback_data"].startswith("rich-")
+        )
 
     async def test_hikkanet_chess_uses_player_orientation_and_network_controls(self):
         game = {
