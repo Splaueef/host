@@ -891,6 +891,91 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session["turn"], 0)
         self.assertIn("B9", session["last_action"])
 
+    async def test_go_rich_board_places_stones_by_tapping_cells(self):
+        token = self.module._new_session("go13", -100)
+        session = self.module._session(token)
+        self.module.inline = _RichInline()
+        rendered = []
+
+        async def capture_rich_edit(target, record, rich_message):
+            rendered.append(rich_message)
+            return True
+
+        self.module._edit_rich_chess_message = capture_rich_edit
+        host = _Call(1, "Host")
+        host.unit_id = "rich-unit"
+        host.inline_message_id = "inline-go13"
+
+        self.assertTrue(await self.module._edit_game_panel(host, token))
+
+        table = next(
+            block for block in rendered[-1]["blocks"] if block["type"] == "table"
+        )
+        board_cells = [cell for row in table["cells"][1:] for cell in row[1:]]
+        self.assertEqual(len(board_cells), 13 * 13)
+        self.assertTrue(
+            all(cell["text"]["type"] == "button" for cell in board_cells)
+        )
+        self.assertTrue(
+            all(
+                cell["text"]["button"]["callback_data"].startswith("rich-")
+                for cell in board_cells
+            )
+        )
+        plain_text = " ".join(
+            str(block.get("text", "")) for block in rendered[-1]["blocks"]
+        )
+        self.assertIn("Торкніться", plain_text)
+
+        await self.module._go_rich_place(host, token, 0)
+        guest = _Call(2, "Guest")
+        guest.inline_message_id = "inline-go13"
+        await self.module._go_rich_place(guest, token, 1)
+
+        self.assertEqual(session["board"][:2], [1, -1])
+        self.assertEqual(session["move_number"], 2)
+        self.assertEqual(session["turn"], 0)
+        self.assertIsNone(session["selected_row"])
+        self.assertIn("B13", session["last_action"])
+
+    async def test_hikkanet_go_rich_cell_submits_position_directly(self):
+        network = _Network()
+        self.module.lookup = lambda name: network if name == "HikkaNet" else None
+        game = {
+            "game_id": "ng_go0123456789",
+            "kind": "go9",
+            "status": "active",
+            "my_slot": 0,
+            "revision": 7,
+            "players": [
+                {"slot": 0, "instance_id": "hikka-one", "display_name": "Host"},
+                {"slot": 1, "instance_id": "hikka-two", "display_name": "Guest"},
+            ],
+            "state": {
+                "go_size": 9,
+                "board": [0] * 81,
+                "turn": 0,
+                "winner": None,
+                "draw": False,
+                "finished": False,
+                "captures": [0, 0],
+                "consecutive_passes": 0,
+                "move_number": 0,
+                "last_move": None,
+                "last_action": None,
+                "history": [],
+            },
+        }
+        token = self.module._new_network_view(game)
+        call = _Call(1, "Host")
+
+        await self.module._net_go_rich_place(call, token, 17)
+
+        self.assertEqual(
+            network.moves,
+            [("ng_go0123456789", 7, {"type": "place", "position": 17})],
+        )
+
     async def test_go_two_passes_finish_with_komi_score(self):
         invited = types.SimpleNamespace(id=2, first_name="Guest", last_name=None, username="guest", bot=False)
         token = self.module._new_session("go9", -100, invited)
