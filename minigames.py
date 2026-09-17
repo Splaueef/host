@@ -1,10 +1,10 @@
 # meta developer: @Huai_Baike
-# meta version: 2.4.1
+# meta version: 2.4.2
 # meta description: Локальні та глобальні HikkaNet-ігри з рейтингом і матчмейкінгом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (2, 4, 1)
+__version__ = (2, 4, 2)
 
 import asyncio
 import contextlib
@@ -1606,20 +1606,52 @@ class MiniGamesMod(loader.Module):
         self._append_rich_controls(blocks, markup)
         return {"blocks": blocks, "skip_entity_detection": True}
 
+    def _rich_empty_cell_text(self, fallback):
+        alternative = self._chess_emoji_alternatives.get(
+            CHESS_CELL_PREMIUM_EMOJI_ID
+        )
+        if not alternative:
+            return str(fallback)
+        return {
+            "type": "custom_emoji",
+            "custom_emoji_id": CHESS_CELL_PREMIUM_EMOJI_ID,
+            "alternative_text": alternative,
+        }
+
+    def _rich_board_button(self, source, *, text, style=None, empty=False):
+        alternative = (
+            self._chess_emoji_alternatives.get(CHESS_CELL_PREMIUM_EMOJI_ID)
+            if empty
+            else None
+        )
+        return self._chess_rich_button(
+            source,
+            text=text,
+            style=style,
+            custom_emoji_id=(
+                CHESS_CELL_PREMIUM_EMOJI_ID if alternative else None
+            ),
+            alternative_text=alternative,
+        )
+
     def _build_rich_ttt_message(self, session, markup, network_game=None):
         blocks = self._rich_text_blocks(self._render_ttt(session), network_game)
         table = []
-        for row in markup[:3]:
+        for row_index, row in enumerate(markup[:3]):
             cells = []
-            for source in row:
+            for column, source in enumerate(row):
                 label = str(source.get("text", "·"))
                 style = "primary" if label == "❌" else "success" if label == "⭕" else "link"
+                empty = session["board"][row_index * 3 + column] is None
                 cells.append(
                     self._chess_rich_table_cell(
                         {
                             "type": "button",
-                            "button": self._chess_rich_button(
-                                source, text=label, style=style
+                            "button": self._rich_board_button(
+                                source,
+                                text=label,
+                                style=style,
+                                empty=empty,
                             ),
                         }
                     )
@@ -1647,7 +1679,7 @@ class MiniGamesMod(loader.Module):
         for row_index, row in enumerate(markup[:8]):
             rank = str(8 - row_index)
             cells = [self._chess_rich_table_cell(rank, header=True)]
-            for source in row:
+            for column, source in enumerate(row):
                 label = str(source.get("text", CHECKER_LIGHT_CELL))
                 style = (
                     "primary"
@@ -1656,12 +1688,19 @@ class MiniGamesMod(loader.Module):
                     if label == CHECKER_TARGET_CELL
                     else "link"
                 )
+                empty = (
+                    session["board"][self._checker_index(row_index, column)] == 0
+                    and label not in {CHECKER_SELECTED_CELL, CHECKER_TARGET_CELL}
+                )
                 cells.append(
                     self._chess_rich_table_cell(
                         {
                             "type": "button",
-                            "button": self._chess_rich_button(
-                                source, text=label, style=style
+                            "button": self._rich_board_button(
+                                source,
+                                text=label,
+                                style=style,
+                                empty=empty,
                             ),
                         }
                     )
@@ -1723,14 +1762,17 @@ class MiniGamesMod(loader.Module):
                     label = "+" if (row_index, column) in hoshi else "·"
                 source = place_buttons.get(position)
                 if source is None:
-                    content = label
+                    content = (
+                        self._rich_empty_cell_text(label) if not stone else label
+                    )
                 else:
                     content = {
                         "type": "button",
-                        "button": self._chess_rich_button(
+                        "button": self._rich_board_button(
                             source,
                             text=label,
                             style="primary" if stone else "link",
+                            empty=not stone,
                         ),
                     }
                 cells.append(self._chess_rich_table_cell(content))
@@ -2116,6 +2158,12 @@ class MiniGamesMod(loader.Module):
                 self._rich_emoji_warning_shown = True
             return False
 
+    async def _ensure_empty_cell_emoji_alternative(self):
+        if CHESS_CELL_PREMIUM_EMOJI_ID in self._chess_emoji_alternatives:
+            return True
+        await self._ensure_chess_emoji_alternatives()
+        return CHESS_CELL_PREMIUM_EMOJI_ID in self._chess_emoji_alternatives
+
     async def _edit_rich_chess_message(self, call, record, rich_message):
         inline_message_id = (
             getattr(call, "inline_message_id", None)
@@ -2191,8 +2239,11 @@ class MiniGamesMod(loader.Module):
             if not self._register_rich_callbacks(call, record, markup):
                 return False
             if session is not None:
-                if session.get("kind") == "chess":
+                kind = session.get("kind")
+                if kind == "chess":
                     await self._ensure_chess_emoji_alternatives()
+                elif kind in {"ttt", "checkers", "go9", "go13"}:
+                    await self._ensure_empty_cell_emoji_alternative()
                 rich_message = self._build_rich_game_message(
                     session, markup, network_game=game
                 )

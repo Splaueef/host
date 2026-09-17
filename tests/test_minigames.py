@@ -684,6 +684,9 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_every_local_game_uses_telegram_rich_messages(self):
         self.module.inline = _RichInline()
+        self.module._chess_emoji_alternatives = {
+            minigames.CHESS_CELL_PREMIUM_EMOJI_ID: "▫️"
+        }
         rendered = []
 
         async def capture_rich_edit(target, record, rich_message):
@@ -732,6 +735,30 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             len(next(block for block in by_kind["go13"]["blocks"] if block["type"] == "table")["cells"]),
             14,
+        )
+        empty_cells = (
+            next(
+                block
+                for block in by_kind["ttt"]["blocks"]
+                if block["type"] == "table"
+            )["cells"][0][0]["text"]["button"]["text"],
+            next(
+                block
+                for block in by_kind["checkers"]["blocks"]
+                if block["type"] == "table"
+            )["cells"][4][1]["text"]["button"]["text"],
+            next(
+                block
+                for block in by_kind["go13"]["blocks"]
+                if block["type"] == "table"
+            )["cells"][1][1]["text"]["button"]["text"],
+        )
+        self.assertTrue(
+            all(
+                cell["custom_emoji_id"]
+                == minigames.CHESS_CELL_PREMIUM_EMOJI_ID
+                for cell in empty_cells
+            )
         )
 
     def test_chess_capture_cell_is_tappable_on_iphone(self):
@@ -895,6 +922,9 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         token = self.module._new_session("go13", -100)
         session = self.module._session(token)
         self.module.inline = _RichInline()
+        self.module._chess_emoji_alternatives = {
+            minigames.CHESS_CELL_PREMIUM_EMOJI_ID: "▫️"
+        }
         rendered = []
 
         async def capture_rich_edit(target, record, rich_message):
@@ -919,6 +949,13 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all(
                 cell["text"]["button"]["callback_data"].startswith("rich-")
+                for cell in board_cells
+            )
+        )
+        self.assertTrue(
+            all(
+                cell["text"]["button"]["text"]["custom_emoji_id"]
+                == minigames.CHESS_CELL_PREMIUM_EMOJI_ID
                 for cell in board_cells
             )
         )
@@ -1106,6 +1143,9 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         call.unit_id = "rich-unit"
         call.inline_message_id = "inline-network-ttt"
         self.module.inline = _RichInline()
+        self.module._chess_emoji_alternatives = {
+            minigames.CHESS_CELL_PREMIUM_EMOJI_ID: "▫️"
+        }
         rendered = []
 
         async def capture_rich_edit(target, record, rich_message):
