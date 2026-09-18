@@ -22,6 +22,7 @@
     "purge.py": "1.0.0",
     "quietschedule.py": "1.0.0",
     "rkapi.py": "9.0.0",
+    "sessionguard.py": "1.0.0",
     "stats.py": "1.6.0",
     "sysinfo.py": "2.0.0",
     "systemd.py": "1.0.0",

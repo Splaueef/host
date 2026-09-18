@@ -225,6 +225,37 @@ uptime та версії Python/Telethon. Команда модуля — `.sysi
 .dlmod https://raw.githubusercontent.com/Splaueef/host/main/alwaysonline.py
 ```
 
+## SessionGuard
+
+`sessionguard.py` під час першого запуску зберігає всі активні на той момент
+сесії Telegram як довірені. Нову авторизацію модуль ловить одразу через
+`UpdateNewAuthorization` і точково завершує через `account.resetAuthorization`;
+резервна перевірка списку сесій виконується кожні 30 секунд. Поточна сесія
+Hikka завжди захищена від випадкового завершення.
+
+Якщо Telegram тимчасово забороняє керувати авторизаціями з нової сесії,
+SessionGuard повідомляє про це у «Збережених повідомленнях» і повторює спробу
+з безпечною затримкою.
+
+```text
+.sessionguard
+.sessionguard list
+.sessionguard check
+.sessionguard on
+.sessionguard off
+```
+
+Щоб навмисно додати нову довірену сесію: вимкни захист командою
+`.sessionguard off`, увійди з нового пристрою, перевір список через
+`.sessionguard list`, потім виконай `.sessionguard trustall CONFIRM` і знову
+увімкни захист. Telegram не надає стабільного фізичного ID пристрою, тому новий
+вхід навіть із того самого телефона створює нову сесію й без цієї процедури
+буде завершений.
+
+```text
+.dlmod https://raw.githubusercontent.com/Splaueef/host/main/sessionguard.py
+```
+
 ## HiddenGifts
 
 `hidden_gifts.py` відкриває owner-only каталог з усіма звичайними подарунками,
