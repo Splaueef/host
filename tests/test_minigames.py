@@ -550,6 +550,7 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_chess_renders_as_interactive_telegram_rich_message(self):
+        self.module.config["display_mode"] = "rich"
         token = self.module._new_session("chess", -100)
         session = self.module._session(token)
         session["selected"] = 52
@@ -683,6 +684,7 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_every_local_game_uses_telegram_rich_messages(self):
+        self.module.config["display_mode"] = "rich"
         self.module.inline = _RichInline()
         self.module._chess_emoji_alternatives = {
             minigames.CHESS_CELL_PREMIUM_EMOJI_ID: "▫️"
@@ -919,6 +921,7 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("B9", session["last_action"])
 
     async def test_go_rich_board_places_stones_by_tapping_cells(self):
+        self.module.config["display_mode"] = "rich"
         token = self.module._new_session("go13", -100)
         session = self.module._session(token)
         self.module.inline = _RichInline()
@@ -1120,6 +1123,7 @@ class MiniGamesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Хід", call.edits[-1]["text"])
 
     async def test_hikkanet_non_chess_game_uses_rich_message(self):
+        self.module.config["display_mode"] = "rich"
         game = {
             "game_id": "ng_ttt0123456789",
             "kind": "ttt",

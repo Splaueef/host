@@ -44,6 +44,7 @@ MODULE_UPDATE_TOPIC = "system.module_updates"
 MODULE_MANIFEST_LIMIT = 131072
 MODULE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_]+\.py$")
 MODULE_VERSION_RE = re.compile(r"^\d+(?:\.\d+){1,3}$")
+MODULE_CHANGE_LIMIT = 300
 ROOM_RE = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 GAME_ID_RE = re.compile(r"^ng_[0-9a-f]{16}$")
 GAME_STATUSES = {"waiting", "invited", "active", "finished", "cancelled"}
@@ -326,9 +327,27 @@ def _validate_module_manifest(payload: Any) -> dict[str, str]:
     return result
 
 
+def _validate_module_changes(payload: Any) -> dict[str, str]:
+    changes = payload.get("changes", {}) if isinstance(payload, dict) else {}
+    if changes is None:
+        return {}
+    if not isinstance(changes, dict):
+        raise ValueError("invalid module changes")
+    result = {}
+    for filename, summary in changes.items():
+        if not isinstance(filename, str) or not MODULE_FILENAME_RE.fullmatch(filename):
+            raise ValueError("invalid module change filename")
+        if not isinstance(summary, str):
+            raise ValueError("invalid module change summary")
+        summary = " ".join(summary.split()).strip()
+        if summary:
+            result[filename] = summary[:MODULE_CHANGE_LIMIT]
+    return result
+
+
 async def _fetch_module_manifest(
     session: aiohttp.ClientSession,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, str]]:
     url = f"{MODULE_MANIFEST_URL}?t={int(time.time()) // 300}"
     async with session.get(url, allow_redirects=True) as response:
         final = urlsplit(str(response.url))
@@ -346,7 +365,7 @@ async def _fetch_module_manifest(
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError("module manifest is not valid JSON") from exc
     try:
-        return _validate_module_manifest(payload)
+        return _validate_module_manifest(payload), _validate_module_changes(payload)
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
 
@@ -355,14 +374,17 @@ async def _process_module_manifest(
     app: web.Application,
     modules: dict[str, str],
     detected_at: Optional[int] = None,
+    changes: Optional[dict[str, str]] = None,
 ) -> list[dict[str, Any]]:
     """Cache one manifest and emit an event only for newer module versions."""
     modules = _validate_module_manifest({"schema": 1, "modules": modules})
     detected_at = int(time.time()) if detected_at is None else int(detected_at)
+    changes = dict(changes or {})
     state_value = {
         "schema": 1,
         "repository": MODULE_REPOSITORY,
         "modules": modules,
+        "changes": changes,
     }
     store = app[STORE_KEY]
     previous_state = await store.get_service_state(MODULE_STATE_KEY)
@@ -385,13 +407,14 @@ async def _process_module_manifest(
             and MODULE_VERSION_RE.fullmatch(previous_version)
             and _version_tuple(version) > _version_tuple(previous_version)
         ):
-            changed.append(
-                {
-                    "filename": filename,
-                    "previous_version": previous_version,
-                    "version": version,
-                }
-            )
+            item = {
+                "filename": filename,
+                "previous_version": previous_version,
+                "version": version,
+            }
+            if changes.get(filename):
+                item["summary"] = changes[filename]
+            changed.append(item)
 
     if changed:
         ttl_seconds = app[SETTINGS_KEY].event_retention_hours * 3600
@@ -944,8 +967,8 @@ async def _cleanup_context(app: web.Application):
         ) as session:
             while True:
                 try:
-                    modules = await _fetch_module_manifest(session)
-                    await _process_module_manifest(app, modules)
+                    modules, changes = await _fetch_module_manifest(session)
+                    await _process_module_manifest(app, modules, changes=changes)
                 except asyncio.CancelledError:
                     raise
                 except Exception:

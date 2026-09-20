@@ -1,10 +1,10 @@
 # meta developer: @Huai_Baike
-# meta version: 2.4.2
+# meta version: 2.5.0
 # meta description: Локальні та глобальні HikkaNet-ігри з рейтингом і матчмейкінгом
 # scope: inline
 # scope: hikka_only
 
-__version__ = (2, 4, 2)
+__version__ = (2, 5, 0)
 
 import asyncio
 import contextlib
@@ -145,6 +145,11 @@ class MiniGamesMod(loader.Module):
 
     def __init__(self):
         self.config = loader.ModuleConfig(
+            loader.ConfigValue(
+                "display_mode",
+                "html",
+                lambda: "Режим ігрових панелей: html (звичайні inline-кнопки) або rich (Telegram Rich Text)",
+            ),
             loader.ConfigValue(
                 "quiz_rounds",
                 5,
@@ -528,6 +533,7 @@ class MiniGamesMod(loader.Module):
         return builder(token, session)
 
     def _render_menu(self, session):
+        mode = "Rich Text" if self._rich_enabled() else "HTML"
         return (
             "🎮 <b>MiniGames · ігрова кімната</b>\n\n"
             "❌⭕ <b>Хрестики-нулики</b> — класика для двох\n"
@@ -538,7 +544,8 @@ class MiniGamesMod(loader.Module):
             "⚫⚪ <b>Ґо</b> — дошки 9×9 і 13×13\n"
             "🧠 <b>Вікторина</b> — перший правильний отримує бал\n\n"
             "🏠 <b>Локально</b> — учасники поточного чату\n"
-            "🌐 <b>HikkaNet</b> — суперник може бути в іншому чаті або на іншій Hikka"
+            "🌐 <b>HikkaNet</b> — суперник може бути в іншому чаті або на іншій Hikka\n\n"
+            f"🖥 <b>Відображення:</b> {mode}"
         )
 
     def _markup_menu(self, token, session):
@@ -569,8 +576,37 @@ class MiniGamesMod(loader.Module):
                     "args": (token,),
                 }
             ],
+            [
+                {
+                    "text": (
+                        "🧩 Перемкнути на Rich Text"
+                        if not self._rich_enabled()
+                        else "🔘 Перемкнути на HTML"
+                    ),
+                    "callback": self._toggle_display_mode,
+                    "args": (token,),
+                }
+            ],
             [{"text": "✖️ Закрити", "callback": self._close, "args": (token,)}],
         ]
+
+    def _rich_enabled(self):
+        return str(self.config["display_mode"] or "html").strip().lower() == "rich"
+
+    async def _toggle_display_mode(self, call, token):
+        session = self._session(token)
+        user_id, _ = self._actor(call)
+        if session is None:
+            await call.answer(self.strings["expired"], show_alert=True)
+            return
+        if user_id != session["creator_id"]:
+            await call.answer(self.strings["not_yours"], show_alert=True)
+            return
+        self.config["display_mode"] = "html" if self._rich_enabled() else "rich"
+        await call.answer(
+            "Увімкнено Rich Text" if self._rich_enabled() else "Увімкнено HTML"
+        )
+        await self._edit_game_panel(call, token)
 
     async def _select_game(self, call, token, kind):
         session = self._session(token)
@@ -2214,6 +2250,8 @@ class MiniGamesMod(loader.Module):
         return False
 
     async def _try_edit_rich_game(self, call, token, *, network=False):
+        if not self._rich_enabled():
+            return False
         try:
             if network:
                 record = self._network_view(token)

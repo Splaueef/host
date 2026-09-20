@@ -11,13 +11,13 @@
     "gift_monitor.py": "3.0.0",
     "group_admin.py": "1.0.0",
     "hidden_gifts.py": "1.1.0",
-    "hikkanet.py": "2.0.0",
+    "hikkanet.py": "2.1.0",
     "hikkanetchat.py": "2.0.0",
     "math.py": "1.0.0",
     "messagescheduler.py": "1.0.0",
-    "minigames.py": "2.4.2",
+    "minigames.py": "2.5.0",
     "mistralAI.py": "4.5.0",
-    "modulehub.py": "3.3.0",
+    "modulehub.py": "3.4.0",
     "nekospy.py": "1.4.0",
     "purge.py": "1.0.0",
     "quietschedule.py": "1.0.0",
@@ -29,5 +29,10 @@
     "teledocs.py": "1.0.0",
     "timeinfo.py": "1.0.0",
     "vdlt.py": "6.10.0"
+  },
+  "changes": {
+    "minigames.py": "Додано вибір HTML або Rich Text; HTML використовується типово, режим можна перемкнути в меню чи конфігурації.",
+    "hikkanet.py": "Події оновлення модулів тепер можуть передавати короткий опис змін.",
+    "modulehub.py": "У звітах автоматичного оновлення показується коротка довідка про зміни кожного модуля."
   }
 }

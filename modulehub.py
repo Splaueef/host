@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 3.3.0
+# meta version: 3.4.0
 # meta description: 🧭 Центр команд, автооновлення та синхронізація статистики Hikka.
 # scope: inline
 # scope: hikka_only
@@ -661,7 +661,15 @@ class ModuleHubMod(loader.Module):
             raise RuntimeError(
                 "Manifest HikkaNet не містить: " + ", ".join(sorted(missing))
             )
-        return result
+        raw_changes = payload.get("changes", {})
+        changes = {}
+        if isinstance(raw_changes, dict):
+            for filename, summary in raw_changes.items():
+                if filename in result and isinstance(summary, str):
+                    summary = " ".join(summary.split()).strip()
+                    if summary:
+                        changes[filename] = summary[:300]
+        return result, changes
 
     async def _fetch_network_manifest(self):
         network = self._network_module()
@@ -697,7 +705,7 @@ class ModuleHubMod(loader.Module):
         if self._update_lock.locked():
             raise RuntimeError("Перевірка оновлень уже виконується")
         async with self._update_lock:
-            manifest = await self._fetch_network_manifest()
+            manifest, manifest_changes = await self._fetch_network_manifest()
             stored = self._storage_get("modulehub_versions", {})
             stored = dict(stored) if isinstance(stored, dict) else {}
             excluded = self._excluded_update_keys()
@@ -741,6 +749,7 @@ class ModuleHubMod(loader.Module):
                     "key": key,
                     "from": local_version or "невідомо",
                     "to": remote_version,
+                    "summary": manifest_changes.get(filename, ""),
                 }
                 report["available"].append(candidate)
                 candidates.append(candidate)
@@ -806,6 +815,10 @@ class ModuleHubMod(loader.Module):
                         f"✅ <b>{utils.escape_html(item['key'])}</b>: "
                         f"<code>{utils.escape_html(item['from'])}</code> → "
                         f"<code>{utils.escape_html(item['to'])}</code>"
+                        + (
+                            f"\n└ {utils.escape_html(item.get('summary', ''))}"
+                            if item.get("summary") else ""
+                        )
                         for item in updated[:25]
                     ],
                 ]
