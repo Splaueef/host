@@ -178,7 +178,9 @@ class VideoFormatTests(unittest.TestCase):
                 vdlt.subprocess.run = original_run
 
         self.assertEqual(result, [output])
-        download_command = calls[1]
+        self.assertEqual(len(calls), 1)
+        download_command = calls[0]
+        self.assertNotIn("--dump-json", download_command)
         self.assertIn("--concurrent-fragments", download_command)
         self.assertEqual(download_command[download_command.index("--concurrent-fragments") + 1], "6")
         self.assertIn("--merge-output-format", download_command)

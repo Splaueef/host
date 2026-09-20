@@ -1,4 +1,4 @@
-__version__ = (6, 10, 0)
+__version__ = (7, 0, 0)
 VERSION = ".".join(map(str, __version__))
 
 import os
@@ -1316,31 +1316,27 @@ class VideoDownloaderMod(loader.Module):
                 and all(s.get("codec_name") in {"aac", "mp3"} for s in audio_streams)
             )
 
-            output = os.path.splitext(path)[0] + "_ios.mp4"
+            # Telegram can stream an already compatible MP4 without another
+            # full-file remux. The old path doubled disk I/O for every video.
             if compatible:
-                cmd = ["ffmpeg", "-i", path, "-map", "0:v:0", "-map", "0:a?",
-                       "-c", "copy", "-movflags", "+faststart", "-y", output]
-            else:
-                # CRF 21 preserves perceived source quality while H.264 + AAC +
-                # yuv420p avoids the black-screen/unplayable files seen on iOS.
-                cmd = [
-                    "ffmpeg", "-i", path, "-map", "0:v:0", "-map", "0:a?",
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "21",
-                    "-pix_fmt", "yuv420p", "-profile:v", "high",
-                    "-c:a", "aac", "-b:a", "128k", "-ac", "2",
-                    "-movflags", "+faststart", "-y", output,
-                ]
+                return path
+
+            output = os.path.splitext(path)[0] + "_ios.mp4"
+            # CRF 21 preserves perceived source quality while H.264 + AAC +
+            # yuv420p avoids the black-screen/unplayable files seen on iOS.
+            cmd = [
+                "ffmpeg", "-i", path, "-map", "0:v:0", "-map", "0:a?",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "21",
+                "-pix_fmt", "yuv420p", "-profile:v", "high",
+                "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+                "-movflags", "+faststart", "-y", output,
+            ]
             result = subprocess.run(cmd, capture_output=True, timeout=600)
             if result.returncode != 0 or not os.path.isfile(output) or os.path.getsize(output) <= 0:
                 if os.path.isfile(output):
                     os.remove(output)
                 return path
 
-            # A compatible source is already usable. Avoid replacing it with a
-            # larger remux; incompatible sources must use the iOS-safe result.
-            if compatible and os.path.getsize(output) >= os.path.getsize(path):
-                os.remove(output)
-                return path
             os.remove(path)
             return output
 
@@ -2275,37 +2271,28 @@ class VideoDownloaderMod(loader.Module):
                 "--http-chunk-size", "10M",
             ]
 
-            info_cmd = cmd + common + ["--no-playlist", "--dump-json", "--format-sort=resolution,ext,tbr", url]
-            try:
-                info_proc = subprocess.run(info_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90, env=_subprocess_env_for_cookie_owner())
-            except Exception as e:
-                logger.warning("yt-dlp CLI info failed: %s", e)
-                continue
-            if info_proc.returncode != 0 or not info_proc.stdout.strip():
-                info_err = info_proc.stderr or info_proc.stdout
-                if _is_youtube_auth_error(info_err):
-                    saw_auth_required = True
-                    logger.warning("yt-dlp CLI YouTube auth/POT challenge; cookies=%s browser_cookies=%s", bool(cookies), bool(browser_cookies))
-                    continue
-                logger.warning("yt-dlp CLI info error: %s", info_err[-500:])
-                continue
-            try:
-                import json
-                info = json.loads(info_proc.stdout)
-            except Exception as e:
-                logger.warning("yt-dlp CLI JSON parse failed: %s", e)
-                continue
-            if info.get("live_status") not in (None, "not_live"):
-                logger.warning("Live streams are not supported by CLI fallback: %s", info.get("live_status"))
-                continue
-
             outtmpl = f"{base_name}_cli_%(id)s.%(ext)s"
-            dl_cmd = cmd + common + ["--no-playlist", "--newline", "--print", "after_move:filepath", "-o", outtmpl]
+            # Avoid extracting the page twice (metadata probe + download).
+            # The fallback selector lets yt-dlp choose during one extraction.
+            vertical = _is_vertical_url(url)
+            quality = str(self.config.get("quality", "720"))
+            selector = (
+                "bestaudio/best"
+                if audio
+                else "/".join(self._youtube_format_chain(quality, vertical))
+                if _is_youtube_url(url)
+                else "/".join(self._format_chain(quality, vertical))
+            )
+            dl_cmd = cmd + common + [
+                "--no-playlist", "--newline", "--no-part", "--continue",
+                "--retries", "5", "--fragment-retries", "5",
+                "--file-access-retries", "3", "--socket-timeout", "20",
+                "--print", "after_move:filepath", "-o", outtmpl,
+                "--format", selector,
+            ]
             if audio:
-                dl_cmd += ["--format", self._tuitube_format_value(info, True)[0], "--extract-audio", "--audio-format", self.config.get("audio_format", "mp3")]
+                dl_cmd += ["--extract-audio", "--audio-format", self.config.get("audio_format", "mp3")]
             else:
-                fmt, _container = self._tuitube_format_value(info, False)
-                dl_cmd += ["--format", fmt]
                 # Remux split streams instead of transcoding every non-MP4
                 # selection.  The final compatibility pass already probes the
                 # actual codecs and transcodes only when it is really needed.
@@ -2336,8 +2323,9 @@ class VideoDownloaderMod(loader.Module):
             paths = []
             for line in (proc.stdout or "").splitlines():
                 line = line.strip()
-                if os.path.isabs(line) and os.path.isfile(line) and os.path.getsize(line) > 0:
-                    paths.append(line)
+                candidate = os.path.abspath(line) if line else ""
+                if candidate and os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                    paths.append(candidate)
             if not paths:
                 paths = [p for p in glob.glob(f"{base_name}_cli_*") if os.path.isfile(p) and os.path.getsize(p) > 0 and os.path.splitext(p)[1].lower() in VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS]
             if paths:
@@ -2752,7 +2740,9 @@ class VideoDownloaderMod(loader.Module):
             if photo_result:
                 return photo_result
 
-        if any(h in u for h in ("reddit.com", "redd.it", "vimeo.com", "dailymotion.com", "twitch.tv", "facebook.com", "fb.watch", "soundcloud.com")):
+        # Prefer yt-dlp for audiovisual services. gallery-dl often performs a
+        # slow failed pass there or returns artwork instead of audio/video.
+        if any(h in u for h in ("reddit.com", "redd.it")) and not audio:
             gallery_result = await self._dl_gallery_dl(url, base_name)
             if gallery_result:
                 return gallery_result
