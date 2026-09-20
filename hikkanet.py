@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 2.0.0
+# meta version: 2.1.0
 # meta description: 🔐 HikkaNet: вузли, глобальні ігри, чат, події та статистика.
 # scope: inline
 # scope: hikka_only
@@ -32,7 +32,7 @@ from .. import loader, utils
 
 
 logger = logging.getLogger(__name__)
-__version__ = (2, 0, 0)
+__version__ = (2, 1, 0)
 _PROTOCOL = "HIKKA-HUB-V1"
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$")
@@ -517,6 +517,7 @@ class HikkaNetMod(loader.Module):
                     "metrics",
                     "metrics_batch",
                     "module_updates",
+                    "module_update_summaries",
                     "network_games",
                     "game_leaderboard",
                     "chat_presence",
