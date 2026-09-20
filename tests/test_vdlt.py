@@ -64,6 +64,21 @@ vdlt = _load_module()
 
 
 class CookieManagerTests(unittest.TestCase):
+    def test_deployment_path_falls_back_to_data_mount(self):
+        original_exists = vdlt.os.path.exists
+        try:
+            vdlt.os.path.exists = lambda path: path == "/data/home/rkbot/URKbot/cookies.txt"
+            self.assertEqual(
+                vdlt._deployment_path("/home/rkbot/URKbot/cookies.txt"),
+                "/data/home/rkbot/URKbot/cookies.txt",
+            )
+            self.assertEqual(
+                vdlt._deployment_path("/custom/cookies.txt"),
+                "/custom/cookies.txt",
+            )
+        finally:
+            vdlt.os.path.exists = original_exists
+
     def test_file_for_requires_matching_domain(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "cookies.txt")

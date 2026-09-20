@@ -1,4 +1,4 @@
-__version__ = (7, 0, 0)
+__version__ = (7, 0, 1)
 VERSION = ".".join(map(str, __version__))
 
 import os
@@ -30,6 +30,7 @@ from .. import loader, utils
 logger = logging.getLogger(__name__)
 
 COOKIES_DIR     = "/home/rkbot/URKbot/"
+COOKIES_FALLBACK_DIR = "/data/home/rkbot/URKbot/"
 COOKIES_DEFAULT = os.path.join(COOKIES_DIR, "cookies.txt")
 COOKIES_YOUTUBE = os.path.join(COOKIES_DIR, "cookies-youtube-com.txt")
 PREFERRED_DENO_PATH = "/usr/local/bin/deno"
@@ -166,6 +167,21 @@ _MAX_FNAME_LEN = 180
 
 # Таймаут на одне завдання в черзі (10 хвилин)
 _TASK_TIMEOUT = 600
+
+
+def _deployment_path(path: str) -> str:
+    """Use the mirrored /data deployment path when the legacy path is absent."""
+    expanded = os.path.expanduser(path or "")
+    if not expanded or os.path.exists(expanded):
+        return expanded
+    try:
+        relative = os.path.relpath(expanded, COOKIES_DIR)
+    except (TypeError, ValueError):
+        return expanded
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        return expanded
+    fallback = os.path.join(COOKIES_FALLBACK_DIR, relative)
+    return fallback if os.path.exists(fallback) else expanded
 
 
 def _is_safe_http_url(url: str) -> bool:
@@ -347,31 +363,34 @@ def _cookie_file_has_domain(path: str, domains: tuple[str, ...]) -> bool:
     return False
 
 
-def _cookie_domains_status(path: str = COOKIES_DEFAULT) -> dict[str, bool]:
+def _cookie_domains_status(path: str | None = None) -> dict[str, bool]:
+    path = _deployment_path(path or COOKIES_DEFAULT)
     return {name: _cookie_file_has_domain(path, domains) for name, domains in COOKIE_DOMAINS.items()}
 
 
 def _merge_platform_cookies() -> bool:
     """Move legacy per-platform cookies into the main cookies.txt file."""
     changed = False
-    os.makedirs(COOKIES_DIR, exist_ok=True)
+    default_path = _deployment_path(COOKIES_DEFAULT)
+    os.makedirs(os.path.dirname(default_path), exist_ok=True)
     for host, path in PLATFORM_COOKIES.items():
+        path = _deployment_path(path)
         if not os.path.isfile(path) or os.path.getsize(path) <= 0:
             continue
         domains = (host,)
-        if _cookie_file_has_domain(COOKIES_DEFAULT, domains):
+        if _cookie_file_has_domain(default_path, domains):
             continue
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as src, \
-                 open(COOKIES_DEFAULT, "a", encoding="utf-8") as dst:
-                if os.path.getsize(COOKIES_DEFAULT) == 0:
+                 open(default_path, "a", encoding="utf-8") as dst:
+                if os.path.getsize(default_path) == 0:
                     dst.write("# Netscape HTTP Cookie File\n")
                 dst.write(f"\n# Imported from {os.path.basename(path)} by VideoDownloader\n")
                 dst.write(src.read().rstrip() + "\n")
             changed = True
-            logger.info("Merged legacy cookies for %s into %s", host, COOKIES_DEFAULT)
+            logger.info("Merged legacy cookies for %s into %s", host, default_path)
         except Exception as e:
-            logger.warning("Could not merge cookies %s -> %s: %s", path, COOKIES_DEFAULT, e)
+            logger.warning("Could not merge cookies %s -> %s: %s", path, default_path, e)
     return changed
 
 
@@ -382,13 +401,15 @@ def _is_youtube_url(url: str) -> bool:
 
 def _get_cookies(url: str) -> str | None:
     hostname = (urlsplit(url).netloc or "").lower().lstrip("www.")
-    if os.path.isfile(COOKIES_DEFAULT) and os.path.getsize(COOKIES_DEFAULT) > 0:
+    default_path = _deployment_path(COOKIES_DEFAULT)
+    if os.path.isfile(default_path) and os.path.getsize(default_path) > 0:
         matched = [domains for domains in COOKIE_DOMAINS.values() if any(d in hostname for d in domains)]
-        if not matched or _cookie_file_has_domain(COOKIES_DEFAULT, matched[0]):
-            return COOKIES_DEFAULT
+        if not matched or _cookie_file_has_domain(default_path, matched[0]):
+            return default_path
         logger.info("cookies.txt has no cookies for %s; skipping it", hostname)
         return None
     for host, path in PLATFORM_COOKIES.items():
+        path = _deployment_path(path)
         if host in hostname and os.path.isfile(path) and os.path.getsize(path) > 0:
             return path
     return None
@@ -402,8 +423,8 @@ class CookieManager:
     """
 
     def __init__(self, cookies_file: str, firefox_profile: str, browser_user: str = ""):
-        self.cookies_file = os.path.expanduser(cookies_file or "")
-        self.firefox_profile = os.path.expanduser(firefox_profile or "")
+        self.cookies_file = _deployment_path(cookies_file)
+        self.firefox_profile = _deployment_path(firefox_profile)
         self.browser_user = (browser_user or getpass.getuser()).strip()
 
     @staticmethod
@@ -479,10 +500,11 @@ def _subprocess_env_for_cookie_owner() -> dict:
     """
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     try:
-        if os.path.exists(COOKIES_DEFAULT):
+        cookies_path = _deployment_path(COOKIES_DEFAULT)
+        if os.path.exists(cookies_path):
             import pwd
 
-            owner = pwd.getpwuid(os.stat(COOKIES_DEFAULT).st_uid)
+            owner = pwd.getpwuid(os.stat(cookies_path).st_uid)
             if owner.pw_dir:
                 env["HOME"] = owner.pw_dir
     except Exception as e:
@@ -3943,7 +3965,8 @@ class VideoDownloaderMod(loader.Module):
         await utils.answer(
             message,
             self.strings("cookies_status").format(
-                yt=_s(COOKIES_YOUTUBE), default=_s(COOKIES_DEFAULT),
+                yt=_s(_deployment_path(COOKIES_YOUTUBE)),
+                default=_s(self._cookie_manager().cookies_file),
                 mode=self.config.get("yt_cookies_mode", "auto"),
                 browser=self._yt_browser_cookies_value(), domains=domains
             )
