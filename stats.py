@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 1.6.0
+# meta version: 2.0.0
 # meta description: 📊 Статистика вашої активності в Telegram — повідомлення, чати, піки по годинах.
 
 import datetime
@@ -68,6 +68,14 @@ class DailyStatMod(loader.Module):
         "unknown_arg": (
             "❓ <b>Невідома підкоманда:</b> <code>{}</code>\n\n{}"
         ),
+        "inline_failed": (
+            "⚠️ <b>Не вдалося відкрити меню кнопок.</b>\n"
+            "Спробуйте <code>{prefix}ds today</code>."
+        ),
+        "channel_ready": (
+            "✅ <b>Канал звітів DailyStat готовий.</b>\n"
+            "У нього автоматично надходитимуть денні, тижневі та місячні звіти."
+        ),
     }
 
     def __init__(self):
@@ -78,11 +86,19 @@ class DailyStatMod(loader.Module):
                 "Кількість чатів у топі",
                 validator=loader.validators.Integer(minimum=1, maximum=20),
             ),
+            loader.ConfigValue(
+                "report_hour",
+                23,
+                "Година автоматичної публікації (за локальним часом сервера)",
+                validator=loader.validators.Integer(minimum=0, maximum=23),
+            ),
         )
 
     async def client_ready(self, client, db):
         self._client = client
         self._init_storage()
+        self._report_channel = None
+        await self._ensure_report_channel()
 
     # ── Internal storage helpers ──────────────────────────────────────────
 
@@ -126,6 +142,38 @@ class DailyStatMod(loader.Module):
     def _month_keys(self) -> list:
         today = datetime.date.today()
         return [(today - datetime.timedelta(days=i)).isoformat() for i in range(30)]
+
+    @staticmethod
+    def _calendar_month_keys(day=None) -> list:
+        day = day or datetime.date.today()
+        first = day.replace(day=1)
+        return [
+            (first + datetime.timedelta(days=i)).isoformat()
+            for i in range((day - first).days + 1)
+        ]
+
+    async def _ensure_report_channel(self):
+        """Resolve the persisted reports channel or recreate/find it by marker."""
+        saved = self.get("report_channel_id")
+        if saved:
+            try:
+                self._report_channel = await self._client.get_entity(saved)
+                return self._report_channel
+            except Exception:
+                logger.warning("DailyStat: saved report channel is unavailable")
+        try:
+            channel, _ = await utils.asset_channel(
+                self._client,
+                "DailyStat • Reports",
+                "[DAILYSTAT_REPORTS_V2] Автоматичні приватні звіти статистики",
+                silent=True,
+            )
+            self._report_channel = channel
+            self.set("report_channel_id", getattr(channel, "id", channel))
+            return channel
+        except Exception:
+            logger.exception("DailyStat: could not prepare reports channel")
+            return None
 
     def _get_day(self, key: str) -> dict:
         stats = self.get("stats", {})
@@ -334,6 +382,9 @@ class DailyStatMod(loader.Module):
             return
         chat_id = getattr(message, "chat_id", None)
         if chat_id is None:
+            return
+        report_id = self.get("report_channel_id")
+        if report_id and str(chat_id).replace("-100", "") == str(report_id):
             return
 
         # Вхідні рахуємо лише в особистих діалогах. Таким чином повідомлення
@@ -606,6 +657,158 @@ class DailyStatMod(loader.Module):
         ]
         return matches[0] if len(matches) == 1 else None
 
+    def _period_data(self, period):
+        if period == "week":
+            return self._merge_days(self._week_keys()), "останні 7 днів", 7
+        if period == "month":
+            return self._merge_days(self._month_keys()), "останні 30 днів", 30
+        return self._get_day(self._today_key()), "сьогодні", 1
+
+    def _period_markup(self, period="today", user_id=None):
+        def button(title, value):
+            selected = "● " if value == period else ""
+            return {
+                "text": selected + title,
+                "callback": self._panel_callback,
+                "args": (value, user_id, "summary"),
+            }
+        return [
+            [button("Сьогодні", "today"), button("7 днів", "week"),
+             button("30 днів", "month")],
+            [
+                {"text": "📊 Загалом", "callback": self._panel_callback,
+                 "args": (period, user_id, "summary")},
+                {"text": "🕓 По годинах", "callback": self._panel_callback,
+                 "args": (period, user_id, "peak")},
+            ],
+            [{"text": "👤 Обрати користувача", "input": "@username, ім’я або ID",
+              "handler": self._user_input, "args": (period,)}],
+            ([{"text": "✖️ Прибрати користувача", "callback": self._panel_callback,
+               "args": (period, None, "summary")}]
+             if user_id is not None else []),
+            [{"text": "🔄 Оновити", "callback": self._panel_callback,
+              "args": (period, user_id, "summary")},
+             {"text": "✖️ Закрити", "action": "close"}],
+        ]
+
+    def _panel_text(self, period="today", user_id=None, view="summary"):
+        data, label, days = self._period_data(period)
+        if user_id is not None:
+            user = data["users"].get(str(user_id))
+            if not user:
+                return self.strings["user_not_found"]
+            name = self._format_name(user)
+            total = user["sent"] + user["received"]
+            text = (
+                f"📊 <b>DailyStat · користувач</b>\n🗓 <i>{label}</i>\n\n"
+                f"👤 <b>{name}</b>\n"
+                f"├ 📤 Я написав: <b>{user['sent']}</b>\n"
+                f"├ 📥 Отримано: <b>{user['received']}</b>\n"
+                f"└ 💬 Разом: <b>{total}</b>\n"
+            )
+            if view == "peak":
+                text += "\n📤 <b>Моя активність</b>\n" + self._format_hours(user["sent_hours"])
+                text += "\n📥 <b>Активність співрозмовника</b>\n" + self._format_hours(user["received_hours"])
+            else:
+                text += (
+                    f"\n⏰ Пік моїх повідомлень: <b>{self._peak_hour(user['sent_hours'])}</b>\n"
+                    f"⏰ Пік вхідних: <b>{self._peak_hour(user['received_hours'])}</b>"
+                )
+            return text
+        if not data["sent"] and not data["received"]:
+            return self.strings["no_data"]
+        if view == "peak":
+            return self.strings["stat_header"].format(period=label) + (
+                self._format_peak(data) or self.strings["no_data"]
+            )
+        text = self._format_stat(data, label, days=days)
+        text += self._format_senders(data, self.config["top_count"])
+        text += self._format_top(data, self.config["top_count"])
+        return text
+
+    async def _panel_callback(self, call, period="today", user_id=None,
+                              view="summary"):
+        await call.edit(
+            self._panel_text(period, user_id, view),
+            reply_markup=self._period_markup(period, user_id),
+        )
+
+    async def _user_input(self, call, query, period="today"):
+        data, _, _ = self._period_data(period)
+        user = self._find_user(data, query)
+        if not user:
+            await call.answer("Користувача не знайдено за цей період", show_alert=True)
+            return
+        await self._panel_callback(call, period, user.get("id"), "summary")
+
+    async def _open_panel(self, message, period="today"):
+        try:
+            opened = await self.inline.form(
+                self._panel_text(period), message,
+                reply_markup=self._period_markup(period),
+                force_me=True,
+                disable_security=False,
+            )
+            if opened:
+                return
+        except Exception:
+            logger.exception("DailyStat: inline panel failed")
+        await utils.answer(
+            message,
+            self.strings["inline_failed"].format(
+                prefix=utils.escape_html(str(self.get_prefix()))
+            ),
+        )
+
+    def _report_text(self, data, label, days, kind):
+        icons = {"day": "🌙", "week": "🗓", "month": "📆"}
+        text = f"{icons[kind]} <b>Автоматичний звіт DailyStat</b>\n"
+        text += f"<i>{label}</i>\n\n"
+        text += self._format_stat(data, label, days=days).split("\n\n", 1)[1]
+        text += self._format_senders(data, self.config["top_count"])
+        text += self._format_top(data, self.config["top_count"])
+        return text
+
+    async def _publish_report(self, report_key, data, label, days, kind):
+        sent = self.get("published_reports", [])
+        if not isinstance(sent, list):
+            sent = []
+        if report_key in sent or (not data["sent"] and not data["received"]):
+            return
+        channel = self._report_channel or await self._ensure_report_channel()
+        if not channel:
+            return
+        await self._client.send_message(
+            channel, self._report_text(data, label, days, kind), parse_mode="html"
+        )
+        self.set("published_reports", (sent + [report_key])[-400:])
+
+    @loader.loop(interval=60, autostart=True)
+    async def report_scheduler(self):
+        if not getattr(self, "_client", None):
+            return
+        now = datetime.datetime.now().astimezone()
+        if now.hour != self.config["report_hour"]:
+            return
+        today = now.date()
+        day_key = today.isoformat()
+        await self._publish_report(
+            "day:" + day_key, self._get_day(day_key),
+            today.strftime("%d.%m.%Y"), 1, "day"
+        )
+        if today.weekday() == 6:
+            await self._publish_report(
+                "week:" + day_key, self._merge_days(self._week_keys()),
+                "підсумок за останні 7 днів", 7, "week"
+            )
+        tomorrow = today + datetime.timedelta(days=1)
+        if tomorrow.month != today.month:
+            keys = self._calendar_month_keys(today)
+            await self._publish_report(
+                "month:" + today.strftime("%Y-%m"), self._merge_days(keys),
+                today.strftime("підсумок за %m.%Y"), len(keys), "month"
+            )
+
     def _help_text(self) -> str:
         prefix = utils.escape_html(str(self.get_prefix()))
         return self.strings["help"].format(prefix=prefix)
@@ -729,7 +932,9 @@ class DailyStatMod(loader.Module):
         """📊 Статистика | .ds [week|month|top|peak|scan|reset|help]"""
         args = utils.get_args_raw(message).strip().lower()
 
-        if not args or args in {"today", "сьогодні"}:
+        if not args or args in {"menu", "меню"}:
+            await self._open_panel(message)
+        elif args in {"today", "сьогодні"}:
             await self._ds_today(message)
         elif args in {"reset", "reset confirm"}:
             await self._ds_reset(message, confirmed=args == "reset confirm")
