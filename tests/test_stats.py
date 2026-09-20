@@ -33,6 +33,7 @@ def _load_module():
     loader.Module = _Module
     loader.tds = lambda value: value
     loader.command = lambda *args, **kwargs: (lambda value: value)
+    loader.loop = lambda *args, **kwargs: (lambda value: value)
     loader.ModuleConfig = lambda *args: {"top_count": 5}
     loader.ConfigValue = lambda *args, **kwargs: None
     loader.validators = types.SimpleNamespace(Integer=lambda **kwargs: None)
@@ -394,6 +395,38 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("&lt;Alice&gt;", rendered)
         self.assertIn("08:00", rendered)
         self.assertIn("21:00", rendered)
+
+    def test_panel_can_switch_period_and_show_one_user(self):
+        today = self.module._today_key()
+        day = self.module._get_day(today)
+        self.module._add_sent(day, 7, "Alice", False, 8, "alice")
+        self.module._add_received(day, 7, "Alice", 21, "alice")
+        self.module._save_day(today, day)
+
+        rendered = self.module._panel_text("week", 7, "summary")
+
+        self.assertIn("останні 7 днів", rendered)
+        self.assertIn("Alice", rendered)
+        self.assertIn("Разом: <b>2</b>", rendered)
+
+    def test_calendar_month_keys_do_not_include_previous_month(self):
+        keys = self.module._calendar_month_keys(datetime.date(2026, 9, 30))
+
+        self.assertEqual(keys[0], "2026-09-01")
+        self.assertEqual(keys[-1], "2026-09-30")
+        self.assertEqual(len(keys), 30)
+
+    async def test_report_is_published_only_once(self):
+        self.module._report_channel = 123
+        self.module._client = types.SimpleNamespace(send_message=mock.AsyncMock())
+        day = self.module._empty_day()
+        day["sent"] = 4
+
+        await self.module._publish_report("day:2026-09-20", day, "20.09.2026", 1, "day")
+        await self.module._publish_report("day:2026-09-20", day, "20.09.2026", 1, "day")
+
+        self.module._client.send_message.assert_awaited_once()
+        self.assertEqual(self.module.get("published_reports"), ["day:2026-09-20"])
 
     async def test_scan_updates_message_returned_by_progress_answer(self):
         original = object()
