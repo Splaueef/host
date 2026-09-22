@@ -75,6 +75,7 @@ class ModuleHubMod(loader.Module):
         "minigames": "minigames.py",
         "alwaysonline": "alwaysonline.py",
         "giftmonitor": "gift_monitor.py",
+        "walletp2p": "walletp2p.py",
         "hiddengifts": "hidden_gifts.py",
         "sysinfo": "sysinfo.py",
         "timeinfo": "timeinfo.py",
@@ -198,6 +199,12 @@ class ModuleHubMod(loader.Module):
             "icon": "🟢",
             "description": "Автоматично підтримує статус акаунта Telegram онлайн.",
         },
+        "walletp2p": {
+            "class": "WalletP2PMod",
+            "name": "WalletP2P",
+            "icon": "💱",
+            "description": "Ціни та оголошення Wallet P2P; перехід до угоди в Wallet.",
+        },
         "giftmonitor": {
             "class": "GiftMonitorMod",
             "name": "GiftMonitor",
@@ -250,6 +257,7 @@ class ModuleHubMod(loader.Module):
         ("🛡 Адміністрування", ("groupadmin", "purge", "quiet")),
         ("🎮 Розваги", ("minigames",)),
         ("🎁 Подарунки", ("giftmonitor", "hiddengifts")),
+        ("💱 P2P", ("walletp2p",)),
         ("🛠 Система", ("nekospy", "systemd", "backup", "sysinfo", "alwaysonline")),
         (
             "🧰 Інструменти",
@@ -363,6 +371,7 @@ class ModuleHubMod(loader.Module):
         "quiz",
         "gstatus",
         "gmarket",
+        "p2p",
         "onlinestatus",
         "sysinfo",
         "time",

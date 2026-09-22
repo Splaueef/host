@@ -25,3 +25,4 @@ systemd
 teledocs
 timeinfo
 vdlt
+walletp2p

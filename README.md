@@ -9,6 +9,29 @@ The original repository was copied manually and uploaded as a separate project s
 
 The purpose of this repository is to maintain hosting-related files used by custom builds, forks, and related tools.
 
+## Wallet P2P
+
+`walletp2p.py` показує активні оголошення й ціни офіційного Wallet P2P API.
+Можна вибрати купівлю або продаж криптовалюти, валютну пару, суму у фіаті
+(фільтр лімітів оголошення) та сторінку. Inline-меню має перемикання напряму,
+пагінацію, оновлення і кнопку переходу в [Wallet](https://t.me/wallet).
+За відсутності inline-бота команда показує текстовий результат.
+
+Створи ключ у Wallet → P2P Market → My Profile → API Keys, а потім заповни
+приховане поле `api_key` у `.config WalletP2P` (краще у «Збережених повідомленнях»).
+Ключ надсилається тільки як заголовок `X-API-Key` до офіційного endpoint Wallet;
+команди не приймають і не друкують ключ. Доступ до P2P Market має бути увімкнено
+для твого облікового запису. API підтримує тільки читання оголошень: розміщення,
+оплата й завершення угоди можливі лише в інтерфейсі Wallet.
+
+```text
+.dlmod https://raw.githubusercontent.com/Splaueef/host/main/walletp2p.py
+.p2p
+.p2p buy USDT EUR
+.p2p sell USDT UAH 500
+.p2p buy USDT EUR 100 2
+```
+
 ## ModuleHub
 
 `modulehub.py` додає єдиний owner-only центр керування модулями через inline-бота. Він автоматично показує актуальні команди завантажених модулів і підтримує:
