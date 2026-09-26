@@ -1,4 +1,4 @@
-__version__ = (1, 1, 0)
+__version__ = (1, 1, 1)
 
 """
     █▀▄▀█ █▀█ █▀█ █ █▀ █ █ █▀▄▀█ █▀▄▀█ █▀▀ █▀█
@@ -174,9 +174,12 @@ ua = [
 ]
 
 
+REGION_EDIT_PREFIX = "⌛ Налаштування регіону "
+
+
 class AirAlertMod(loader.Module):
-    """🇺🇦 Предупреждение о воздушной тревоге.
-    Нужно быть подписаным на @air_alert_ua и включены уведомления в вашем боте"""
+    """🇺🇦 Сповіщення про повітряну тривогу.
+    Потрібно підписатися на @air_alert_ua й увімкнути сповіщення від свого бота."""
 
     strings = {"name": "AirAlert"}
 
@@ -189,7 +192,7 @@ class AirAlertMod(loader.Module):
             self.me = self._client.tg_id
             self.bot_id = self.inline.bot_id
             await self.request_join(
-                "@air_alert_ua", "Required by AirAlert", assure_joined=True
+                "@air_alert_ua", "Необхідний для роботи AirAlert", assure_joined=True
             )
             return
 
@@ -202,33 +205,33 @@ class AirAlertMod(loader.Module):
                 JoinChannelRequest(await self.client.get_entity("t.me/air_alert_ua"))
             )
         except Exception:
-            logger.error("Can't join t.me/air_alert_ua")
+            logger.error("Не вдалося приєднатися до t.me/air_alert_ua")
         try:
             channel = await self.client.get_entity("t.me/morisummermods")
             await client(JoinChannelRequest(channel))
         except Exception:
-            logger.error("Can't join morisummermods")
+            logger.error("Не вдалося приєднатися до morisummermods")
         try:
             post = (await client.get_messages("@morisummermods", ids=[15]))[0]
             await post.react("❤️")
         except Exception:
-            logger.error("Can't react to t.me/morisummermods")
+            logger.error("Не вдалося поставити реакцію на допис t.me/morisummermods")
 
     async def alertforwardcmd(self, message: Message) -> None:
-        """Перенаправление предупреждений в другие чаты.
-        Для добавления/удаления введите команду с ссылкой на чат.
-        Для просмотра чатов введите команду без аргументов
-        Для установки кастомной таблички введите .alertforward set <text>"""
+        """Пересилання сповіщень в інші чати.
+        Щоб додати або видалити чат, передайте команді посилання на нього.
+        Щоб переглянути список чатів, викличте команду без аргументів.
+        Щоб установити власний підпис, введіть .alertforward set <текст>"""
         text = utils.get_args_raw(message)
         if text[:3] == "set":
             self.nametag = text[4:]
             self.db.set(self.strings["name"], "nametag", self.nametag)
             return await utils.answer(
                 message,
-                f"🏷 <b>Табличка успешно установлена: <code>{self.nametag}</code></b>",
+                f"🏷 <b>Підпис успішно встановлено: <code>{self.nametag}</code></b>",
             )
         if not text:
-            chats = "<b>Текущие чаты для перенаправления: </b>\n"
+            chats = "<b>Чати для пересилання сповіщень:</b>\n"
             for chat in self.forwards:
                 chats += f"{get_display_name(await self.client.get_entity(chat))}\n"
             await utils.answer(message, chats)
@@ -236,23 +239,23 @@ class AirAlertMod(loader.Module):
         try:
             chat = (await self.client.get_entity(text.replace("https://", ""))).id
         except Exception:
-            await utils.answer(message, "<b>Чат не найден</b>")
+            await utils.answer(message, "<b>Чат не знайдено</b>")
             return
         if chat in self.forwards:
             self.forwards.remove(chat)
             self.db.set(self.strings["name"], "forwards", self.forwards)
-            await utils.answer(message, "<b>Чат успешно удален для перенаправления</b>")
+            await utils.answer(message, "<b>Чат видалено зі списку пересилання</b>")
         else:
             self.forwards.append(chat)
             self.db.set(self.strings["name"], "forwards", self.forwards)
             await utils.answer(
-                message, "<b>Чат успешно установлен для перенаправления</b>"
+                message, "<b>Чат додано до списку пересилання</b>"
             )
 
     async def alert_inline_handler(self, query: GeekInlineQuery) -> None:
-        """Выбор регионов.
-        Чтобы получать все предупреждения введите alert all.
-        Чтобы посмотреть ваши регионы alert my"""
+        """Вибір регіонів.
+        Щоб отримувати всі сповіщення, введіть alert all.
+        Щоб переглянути вибрані регіони, введіть alert my."""
         text = query.args
         if not text:
             result = ua
@@ -267,19 +270,19 @@ class AirAlertMod(loader.Module):
             InlineQueryResultArticle(
                 id=rand(20),
                 title=(
-                    f"{'✅' if reg in self.regions else '❌'}{reg if reg != 'all' else 'Все уведомления'}"
+                    f"{'✅' if reg in self.regions else '❌'}{reg if reg != 'all' else 'Усі сповіщення'}"
                 ),
                 description=(
-                    f"Нажмите чтобы {'удалить' if reg in self.regions else 'добавить'}"
+                    f"Натисніть, щоб {'видалити' if reg in self.regions else 'додати'}"
                     if reg != "all"
                     else (
-                        "🇺🇦 Нажмите чтобы"
-                        f" {'выключить' if 'all' in self.regions else 'включить'} все"
-                        " уведомления"
+                        "🇺🇦 Натисніть, щоб"
+                        f" {'вимкнути' if 'all' in self.regions else 'увімкнути'} всі"
+                        " сповіщення"
                     )
                 ),
                 input_message_content=InputTextMessageContent(
-                    f"⌛ Редактирование региона <code>{reg}</code>",
+                    f"{REGION_EDIT_PREFIX}<code>{reg}</code>",
                     parse_mode="HTML",
                 ),
             )
@@ -292,16 +295,16 @@ class AirAlertMod(loader.Module):
             getattr(message, "out", False)
             and getattr(message, "via_bot_id", False)
             and message.via_bot_id == self.bot_id
-            and "⌛ Редактирование региона" in getattr(message, "raw_text", "")
+            and getattr(message, "raw_text", "").startswith(REGION_EDIT_PREFIX)
         ):
             self.regions = self.db.get(self.strings["name"], "regions", [])
-            region = message.raw_text[25:]
-            state = "добавлен"
+            region = message.raw_text[len(REGION_EDIT_PREFIX):]
+            state = "додано"
             if region not in self.regions:
                 self.regions.append(region)
             else:
                 self.regions.remove(region)
-                state = "удален"
+                state = "видалено"
             self.db.set(self.strings["name"], "regions", self.regions)
             try:
                 e = await self.client.get_entity("t.me/air_alert_ua")
@@ -309,10 +312,10 @@ class AirAlertMod(loader.Module):
             except Exception:
                 sub = False
             n = "\n"
-            res = f"<b>Регион <code>{region}</code> успешно {state}</b>{n}"
+            res = f"<b>Регіон <code>{region}</code> {state}</b>{n}"
             if not sub:
                 res += (
-                    "<b>НЕ ВЫХОДИ С @air_alert_ua (иначе ничего работать не будет)</b>"
+                    "<b>Не відписуйтеся від @air_alert_ua, інакше сповіщення не надходитимуть.</b>"
                 )
                 if not hasattr(self, "hikka"):
                     await self.client(
