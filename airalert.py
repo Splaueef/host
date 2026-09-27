@@ -1,4 +1,4 @@
-__version__ = (1, 1, 1)
+__version__ = (1, 2, 0)
 
 """
     █▀▄▀█ █▀█ █▀█ █ █▀ █ █ █▀▄▀█ █▀▄▀█ █▀▀ █▀█
@@ -17,7 +17,7 @@ from asyncio import sleep
 from aiogram.types import InlineQueryResultArticle, InputTextMessageContent
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.types import Message
-from telethon.utils import get_display_name
+from telethon.utils import get_display_name, get_peer_id
 
 from .. import loader, utils
 from ..inline import GeekInlineQuery, rand
@@ -175,115 +175,159 @@ ua = [
 
 
 REGION_EDIT_PREFIX = "⌛ Налаштування регіону "
+SOURCE_CHANNEL_ID = 1766138888
+SOURCE_CHANNEL = "@air_alert_ua"
 
 
+@loader.tds
 class AirAlertMod(loader.Module):
     """🇺🇦 Сповіщення про повітряну тривогу.
-    Потрібно підписатися на @air_alert_ua й увімкнути сповіщення від свого бота."""
+    Підпишіться на @air_alert_ua; налаштування: .config AirAlert."""
 
     strings = {"name": "AirAlert"}
 
+    def __init__(self):
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue(
+                "enabled", True, "Увімкнути обробку тривог",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "regions", [], "Регіони з @air_alert_ua: all — всі; порожній список — жоден",
+                validator=loader.validators.Series(loader.validators.String()),
+            ),
+            loader.ConfigValue(
+                "forward_chats", [], "ID або @username чатів для пересилання",
+                validator=loader.validators.Series(loader.validators.String()),
+            ),
+            loader.ConfigValue(
+                "nametag", "", "Підпис наприкінці пересланого повідомлення",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "notify_pm", True, "Надсилати сповіщення в особисті повідомлення бота",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "repeat_count", 1, "Кількість копій у приватних повідомленнях (1–3)",
+                validator=loader.validators.Integer(minimum=1, maximum=3),
+            ),
+            loader.ConfigValue(
+                "repeat_delay", 1, "Інтервал між копіями в секундах (1–30)",
+                validator=loader.validators.Integer(minimum=1, maximum=30),
+            ),
+        )
+        self._seen_alerts = set()
+
     async def client_ready(self, client, db) -> None:
-        self.regions = db.get(self.strings["name"], "regions", [])
-        self.nametag = db.get(self.strings["name"], "nametag", "")
-        self.forwards = db.get(self.strings["name"], "forwards", [])
+        self.db = db
+        self.client = client
+        if not db.get("AirAlert", "config_migrated", False):
+            for config_key, old_key in (
+                ("regions", "regions"),
+                ("forward_chats", "forwards"),
+                ("nametag", "nametag"),
+            ):
+                old_value = db.get("AirAlert", old_key, None)
+                if old_value and not self.config[config_key]:
+                    if config_key != "nametag":
+                        old_value = [str(value) for value in old_value]
+                    self.config[config_key] = old_value
+            db.set("AirAlert", "config_migrated", True)
 
         if hasattr(self, "hikka"):
             self.me = self._client.tg_id
             self.bot_id = self.inline.bot_id
-            await self.request_join(
-                "@air_alert_ua", "Необхідний для роботи AirAlert", assure_joined=True
-            )
+            try:
+                await self.request_join(
+                    SOURCE_CHANNEL, "Необхідний для роботи AirAlert", assure_joined=True
+                )
+            except Exception:
+                logger.warning("Не вдалося підписатися на %s", SOURCE_CHANNEL, exc_info=True)
             return
 
-        self.db = db
-        self.client = client
         self.bot_id = (await self.inline.bot.get_me()).id
         self.me = (await client.get_me()).id
         try:
-            await client(
-                JoinChannelRequest(await self.client.get_entity("t.me/air_alert_ua"))
-            )
+            await client(JoinChannelRequest(await client.get_entity(SOURCE_CHANNEL)))
         except Exception:
-            logger.error("Не вдалося приєднатися до t.me/air_alert_ua")
-        try:
-            channel = await self.client.get_entity("t.me/morisummermods")
-            await client(JoinChannelRequest(channel))
-        except Exception:
-            logger.error("Не вдалося приєднатися до morisummermods")
-        try:
-            post = (await client.get_messages("@morisummermods", ids=[15]))[0]
-            await post.react("❤️")
-        except Exception:
-            logger.error("Не вдалося поставити реакцію на допис t.me/morisummermods")
+            logger.warning("Не вдалося підписатися на %s", SOURCE_CHANNEL, exc_info=True)
+
+    @staticmethod
+    def _chat_ref(value):
+        value = str(value).strip()
+        return int(value) if value.lstrip("-").isdigit() else value
+
+    @staticmethod
+    def _region_matches(region, text):
+        name = str(region).strip().casefold().replace("_", " ")
+        return bool(name) and name in text.casefold().replace("_", " ")
 
     async def alertforwardcmd(self, message: Message) -> None:
-        """Пересилання сповіщень в інші чати.
-        Щоб додати або видалити чат, передайте команді посилання на нього.
-        Щоб переглянути список чатів, викличте команду без аргументів.
-        Щоб установити власний підпис, введіть .alertforward set <текст>"""
-        text = utils.get_args_raw(message)
-        if text[:3] == "set":
-            self.nametag = text[4:]
-            self.db.set(self.strings["name"], "nametag", self.nametag)
+        """.alertforward @chat — додати/видалити чат; без аргументів — список.
+        .alertforward set <підпис> — змінити підпис (без тексту — очистити)."""
+        text = utils.get_args_raw(message).strip()
+        if text == "set" or text.startswith("set "):
+            self.config["nametag"] = text[4:].strip()
             return await utils.answer(
                 message,
-                f"🏷 <b>Підпис успішно встановлено: <code>{self.nametag}</code></b>",
+                f"🏷 <b>Підпис:</b> <code>{utils.escape_html(self.config['nametag']) or '—'}</code>",
             )
         if not text:
-            chats = "<b>Чати для пересилання сповіщень:</b>\n"
-            for chat in self.forwards:
-                chats += f"{get_display_name(await self.client.get_entity(chat))}\n"
-            await utils.answer(message, chats)
+            lines = ["<b>Чати для пересилання:</b>"]
+            for chat in self.config["forward_chats"]:
+                try:
+                    entity = await self.client.get_entity(self._chat_ref(chat))
+                    label = get_display_name(entity)
+                except Exception:
+                    label = str(chat)
+                lines.append(
+                    f"• {utils.escape_html(label)} (<code>{utils.escape_html(str(chat))}</code>)"
+                )
+            if not self.config["forward_chats"]:
+                lines.append("Список порожній.")
+            lines.append("\nНалаштування: <code>.config AirAlert</code>")
+            await utils.answer(message, "\n".join(lines))
             return
         try:
-            chat = (await self.client.get_entity(text.replace("https://", ""))).id
+            entity = await self.client.get_entity(self._chat_ref(text))
+            chat = str(get_peer_id(entity))
         except Exception:
             await utils.answer(message, "<b>Чат не знайдено</b>")
             return
-        if chat in self.forwards:
-            self.forwards.remove(chat)
-            self.db.set(self.strings["name"], "forwards", self.forwards)
+        chats = [str(value) for value in self.config["forward_chats"]]
+        aliases = {chat, str(entity.id), text}
+        if any(value in aliases for value in chats):
+            self.config["forward_chats"] = [value for value in chats if value not in aliases]
             await utils.answer(message, "<b>Чат видалено зі списку пересилання</b>")
         else:
-            self.forwards.append(chat)
-            self.db.set(self.strings["name"], "forwards", self.forwards)
-            await utils.answer(
-                message, "<b>Чат додано до списку пересилання</b>"
-            )
+            self.config["forward_chats"] = chats + [chat]
+            await utils.answer(message, "<b>Чат додано до списку пересилання</b>")
 
     async def alert_inline_handler(self, query: GeekInlineQuery) -> None:
-        """Вибір регіонів.
-        Щоб отримувати всі сповіщення, введіть alert all.
-        Щоб переглянути вибрані регіони, введіть alert my."""
-        text = query.args
+        """Вибір регіонів: @бот alert <пошук>, alert my або alert all."""
+        text = (query.args or "").strip()
+        regions = set(self.config["regions"])
         if not text:
             result = ua
-        elif text == "my":
-            result = self.regions
+        elif text.lower() == "my":
+            result = [region for region in ua if region in regions]
         else:
-            result = [region for region in ua if text.lower() in region.lower()]
+            result = [region for region in ua if text.casefold() in region.casefold()]
         if not result:
             await query.e404()
             return
         res = [
             InlineQueryResultArticle(
                 id=rand(20),
-                title=(
-                    f"{'✅' if reg in self.regions else '❌'}{reg if reg != 'all' else 'Усі сповіщення'}"
-                ),
+                title=f"{'✅' if reg in regions else '❌'} {reg if reg != 'all' else 'Усі сповіщення'}",
                 description=(
-                    f"Натисніть, щоб {'видалити' if reg in self.regions else 'додати'}"
+                    f"Натисніть, щоб {'видалити' if reg in regions else 'додати'}"
                     if reg != "all"
-                    else (
-                        "🇺🇦 Натисніть, щоб"
-                        f" {'вимкнути' if 'all' in self.regions else 'увімкнути'} всі"
-                        " сповіщення"
-                    )
+                    else f"🇺🇦 Натисніть, щоб {'вимкнути' if 'all' in regions else 'увімкнути'} всі сповіщення"
                 ),
                 input_message_content=InputTextMessageContent(
-                    f"{REGION_EDIT_PREFIX}<code>{reg}</code>",
-                    parse_mode="HTML",
+                    f"{REGION_EDIT_PREFIX}<code>{reg}</code>", parse_mode="HTML"
                 ),
             )
             for reg in result[:50]
@@ -293,54 +337,67 @@ class AirAlertMod(loader.Module):
     async def watcher(self, message: Message) -> None:
         if (
             getattr(message, "out", False)
-            and getattr(message, "via_bot_id", False)
-            and message.via_bot_id == self.bot_id
-            and getattr(message, "raw_text", "").startswith(REGION_EDIT_PREFIX)
+            and getattr(message, "via_bot_id", None) == self.bot_id
+            and (getattr(message, "raw_text", "") or "").startswith(REGION_EDIT_PREFIX)
         ):
-            self.regions = self.db.get(self.strings["name"], "regions", [])
-            region = message.raw_text[len(REGION_EDIT_PREFIX):]
-            state = "додано"
-            if region not in self.regions:
-                self.regions.append(region)
-            else:
-                self.regions.remove(region)
+            region = message.raw_text[len(REGION_EDIT_PREFIX):].strip()
+            if region not in ua:
+                return
+            regions = list(self.config["regions"])
+            if region in regions:
+                regions.remove(region)
                 state = "видалено"
-            self.db.set(self.strings["name"], "regions", self.regions)
-            try:
-                e = await self.client.get_entity("t.me/air_alert_ua")
-                sub = not e.left
-            except Exception:
-                sub = False
-            n = "\n"
-            res = f"<b>Регіон <code>{region}</code> {state}</b>{n}"
-            if not sub:
-                res += (
-                    "<b>Не відписуйтеся від @air_alert_ua, інакше сповіщення не надходитимуть.</b>"
-                )
-                if not hasattr(self, "hikka"):
-                    await self.client(
-                        JoinChannelRequest(
-                            await self.client.get_entity("t.me/air_alert_ua")
-                        )
-                    )
-            await self.inline.form(res, message=message)
-        if (
-            getattr(message, "peer_id", False)
-            and getattr(message.peer_id, "channel_id", 0) == 1766138888
-            and (
-                "all" in self.regions
-                or any(reg in message.raw_text for reg in self.regions)
+            else:
+                if region == "all":
+                    regions = ["all"]
+                else:
+                    regions = [value for value in regions if value != "all"]
+                    regions.append(region)
+                state = "додано"
+            self.config["regions"] = regions
+            await self.inline.form(
+                f"<b>Регіон <code>{utils.escape_html(region)}</code> {state}.</b>\n"
+                "Налаштування: <code>.config AirAlert</code>",
+                message=message,
             )
+            return
+
+        if (
+            not self.config["enabled"]
+            or getattr(getattr(message, "peer_id", None), "channel_id", None) != SOURCE_CHANNEL_ID
         ):
-            for _ in range(3):
-                await self.inline.bot.send_message(
-                    self.me,
-                    message.text,
-                    parse_mode="HTML",
-                )
-                await sleep(1)
-            for chat in self.forwards:
-                await self.client.send_message(
-                    chat,
-                    message.text + "\n\n" + self.nametag,
-                )
+            return
+        alert_text = getattr(message, "raw_text", "") or ""
+        regions = self.config["regions"]
+        if not alert_text or not regions or not (
+            "all" in regions
+            or any(self._region_matches(region, alert_text) for region in regions)
+        ):
+            return
+        alert_id = getattr(message, "id", None)
+        if alert_id is not None:
+            if alert_id in self._seen_alerts:
+                return
+            if len(self._seen_alerts) >= 256:
+                self._seen_alerts.clear()
+            self._seen_alerts.add(alert_id)
+
+        if self.config["notify_pm"]:
+            for attempt in range(self.config["repeat_count"]):
+                if attempt:
+                    await sleep(self.config["repeat_delay"])
+                try:
+                    await self.inline.bot.send_message(
+                        self.me, utils.escape_html(alert_text), parse_mode="HTML"
+                    )
+                except Exception:
+                    logger.warning("Не вдалося надіслати сповіщення в особисті повідомлення", exc_info=True)
+                    break
+
+        signature = self.config["nametag"].strip()
+        forward_text = alert_text + ("\n\n" + signature if signature else "")
+        for chat in self.config["forward_chats"]:
+            try:
+                await self.client.send_message(self._chat_ref(chat), forward_text, parse_mode=None)
+            except Exception:
+                logger.warning("Не вдалося переслати тривогу в чат %s", chat, exc_info=True)
