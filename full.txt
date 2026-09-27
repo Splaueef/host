@@ -1,4 +1,4 @@
-airalert.py
+airalert
 alwaysonline
 analysis
 backup
