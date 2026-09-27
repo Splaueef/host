@@ -9,6 +9,31 @@ The original repository was copied manually and uploaded as a separate project s
 
 The purpose of this repository is to maintain hosting-related files used by custom builds, forks, and related tools.
 
+## AirAlert
+
+`airalert.py` читає повідомлення каналу `@air_alert_ua` та надсилає вибрані
+тривоги через inline-бота Hikka і в додаткові чати. Акаунт Hikka має бути
+підписаний на канал; для особистих повідомлень треба запустити свого inline-бота.
+
+Налаштування відкриваються командою `.config AirAlert`:
+
+| Параметр | Значення |
+| --- | --- |
+| `enabled` | Увімкнути або призупинити всі сповіщення. |
+| `regions` | Список назв регіонів із каналу; `all` означає всі тривоги, порожній список вимикає збіги. |
+| `forward_chats` | Список ID або `@username` чатів для пересилання. |
+| `nametag` | Необов'язковий підпис під пересланим текстом. |
+| `notify_pm` | Надсилати копію в особисті повідомлення свого inline-бота. |
+| `repeat_count` | Кількість приватних копій від 1 до 3; типово 1. |
+| `repeat_delay` | Затримка між копіями від 1 до 30 секунд. |
+
+Також можна обирати регіони через inline-пошук `@свій_бот alert`,
+`@свій_бот alert my` або `@свій_бот alert Полтавська`.
+Команда `.alertforward @chat` додає або вилучає чат, `.alertforward` показує
+список, а `.alertforward set Мій підпис` змінює підпис.
+Попередні списки регіонів і чатів та підпис переносяться до `.config`
+під час першого запуску оновленої версії.
+
 ## Wallet P2P
 
 `walletp2p.py` відкриває кнопковий оглядач офіційного Wallet P2P API.
