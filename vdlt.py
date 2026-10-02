@@ -1,4 +1,4 @@
-__version__ = (7, 0, 1)
+__version__ = (7, 2, 0)
 VERSION = ".".join(map(str, __version__))
 
 import os
@@ -18,6 +18,7 @@ import json
 import signal
 import getpass
 import sqlite3
+import contextlib
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 from collections import defaultdict
@@ -67,20 +68,63 @@ MUSIC_HOSTS = (
 )
 
 
-def _is_music_url(url: str) -> bool:
+def _strip_www(hostname: str) -> str:
+    """Drop a leading ``www.`` label.
+
+    ``str.lstrip("www.")`` removes *characters*, not a prefix, so hosts such
+    as ``web.example`` or ``w.tiktok.com`` were mangled before matching.
+    """
+    host = (hostname or "").lower().strip().rstrip(".")
+    return host[4:] if host.startswith("www.") else host
+
+
+def _url_host(url: str) -> str:
     try:
-        hostname = (urlsplit(url).hostname or "").lower().lstrip("www.")
+        return _strip_www(urlsplit(url).hostname or "")
     except Exception:
-        return False
-    return any(_hostname_matches(hostname, host) for host in MUSIC_HOSTS)
+        return ""
+
+
+def _url_is(url: str, *domains: str) -> bool:
+    """True when the URL's host is one of ``domains`` or their subdomain."""
+    host = _url_host(url)
+    return bool(host) and any(_hostname_matches(host, domain) for domain in domains)
+
+
+PLATFORMS = (
+    (("open.spotify.com", "spotify.link"), "Spotify"),
+    (("soundcloud.com",), "SoundCloud"),
+    (("bandcamp.com",), "Bandcamp"),
+    (("audiomack.com",), "Audiomack"),
+    (("mixcloud.com",), "Mixcloud"),
+    (("tiktok.com",), "TikTok"),
+    (("youtube.com", "youtu.be"), "YouTube"),
+    (("instagram.com", "instagr.am"), "Instagram"),
+    (("threads.net",), "Threads"),
+    (("x.com", "twitter.com", "t.co"), "X/Twitter"),
+    (("pinterest.com", "pin.it"), "Pinterest"),
+    (("vimeo.com",), "Vimeo"),
+    (("reddit.com", "redd.it"), "Reddit"),
+    (("twitch.tv",), "Twitch"),
+    (("dailymotion.com",), "Dailymotion"),
+    (("bilibili.com", "b23.tv"), "Bilibili"),
+    (("facebook.com", "fb.watch"), "Facebook"),
+)
+
+
+def _platform_name(url: str) -> str:
+    for domains, name in PLATFORMS:
+        if _url_is(url, *domains):
+            return name
+    return "Other"
+
+
+def _is_music_url(url: str) -> bool:
+    return _url_is(url, *MUSIC_HOSTS)
 
 
 def _is_spotify_url(url: str) -> bool:
-    try:
-        hostname = (urlsplit(url).hostname or "").lower().lstrip("www.")
-    except Exception:
-        return False
-    return any(_hostname_matches(hostname, host) for host in ("open.spotify.com", "spotify.link"))
+    return _url_is(url, "open.spotify.com", "spotify.link")
 
 
 class _OpenGraphParser(HTMLParser):
@@ -120,19 +164,13 @@ def _spotify_track_metadata(html_text: str) -> tuple[str, str] | None:
     return title, artist
 
 def _hostname_matches(hostname: str, domain: str) -> bool:
-    domain = domain.lower().strip().strip("/")
-    hostname = hostname.lower().strip().lstrip("www.")
+    domain = _strip_www(domain.strip().strip("/"))
+    hostname = _strip_www(hostname)
     return hostname == domain or hostname.endswith(f".{domain}")
 
 
 def _is_supported_url(url: str) -> bool:
-    try:
-        hostname = (urlsplit(url).netloc or "").lower().lstrip("www.")
-    except Exception:
-        return False
-    if not hostname:
-        return False
-    return any(_hostname_matches(hostname, host) for host in SUPPORTED_HOSTS)
+    return _url_is(url, *SUPPORTED_HOSTS)
 
 COOKIE_DOMAINS = {
     "YouTube": ("youtube.com", "youtu.be", "googlevideo.com"),
@@ -167,6 +205,35 @@ _MAX_FNAME_LEN = 180
 
 # Таймаут на одне завдання в черзі (10 хвилин)
 _TASK_TIMEOUT = 600
+
+# Every task downloads into its own directory below this one instead of the
+# Hikka working directory, so a crash can no longer leave media next to the
+# userbot's files and cleanup is a single ``rmtree``.
+WORK_DIR_NAME = ".vdl_work"
+STALE_WORK_SECONDS = 6 * 3600
+# A forced yt-dlp upgrade after a failed download is useful once in a while,
+# not after every broken or private link.
+FORCED_UPDATE_INTERVAL = 6 * 3600
+MEDIA_CACHE_LIMIT = 500
+
+
+def _empty_stats() -> dict:
+    return {
+        "total": 0, "ok": 0, "err": 0, "retried": 0,
+        "audio": 0, "photos": 0, "playlists": 0, "today": 0,
+        "transcripts": 0, "timeouts": 0, "cached": 0,
+        "day": time.strftime("%Y-%m-%d"),
+        "platforms": defaultdict(int),
+    }
+
+
+def _parse_bool(value) -> bool:
+    text = str(value).strip().lower()
+    if text in {"1", "on", "true", "yes", "так", "увімк", "вкл"}:
+        return True
+    if text in {"0", "off", "false", "no", "ні", "вимк", "выкл"}:
+        return False
+    raise ValueError(value)
 
 
 def _deployment_path(path: str) -> str:
@@ -395,24 +462,7 @@ def _merge_platform_cookies() -> bool:
 
 
 def _is_youtube_url(url: str) -> bool:
-    host = (urlsplit(url).netloc or "").lower().lstrip("www.")
-    return host == "youtu.be" or host.endswith(".youtu.be") or host == "youtube.com" or host.endswith(".youtube.com")
-
-
-def _get_cookies(url: str) -> str | None:
-    hostname = (urlsplit(url).netloc or "").lower().lstrip("www.")
-    default_path = _deployment_path(COOKIES_DEFAULT)
-    if os.path.isfile(default_path) and os.path.getsize(default_path) > 0:
-        matched = [domains for domains in COOKIE_DOMAINS.values() if any(d in hostname for d in domains)]
-        if not matched or _cookie_file_has_domain(default_path, matched[0]):
-            return default_path
-        logger.info("cookies.txt has no cookies for %s; skipping it", hostname)
-        return None
-    for host, path in PLATFORM_COOKIES.items():
-        path = _deployment_path(path)
-        if host in hostname and os.path.isfile(path) and os.path.getsize(path) > 0:
-            return path
-    return None
+    return _url_is(url, "youtube.com", "youtu.be")
 
 
 class CookieManager:
@@ -429,7 +479,7 @@ class CookieManager:
 
     @staticmethod
     def domains_for_url(url: str) -> tuple[str, ...]:
-        hostname = (urlsplit(url).hostname or "").lower().lstrip("www.")
+        hostname = _url_host(url)
         for domains in COOKIE_DOMAINS.values():
             if any(_hostname_matches(hostname, domain) for domain in domains):
                 return domains
@@ -732,12 +782,12 @@ def _is_vertical_url(url: str) -> bool:
 def _normalize_youtube_url(url: str) -> str:
     try:
         parts = urlsplit(url)
-        host = parts.netloc.lower().lstrip("www.")
-        if "youtu.be" in host:
+        host = _strip_www(parts.hostname or "")
+        if _hostname_matches(host, "youtu.be"):
             vid = parts.path.strip("/").split("/")[0]
             if vid:
                 return f"https://www.youtube.com/watch?v={vid}"
-        if "youtube.com" in host:
+        if _hostname_matches(host, "youtube.com"):
             if parts.path.startswith("/shorts/"):
                 vid = parts.path.replace("/shorts/", "").split("/")[0].split("?")[0]
                 if vid:
@@ -884,6 +934,7 @@ class VideoDownloaderMod(loader.Module):
             "├ Фото: <code>{photos}</code>\n"
             "├ Плейлистів: <code>{playlists}</code>\n"
             "├ Транскриптів: <code>{transcripts}</code>\n"
+            "├ З кешу (миттєво): <code>{cached}</code>\n"
             "├ Сьогодні: <code>{today}</code> / <code>{limit}</code>\n"
             "└ Платформи:\n{platforms}"
         ),
@@ -892,7 +943,7 @@ class VideoDownloaderMod(loader.Module):
             "<b>🍪 Cookies:</b> <code>cookies.txt</code>\n"
             "├ Файл: {default}\n"
             "├ Legacy YouTube: {yt}\n"
-            "├ Шлях: <code>/home/rkbot/URKbot/cookies.txt</code>\n"
+            "├ Шлях: <code>{path}</code>\n"
             "├ Режим YouTube: <code>{mode}</code>\n"
             "├ Browser cookies: <code>{browser}</code>\n"
             "├ Порядок: файл cookies → оновлення Firefox → browser cookies.\n"
@@ -918,6 +969,8 @@ class VideoDownloaderMod(loader.Module):
             "• <code>.vdlcookies</code> — статус cookies\n"
             "• <code>.vdlupdate</code> — оновити yt-dlp\n"
             "• <code>.vdlqueue</code> — черга\n"
+            "• <code>.vdlcancel</code> — скасувати завдання в черзі\n"
+            "• <code>.vdlinfo [URL]</code> — назва, тривалість і якості без завантаження\n"
             "• <code>.vdlruntime</code> — статус JS runtime\n\n"
             "• <code>.vdldiag</code> — повна діагностика\n\n"
             "<b>Транскрипт:</b>\n"
@@ -929,7 +982,10 @@ class VideoDownloaderMod(loader.Module):
             "<b>.vdlset [параметр] [значення]:</b>\n"
             "cooldown, limit, size, auto_delete,\n"
             "retries, queue_max, notify_dm,\n"
-            "playlist, playlist_max, audio_format, workers, fragments, cli, any_url, ipv4"
+            "playlist, playlist_max, audio_format, workers, fragments, cli, any_url, ipv4,\n"
+            "links, cache, source\n\n"
+            "<i>Повторне посилання надсилається з кешу миттєво; з одного повідомлення\n"
+            "завантажується до <code>links</code> посилань.</i>"
         ),
     }
 
@@ -957,7 +1013,10 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("private_whitelist", [],    "Контакти в ЛС з дозволеним автозавантаженням"),
             loader.ConfigValue("user_blacklist",   [],    "Чорний список юзерів"),
             loader.ConfigValue("ig_username",      "",    "Instagram логін"),
-            loader.ConfigValue("ig_password",      "",    "Instagram пароль"),
+            loader.ConfigValue(
+                "ig_password", "", "Instagram пароль",
+                validator=loader.validators.Hidden(loader.validators.String()),
+            ),
             loader.ConfigValue("transcript_lang",  "uk",  "Мова транскрипту"),
             loader.ConfigValue("task_timeout",     600,   "Таймаут завдання (сек)"),
             loader.ConfigValue("auto_update_ytdlp", True, "Автоматично оновлювати yt-dlp раз на добу"),
@@ -977,19 +1036,22 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("music_channels", [], "Канали для пошуку музики: @username або -100ID"),
             loader.ConfigValue("music_search_limit", 25, "Скільки повідомлень перевіряти в кожному музичному каналі"),
             loader.ConfigValue("cobalt_api_url", "", "Cobalt API fallback для YouTube (URL власного/доступного інстансу)"),
-            loader.ConfigValue("cobalt_api_key", "", "Необов'язковий API key для Cobalt"),
+            loader.ConfigValue(
+                "cobalt_api_key", "", "Необов'язковий API key для Cobalt",
+                validator=loader.validators.Hidden(loader.validators.String()),
+            ),
+            loader.ConfigValue("max_links", 3, "Скільки посилань з одного повідомлення завантажувати (1-10)"),
+            loader.ConfigValue("cache_hours", 72, "Повторно надсилати вже завантажені медіа без завантаження (годин, 0=вимкнено)"),
+            loader.ConfigValue("source_link", False, "Додавати в підпис посилання на джерело"),
         )
-        self._stats = {
-            "total": 0, "ok": 0, "err": 0, "retried": 0,
-            "audio": 0, "photos": 0, "playlists": 0, "today": 0,
-            "transcripts": 0, "timeouts": 0,
-            "day": time.strftime("%Y-%m-%d"),
-            "platforms": defaultdict(int),
-        }
+        self._stats = _empty_stats()
         self._last_dl: float = 0.0
+        self._last_dl_by: dict = {}
         self._queue: asyncio.Queue | None = None
         self._worker_task = None
         self._worker_tasks: list[asyncio.Task] = []
+        self._busy_workers: set = set()
+        self._retire_workers = 0
         self._client = None
         self._music_index_lock = asyncio.Lock()
         self._music_index_task = None
@@ -1013,8 +1075,12 @@ class VideoDownloaderMod(loader.Module):
 
     async def client_ready(self, client, db):
         self._client = client
+        self._load_stats()
+        self._cleanup_stale_workdirs()
         _merge_platform_cookies()
-        self._queue = asyncio.Queue(maxsize=self.config["queue_max"])
+        # Unbounded queue: ``queue_max`` is enforced when a job is added, so
+        # changing it never requires replacing the queue or killing workers.
+        self._queue = asyncio.Queue()
         self._start_queue_workers()
         if self.config.get("auto_install_deps", True):
             asyncio.ensure_future(self._ensure_runtime_dependencies())
@@ -1026,6 +1092,7 @@ class VideoDownloaderMod(loader.Module):
     async def on_unload(self):
         if self._music_index_task:
             self._music_index_task.cancel()
+        await self._drain_queue("<b>🚫 Завантаження скасовано: модуль вивантажено.</b>")
         for task in self._worker_tasks:
             task.cancel()
         for task in self._worker_tasks:
@@ -1035,7 +1102,67 @@ class VideoDownloaderMod(loader.Module):
                 pass
         self._worker_tasks = []
         self._worker_task = None
+        self._save_stats()
 
+    # ── persistent stats ──────────────────────────────────────────────────────
+
+    def _load_stats(self):
+        stored = self.get("stats", None) if hasattr(self, "get") else None
+        stats = _empty_stats()
+        if isinstance(stored, dict):
+            for key, value in stored.items():
+                if key == "platforms" and isinstance(value, dict):
+                    for name, count in value.items():
+                        try:
+                            stats["platforms"][str(name)] = int(count)
+                        except (TypeError, ValueError):
+                            continue
+                elif key == "day":
+                    stats["day"] = str(value)
+                elif key in stats:
+                    try:
+                        stats[key] = max(0, int(value))
+                    except (TypeError, ValueError):
+                        continue
+        self._stats = stats
+
+    def _save_stats(self):
+        """Persist counters so the daily limit survives a Hikka restart."""
+        if not hasattr(self, "set"):
+            return
+        try:
+            data = dict(self._stats)
+            data["platforms"] = dict(self._stats.get("platforms", {}))
+            self.set("stats", data)
+        except Exception as e:
+            logger.debug("Could not save VideoDownloader stats: %s", e)
+
+    # ── work directories ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _work_root() -> str:
+        root = os.path.join(os.getcwd(), WORK_DIR_NAME)
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def _new_workdir(self, prefix: str = "media") -> str:
+        path = os.path.join(self._work_root(), f"{prefix}_{os.urandom(4).hex()}")
+        os.makedirs(path)
+        return path
+
+    def _cleanup_stale_workdirs(self):
+        """Remove directories left behind by a crash or a forced restart."""
+        try:
+            root = self._work_root()
+            now = time.time()
+            for name in os.listdir(root):
+                path = os.path.join(root, name)
+                if os.path.isdir(path) and now - os.path.getmtime(path) > STALE_WORK_SECONDS:
+                    shutil.rmtree(path, ignore_errors=True)
+        except Exception as e:
+            logger.debug("Could not clean stale VideoDownloader dirs: %s", e)
+
+    # ── queue ─────────────────────────────────────────────────────────────────
 
     def _queue_workers_count(self) -> int:
         try:
@@ -1044,30 +1171,95 @@ class VideoDownloaderMod(loader.Module):
             return 2
 
     def _start_queue_workers(self):
-        # Кілька воркерів прибирають головний bottleneck: короткі відео більше не чекають,
-        # доки попереднє завдання повністю завантажиться та відправиться.
-        for task in self._worker_tasks:
-            task.cancel()
-        self._worker_tasks = [
-            asyncio.ensure_future(self._queue_worker())
-            for _ in range(self._queue_workers_count())
-        ]
+        """Resize the worker pool without interrupting running downloads.
+
+        Extra workers are added immediately. When the pool shrinks, idle
+        workers are cancelled and busy ones retire after their current job;
+        previously every resize cancelled in-flight downloads.
+        """
+        self._worker_tasks = [task for task in self._worker_tasks if not task.done()]
+        desired = self._queue_workers_count()
+        while len(self._worker_tasks) < desired:
+            self._worker_tasks.append(asyncio.ensure_future(self._queue_worker()))
+        excess = len(self._worker_tasks) - desired
+        for task in list(self._worker_tasks):
+            if excess <= 0:
+                break
+            if task not in self._busy_workers:
+                task.cancel()
+                self._worker_tasks.remove(task)
+                excess -= 1
+        self._retire_workers = max(0, excess)
         self._worker_task = self._worker_tasks[0] if self._worker_tasks else None
 
+    def _enqueue(self, url: str, message, status, audio_override: bool = False) -> bool:
+        if self._queue is None or self._queue.qsize() >= self._queue_limit():
+            return False
+        self._queue.put_nowait({
+            "url": url, "message": message, "status": status,
+            "audio_override": audio_override,
+        })
+        return True
+
+    def _queue_limit(self) -> int:
+        try:
+            return max(1, int(self.config.get("queue_max", 5)))
+        except (TypeError, ValueError):
+            return 5
+
+    async def _drain_queue(self, text: str) -> int:
+        """Drop queued (not yet started) jobs and tell their requesters."""
+        if self._queue is None:
+            return 0
+        dropped = 0
+        while not self._queue.empty():
+            try:
+                job = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._queue.task_done()
+            dropped += 1
+            status = job.get("status") if isinstance(job, dict) else None
+            if status is not None:
+                try:
+                    await status.edit(text)
+                except Exception:
+                    pass
+        return dropped
+
     async def _queue_worker(self):
+        me = asyncio.current_task()
         while True:
             try:
-                coro = await self._queue.get()
+                job = await self._queue.get()
+                self._busy_workers.add(me)
+                timeout = self.config.get("task_timeout", _TASK_TIMEOUT)
                 try:
-                    timeout = self.config.get("task_timeout", _TASK_TIMEOUT)
-                    await asyncio.wait_for(coro, timeout=timeout)
+                    await asyncio.wait_for(
+                        self._process(
+                            job["url"], job["message"], job["status"],
+                            audio_override=job.get("audio_override", False),
+                        ),
+                        timeout=timeout,
+                    )
                 except asyncio.TimeoutError:
                     self._stats["timeouts"] += 1
+                    self._save_stats()
                     logger.warning("Queue task timed out after %s sec", timeout)
+                    try:
+                        await job["message"].reply(self.strings("err_timeout"))
+                    except Exception:
+                        pass
                 except Exception:
                     logger.exception("Queue worker task error")
                 finally:
+                    self._busy_workers.discard(me)
                     self._queue.task_done()
+                if self._retire_workers > 0:
+                    self._retire_workers -= 1
+                    if me in self._worker_tasks:
+                        self._worker_tasks.remove(me)
+                    return
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -1093,11 +1285,24 @@ class VideoDownloaderMod(loader.Module):
         uid = getattr(message.sender_id, "user_id", message.sender_id)
         return uid in self.config["user_blacklist"]
 
-    def _cooldown_left(self) -> int:
+    def _cooldown_left(self, sender_id=None) -> int:
+        """Seconds left for this sender; one user no longer blocks everyone."""
         cd = self.config["cooldown"]
         if not cd:
             return 0
-        return max(0, int(cd - (time.time() - self._last_dl)))
+        last = self._last_dl_by.get(sender_id, 0.0) if sender_id is not None else self._last_dl
+        return max(0, int(cd - (time.time() - last)))
+
+    def _mark_download(self, sender_id=None):
+        now = time.time()
+        self._last_dl = now
+        if sender_id is not None:
+            self._last_dl_by[sender_id] = now
+            if len(self._last_dl_by) > 1000:
+                cutoff = now - max(60, int(self.config["cooldown"] or 0))
+                self._last_dl_by = {
+                    key: value for key, value in self._last_dl_by.items() if value > cutoff
+                }
 
     def _limit_reached(self) -> bool:
         lim = self.config["daily_limit"]
@@ -1107,8 +1312,7 @@ class VideoDownloaderMod(loader.Module):
         return self._stats["today"] >= lim
 
     def _is_playlist(self, url: str) -> bool:
-        u = url.lower()
-        if "youtube.com" not in u and "youtu.be" not in u:
+        if not _is_youtube_url(url):
             return False
         params = dict(parse_qsl(urlsplit(url).query))
         path = urlsplit(url).path
@@ -1117,45 +1321,44 @@ class VideoDownloaderMod(loader.Module):
         return "list" in params or path.startswith("/playlist")
 
     def _platform(self, url: str) -> str:
-        u = url.lower()
-        for host, name in [
-            ("spotify.com", "Spotify"), ("spotify.link", "Spotify"),
-            ("soundcloud.com", "SoundCloud"), ("bandcamp.com", "Bandcamp"),
-            ("audiomack.com", "Audiomack"), ("mixcloud.com", "Mixcloud"),
-            ("tiktok.com", "TikTok"), ("youtu", "YouTube"),
-            ("instagram.com", "Instagram"), ("instagr.am", "Instagram"),
-            ("x.com", "X/Twitter"), ("twitter.com", "X/Twitter"),
-            ("pinterest.com", "Pinterest"), ("pin.it", "Pinterest"),
-            ("vimeo.com", "Vimeo"), ("reddit.com", "Reddit"), ("redd.it", "Reddit"),
-            ("twitch.tv", "Twitch"), ("dailymotion.com", "Dailymotion"),
-            ("bilibili.com", "Bilibili"), ("b23.tv", "Bilibili"),
-        ]:
-            if host in u:
-                return name
-        return "Other"
+        return _platform_name(url)
+
+    _URL_RE = re.compile(r'https?://[^\s<>"\'\]\)]+|(?:www\.)[^\s<>"\'\]\)]+')
+
+    def _extract_urls(self, text: str, limit: int = 10) -> list[str]:
+        urls = []
+        for match in self._URL_RE.finditer(text or ""):
+            url = match.group(0).rstrip(".,!?:;)]}>\"'")
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            if url not in urls:
+                urls.append(url)
+            if len(urls) >= limit:
+                break
+        return urls
 
     def _extract_url(self, text: str) -> str | None:
-        m = re.search(r'https?://[^\s<>"\'\]\)]+|(?:www\.)[^\s<>"\'\]\)]+', text)
-        if not m:
-            return None
-        url = m.group(0).rstrip(".,!?:;)]}>\"'")
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-        return url
+        urls = self._extract_urls(text, 1)
+        return urls[0] if urls else None
+
+    def _max_links(self) -> int:
+        try:
+            return max(1, min(10, int(self.config.get("max_links", 3))))
+        except (TypeError, ValueError):
+            return 3
 
     def _normalize(self, url: str) -> str:
         try:
             parts = urlsplit(url)
-            h = (parts.netloc or "").lower()
-            if "youtube.com" in h or "youtu.be" in h:
+            if _is_youtube_url(url):
                 return _normalize_youtube_url(url)
-            if "instagram.com" in h or "instagr.am" in h:
+            if _url_is(url, "instagram.com", "instagr.am"):
                 clean_path = parts.path.rstrip("/")
                 params = dict(parse_qsl(parts.query))
                 clean_params = {k: v for k, v in params.items() if not k.startswith("utm_")}
                 qs = urlencode(clean_params) if clean_params else ""
                 return urlunsplit((parts.scheme, parts.netloc, clean_path, qs, ""))
-            if "x.com" in h or "twitter.com" in h:
+            if _url_is(url, "x.com", "twitter.com"):
                 return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
         except Exception:
             pass
@@ -1623,7 +1826,7 @@ class VideoDownloaderMod(loader.Module):
                     "Chrome/120.0.0.0 Mobile Safari/537.36"
                 )}
                 target_url = url
-                if "pin.it" in url:
+                if _url_is(url, "pin.it"):
                     r = _safe_requests_get(requests, url, timeout=15, headers=headers)
                     target_url = r.url
 
@@ -2041,8 +2244,7 @@ class VideoDownloaderMod(loader.Module):
             opts, url, allow=bool(cookies) if use_browser_cookies is None else use_browser_cookies
         )
 
-        u_lower = url.lower()
-        if "youtube.com" in u_lower or "youtu.be" in u_lower:
+        if _is_youtube_url(url):
             opts.update(_js_runtime_opts(self._js_runtime))
             opts["extractor_args"] = self._build_yt_extractor_args(
                 ["default", "ios", "web_embedded", "-tv"],
@@ -2094,7 +2296,7 @@ class VideoDownloaderMod(loader.Module):
                 return found
 
         except yt_dlp.utils.DownloadError as e:
-            if ("youtube.com" in url.lower() or "youtu.be" in url.lower()) and _is_youtube_auth_error(e):
+            if _is_youtube_url(url) and _is_youtube_auth_error(e):
                 logger.warning("YouTube auth/POT challenge url=%s fmt='%s'", url, fmt)
                 _cleanup(base_name)
                 return "AUTH_REQUIRED"
@@ -2257,11 +2459,16 @@ class VideoDownloaderMod(loader.Module):
         cmd = self._ytdlp_cli_prefix()
         browser_cookies = self._yt_browser_cookies_value()
         if browser_retry:
-            sudo = self._find_executable("", ["sudo"])
-            if not sudo:
-                logger.warning("Browser-cookie retry unavailable: sudo not found")
-                return None
-            cmd = [sudo, "-u", FIREFOX_USER, *cmd]
+            browser_user = self._cookie_manager().browser_user
+            if browser_user and browser_user != getpass.getuser():
+                sudo = self._find_executable("", ["sudo"])
+                if not sudo:
+                    logger.warning("Browser-cookie retry unavailable: sudo not found")
+                    return None
+                # The browser owner must be able to write into the task dir.
+                with contextlib.suppress(OSError):
+                    os.chmod(os.path.dirname(base_name) or ".", 0o777)
+                cmd = [sudo, "-n", "-u", browser_user, *cmd]
         cookie_candidates = (
             [(None, True, "browser")]
             if browser_retry
@@ -2421,7 +2628,6 @@ class VideoDownloaderMod(loader.Module):
     def _pip_install_sync(self, packages: list[str], upgrade: bool = False) -> tuple[bool, str]:
         if not packages:
             return True, "nothing to install"
-        os.makedirs(COOKIES_DIR, exist_ok=True)
         cmd = [sys.executable, "-m", "pip", "install"]
         if upgrade:
             cmd.append("-U")
@@ -2453,16 +2659,31 @@ class VideoDownloaderMod(loader.Module):
             return await self._auto_update_ytdlp()
         return ok, info
 
-    async def _auto_update_ytdlp(self, force: bool = False) -> tuple[bool, str]:
-        stamp = os.path.join(COOKIES_DIR, ".yt_dlp_update_stamp")
-        if not force and os.path.isfile(stamp) and time.time() - os.path.getmtime(stamp) < 86400:
+    def _stamp(self, key: str) -> float:
+        try:
+            return float(self.get(key, 0) or 0) if hasattr(self, "get") else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    async def _auto_update_ytdlp(self, force: bool = False, manual: bool = False) -> tuple[bool, str]:
+        """Upgrade yt-dlp daily; forced (after-failure) upgrades are rate-limited.
+
+        The timestamps live in the module database: the old stamp file sat in a
+        hard-coded /home/rkbot path and failed on any other installation.
+        """
+        now = time.time()
+        if not force and now - self._stamp("ytdlp_updated_at") < 86400:
             return True, "recent"
+        if force and not manual and now - self._stamp("ytdlp_forced_at") < FORCED_UPDATE_INTERVAL:
+            return False, "forced update attempted recently"
+        if force and hasattr(self, "set"):
+            self.set("ytdlp_forced_at", now)
 
         try:
             ok, info = await utils.run_sync(self._pip_install_sync, ["yt-dlp"], True)
             if ok:
-                with open(stamp, "w", encoding="utf-8") as f:
-                    f.write(str(time.time()))
+                if hasattr(self, "set"):
+                    self.set("ytdlp_updated_at", time.time())
                 return True, info
             return False, info
         except Exception as e:
@@ -2733,20 +2954,19 @@ class VideoDownloaderMod(loader.Module):
     async def _download(
         self, url: str, base_name: str, status_msg, audio: bool
     ) -> list | str | None:
-        u = url.lower()
 
         if _is_spotify_url(url):
             return await self._dl_spotify(url, base_name, status_msg)
 
-        if "tiktok.com" in u:
+        if _url_is(url, "tiktok.com"):
             return await self._dl_tiktok(url, base_name, audio)
 
-        if ("pinterest.com" in u or "pin.it" in u) and not audio:
+        if _url_is(url, "pinterest.com", "pin.it") and not audio:
             result = await self._dl_pinterest(url, base_name)
             if result:
                 return result
 
-        if "instagram.com" in u or "instagr.am" in u or "threads.net" in u:
+        if _url_is(url, "instagram.com", "instagr.am", "threads.net"):
             result = await self._dl_instagram_instaloader(url, base_name, audio)
             if result:
                 return result
@@ -2757,19 +2977,19 @@ class VideoDownloaderMod(loader.Module):
                 return await self._dl_gallery_dl(url, base_name)
             return None
 
-        if ("x.com" in u or "twitter.com" in u) and not audio:
+        if _url_is(url, "x.com", "twitter.com") and not audio:
             photo_result = await self._dl_twitter_photos(url, base_name)
             if photo_result:
                 return photo_result
 
         # Prefer yt-dlp for audiovisual services. gallery-dl often performs a
         # slow failed pass there or returns artwork instead of audio/video.
-        if any(h in u for h in ("reddit.com", "redd.it")) and not audio:
+        if _url_is(url, "reddit.com", "redd.it") and not audio:
             gallery_result = await self._dl_gallery_dl(url, base_name)
             if gallery_result:
                 return gallery_result
 
-        if "youtube.com" in u or "youtu.be" in u:
+        if _is_youtube_url(url):
             cli_result = await self._dl_ytdlp_cli(url, base_name, audio)
             youtube_auth_failed = cli_result == "AUTH_REQUIRED"
             if cli_result and cli_result not in ("AUTH_REQUIRED", "TOO_LARGE"):
@@ -2910,7 +3130,7 @@ class VideoDownloaderMod(loader.Module):
             if cookies:
                 opts["cookiefile"] = cookies
 
-            if "youtube.com" in url or "youtu.be" in url:
+            if _is_youtube_url(url):
                 opts.update(_js_runtime_opts(self._js_runtime))
                 opts["extractor_args"] = self._build_yt_extractor_args(
                     ["default", "ios", "web_embedded", "-tv"],
@@ -2941,6 +3161,39 @@ class VideoDownloaderMod(loader.Module):
 
     # ── send ──────────────────────────────────────────────────────────────────
 
+    def _schedule_auto_delete(self, sent: list):
+        delay = int(self.config.get("auto_delete", 0) or 0)
+        if delay <= 0 or not sent:
+            return
+
+        async def _delete_later():
+            await asyncio.sleep(delay)
+            for item in sent:
+                try:
+                    await item.delete()
+                except Exception:
+                    pass
+
+        asyncio.ensure_future(_delete_later())
+
+    @staticmethod
+    def _as_messages(result) -> list:
+        if result is None:
+            return []
+        return list(result) if isinstance(result, (list, tuple)) else [result]
+
+    async def _send_one(self, message, path: str, caption: str) -> list:
+        video_attribute = await utils.run_sync(_telegram_video_attribute, path)
+        sent = await message.client.send_file(
+            message.chat_id, path,
+            reply_to=message.id, caption=caption,
+            parse_mode="html",
+            force_document=_file_type(path) == "other",
+            attributes=[video_attribute] if video_attribute else None,
+            part_size_kb=512,
+        )
+        return self._as_messages(sent)
+
     async def _send(self, message, path: str, caption: str, force_document: bool = False):
         video_attribute = await utils.run_sync(_telegram_video_attribute, path)
         sent = await message.client.send_file(
@@ -2951,32 +3204,25 @@ class VideoDownloaderMod(loader.Module):
             attributes=[video_attribute] if video_attribute else None,
             part_size_kb=512,
         )
-        ad = self.config["auto_delete"]
-        if ad > 0:
-            async def _del(m=sent, d=ad):
-                await asyncio.sleep(d)
-                try:
-                    await m.delete()
-                except Exception:
-                    pass
-            asyncio.ensure_future(_del())
+        self._schedule_auto_delete(self._as_messages(sent))
         return sent
 
-    async def _send_album(self, message, paths: list[str], caption: str):
+    async def _send_album(self, message, paths: list[str], caption: str) -> list:
         """
         Надсилає файли як grouped media (альбом) в Telegram.
         Групує фото окремо від відео (Telegram не підтримує мікс).
-        MAX_ALBUM=10 — ліміт Telegram.
+        MAX_ALBUM=10 — ліміт Telegram. Повертає надіслані повідомлення.
         """
         valid = [p for p in paths
                  if isinstance(p, str) and os.path.isfile(p) and os.path.getsize(p) > 0]
         if not valid:
-            return
+            return []
 
+        sent: list = []
         if len(valid) == 1:
-            ftype = _file_type(valid[0])
-            await self._send(message, valid[0], caption, force_document=(ftype == "other"))
-            return
+            sent = await self._send_one(message, valid[0], caption)
+            self._schedule_auto_delete(sent)
+            return sent
 
         images    = [p for p in valid if _file_type(p) == "image"]
         non_images = [p for p in valid if _file_type(p) != "image"]
@@ -2993,53 +3239,204 @@ class VideoDownloaderMod(loader.Module):
         for group in groups:
             for chunk_start in range(0, len(group), MAX_ALBUM):
                 chunk = group[chunk_start: chunk_start + MAX_ALBUM]
-                # FIX: caption для першого файлу першої групи, решта — порожній рядок
+                # Caption only on the very first file of the first album.
                 chunk_caption = caption if (first_group and chunk_start == 0) else ""
                 first_group = False
 
                 if len(chunk) == 1:
-                    ftype = _file_type(chunk[0])
                     try:
-                        await message.client.send_file(
-                            message.chat_id, chunk[0],
-                            reply_to=message.id,
-                            caption=chunk_caption,
-                            parse_mode="html",
-                            force_document=(ftype == "other"),
-                            part_size_kb=512,
-                        )
+                        sent += await self._send_one(message, chunk[0], chunk_caption)
                     except Exception as e:
                         logger.warning("Single file send failed: %s", e)
                     continue
 
-                # FIX: captions_list завжди рівної довжини з chunk
                 captions_list = [chunk_caption] + [""] * (len(chunk) - 1)
                 try:
-                    await message.client.send_file(
+                    sent += self._as_messages(await message.client.send_file(
                         message.chat_id,
                         chunk,
                         reply_to=message.id,
                         caption=captions_list,
                         parse_mode="html",
                         part_size_kb=512,
-                    )
+                    ))
                 except Exception as e:
                     logger.warning("Album send failed, trying individually: %s", e)
                     for i, p in enumerate(chunk):
-                        ftype = _file_type(p)
-                        # FIX: перший файл fallback отримує caption, решта — порожній рядок
-                        fb_caption = captions_list[i] if i < len(captions_list) else ""
                         try:
-                            await message.client.send_file(
-                                message.chat_id, p,
-                                reply_to=message.id,
-                                caption=fb_caption,
-                                parse_mode="html",
-                                force_document=(ftype == "other"),
-                                part_size_kb=512,
+                            sent += await self._send_one(
+                                message, p, captions_list[i] if i < len(captions_list) else ""
                             )
                         except Exception as e2:
                             logger.warning("Single file send failed: %s", e2)
+        self._schedule_auto_delete(sent)
+        return sent
+
+    def _source_suffix(self, url: str, platform: str) -> str:
+        if not self.config.get("source_link", False):
+            return ""
+        return (
+            f' · <a href="{utils.escape_html(url)}">'
+            f"{utils.escape_html(platform if platform != 'Other' else 'джерело')}</a>"
+        )
+
+    # ── media info ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _format_duration(seconds) -> str:
+        try:
+            seconds = int(float(seconds))
+        except (TypeError, ValueError):
+            return "—"
+        hours, rest = divmod(max(0, seconds), 3600)
+        minutes, secs = divmod(rest, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+    def _media_info_sync(self, url: str) -> dict | None:
+        import yt_dlp
+
+        opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
+        cookies = self._cookies_for(url)
+        if cookies:
+            opts["cookiefile"] = cookies
+        if _is_youtube_url(url):
+            opts.update(_js_runtime_opts(self._js_runtime))
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    def _media_info_text(self, url: str, info: dict) -> str:
+        esc = utils.escape_html
+        heights = sorted({
+            int(fmt["height"]) for fmt in info.get("formats") or []
+            if fmt.get("height") and fmt.get("vcodec") not in (None, "none")
+        })
+        sizes = [
+            fmt.get("filesize") or fmt.get("filesize_approx")
+            for fmt in info.get("formats") or []
+        ]
+        largest = max((size for size in sizes if size), default=0)
+        lines = [
+            f"<b>ℹ️ {esc(str(info.get('title') or 'Без назви')[:200])}</b>",
+            f"├ Платформа: <code>{esc(self._platform(url))}</code>",
+            f"├ Автор: <code>{esc(str(info.get('uploader') or info.get('channel') or '—')[:100])}</code>",
+            f"├ Тривалість: <code>{self._format_duration(info.get('duration'))}</code>",
+        ]
+        if info.get("view_count"):
+            lines.append(f"├ Переглядів: <code>{int(info['view_count']):,}</code>".replace(",", " "))
+        if heights:
+            lines.append(f"├ Якості: <code>{', '.join(f'{h}p' for h in heights[-6:])}</code>")
+        if largest:
+            lines.append(f"├ Найбільший файл: <code>{largest / 1024 / 1024:.0f} МБ</code>")
+        lines.append(
+            f"└ Ліміт модуля: <code>{self.config.get('max_size', 500)} МБ</code>, "
+            f"якість <code>{esc(str(self.config.get('quality', '720')))}</code>"
+        )
+        return "\n".join(lines)
+
+    @loader.command()
+    async def vdlinfo(self, message):
+        """Інформація про відео без завантаження: .vdlinfo [URL або reply]"""
+        args = utils.get_args_raw(message).strip()
+        url = self._extract_url(args) if args else None
+        if not url:
+            reply = await message.get_reply_message()
+            if reply and reply.raw_text:
+                url = self._extract_url(reply.raw_text)
+        if not url:
+            return await utils.answer(message, self.strings("dl_no_url"))
+        url = self._normalize(url)
+        status = await utils.answer(message, "<b>🔎 Отримую інформацію...</b>")
+        try:
+            info = await asyncio.wait_for(
+                utils.run_sync(self._media_info_sync, url), timeout=60
+            )
+        except Exception as e:
+            logger.warning("Media info failed for %s: %s", url, e)
+            info = None
+        if not info:
+            return await utils.answer(status, self.strings("err_file"))
+        await utils.answer(status, self._media_info_text(url, info))
+
+    # ── media cache ───────────────────────────────────────────────────────────
+
+    def _cache_ttl(self) -> int:
+        try:
+            hours = int(self.config.get("cache_hours", 72) or 0)
+        except (TypeError, ValueError):
+            hours = 0
+        # Auto-deleted messages cannot be re-sent later, so caching is moot.
+        if hours <= 0 or int(self.config.get("auto_delete", 0) or 0) > 0:
+            return 0
+        return hours * 3600
+
+    def _cache_key(self, url: str, audio: bool) -> str:
+        quality = "audio" if audio else str(self.config.get("quality", "720"))
+        return f"{quality}|{url}"
+
+    def _cache_get(self, url: str, audio: bool) -> dict | None:
+        ttl = self._cache_ttl()
+        if not ttl or not hasattr(self, "get"):
+            return None
+        entry = (self.get("media_cache", {}) or {}).get(self._cache_key(url, audio))
+        if not isinstance(entry, dict) or time.time() - float(entry.get("ts", 0)) > ttl:
+            return None
+        return entry
+
+    def _cache_put(self, url: str, audio: bool, chat_id, sent: list, caption: str):
+        ttl = self._cache_ttl()
+        ids = [int(item.id) for item in sent if getattr(item, "id", None)]
+        if not ttl or not ids or not hasattr(self, "set"):
+            return
+        now = time.time()
+        cache = {
+            key: value for key, value in (self.get("media_cache", {}) or {}).items()
+            if isinstance(value, dict) and now - float(value.get("ts", 0)) <= ttl
+        }
+        cache[self._cache_key(url, audio)] = {
+            "chat": chat_id, "ids": ids, "caption": caption, "ts": now,
+        }
+        if len(cache) > MEDIA_CACHE_LIMIT:
+            newest = sorted(cache.items(), key=lambda item: item[1]["ts"])[-MEDIA_CACHE_LIMIT:]
+            cache = dict(newest)
+        self.set("media_cache", cache)
+
+    def _cache_drop(self, url: str, audio: bool):
+        if not hasattr(self, "get"):
+            return
+        cache = dict(self.get("media_cache", {}) or {})
+        if cache.pop(self._cache_key(url, audio), None) is not None:
+            self.set("media_cache", cache)
+
+    async def _send_cached(self, message, url: str, audio: bool) -> bool:
+        """Re-send media already uploaded to Telegram instead of downloading it."""
+        entry = self._cache_get(url, audio)
+        if not entry:
+            return False
+        try:
+            stored = await message.client.get_messages(entry["chat"], ids=entry["ids"])
+            medias = [
+                item.media for item in self._as_messages(stored)
+                if item is not None and getattr(item, "media", None)
+            ]
+            if len(medias) != len(entry["ids"]):
+                raise ValueError("cached media was deleted")
+            caption = entry.get("caption", "")
+            if len(medias) == 1:
+                sent = await message.client.send_file(
+                    message.chat_id, medias[0], reply_to=message.id,
+                    caption=caption, parse_mode="html",
+                )
+            else:
+                sent = await message.client.send_file(
+                    message.chat_id, medias, reply_to=message.id,
+                    caption=[caption] + [""] * (len(medias) - 1), parse_mode="html",
+                )
+            self._schedule_auto_delete(self._as_messages(sent))
+            return True
+        except Exception as e:
+            logger.info("Media cache miss for %s: %s", url, e)
+            self._cache_drop(url, audio)
+            return False
 
     @staticmethod
     def _telegram_audio_metadata(candidate) -> tuple[str, str] | None:
@@ -3209,6 +3606,7 @@ class VideoDownloaderMod(loader.Module):
                     self._stats["audio"] += 1
                     self._stats["today"] += 1
                     self._stats["platforms"]["Telegram"] += 1
+                    self._save_stats()
                     return True
             except Exception as e:
                 logger.warning("Indexed music location is unavailable: %s", e)
@@ -3296,6 +3694,7 @@ class VideoDownloaderMod(loader.Module):
         self._stats["audio"] += 1
         self._stats["today"] += 1
         self._stats["platforms"]["Telegram"] += 1
+        self._save_stats()
         await status.delete()
         return True
 
@@ -3306,7 +3705,9 @@ class VideoDownloaderMod(loader.Module):
             return
         try:
             await self._client.send_message(
-                "me", f"<b>✅ [{platform}]</b> <code>{url}</code>", parse_mode="html"
+                "me",
+                f"<b>✅ [{utils.escape_html(platform)}]</b> <code>{utils.escape_html(url)}</code>",
+                parse_mode="html",
             )
         except Exception:
             pass
@@ -3326,7 +3727,7 @@ class VideoDownloaderMod(loader.Module):
             }
             if cookies:
                 opts["cookiefile"] = cookies
-            if "youtube.com" in url or "youtu.be" in url:
+            if _is_youtube_url(url):
                 opts.update(_js_runtime_opts(self._js_runtime))
                 opts["extractor_args"] = self._build_yt_extractor_args(
                     ["default", "ios", "web_embedded", "-tv"],
@@ -3350,6 +3751,7 @@ class VideoDownloaderMod(loader.Module):
         total = len(entries)
         ok = 0
         self._stats["playlists"] += 1
+        workdir = self._new_workdir("playlist")
 
         for idx, entry in enumerate(entries, 1):
             v_url = entry.get("url") or entry.get("webpage_url") or ""
@@ -3361,7 +3763,7 @@ class VideoDownloaderMod(loader.Module):
             v_url = _normalize_youtube_url(v_url)
             await status_msg.edit(self.strings("loading_playlist").format(idx, total))
 
-            base = f"plvid_{os.urandom(3).hex()}"
+            base = os.path.join(workdir, f"item{idx}")
             result = None
             try:
                 result = await self._download(v_url, base, status_msg, audio)
@@ -3404,6 +3806,8 @@ class VideoDownloaderMod(loader.Module):
                         pass
                 _cleanup(base)
 
+        shutil.rmtree(workdir, ignore_errors=True)
+        self._save_stats()
         await status_msg.edit(self.strings("playlist_done").format(ok=ok, total=total))
         await asyncio.sleep(3)
         try:
@@ -3418,8 +3822,8 @@ class VideoDownloaderMod(loader.Module):
         # module-wide video/audio mode before sharing a Spotify/SoundCloud URL.
         audio    = bool(audio_override or _is_music_url(url) or self.config["audio_mode"])
         platform = self._platform(url)
+        self._reset_daily()
         self._stats["total"] += 1
-        self._last_dl = time.time()
 
         if self._is_playlist(url):
             if not self.config["playlist_enabled"]:
@@ -3445,7 +3849,20 @@ class VideoDownloaderMod(loader.Module):
                 pass
             return
 
-        base = f"media_{os.urandom(3).hex()}"
+        if await self._send_cached(message, url, audio):
+            self._stats["ok"] += 1
+            self._stats["cached"] += 1
+            self._stats["today"] += 1
+            self._stats["platforms"][platform] += 1
+            self._save_stats()
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            return
+
+        workdir = self._new_workdir("media")
+        base = os.path.join(workdir, "media")
         result = None
         send_ok = False
         try:
@@ -3505,9 +3922,12 @@ class VideoDownloaderMod(loader.Module):
                     self._stats["audio"] += len(valid)
                 else:
                     cap = self.strings("caption_video")
+                cap += self._source_suffix(url, platform)
 
-                await self._send_album(message, valid, cap)
-                send_ok = True
+                sent = await self._send_album(message, valid, cap)
+                send_ok = bool(sent)
+                if sent:
+                    self._cache_put(url, audio, message.chat_id, sent, cap)
 
                 self._stats["ok"] += 1
                 self._stats["today"] += 1
@@ -3545,18 +3965,9 @@ class VideoDownloaderMod(loader.Module):
                 except Exception:
                     pass
 
-            yt_clients = ["tv", "web_safari", "mweb", "default"]
-            all_bases = (
-                [base]
-                + [f"{base}_yt{i}" for i in range(self.config["retries"] + 1)]
-                + [f"{base}_a{i}"  for i in range(self.config["retries"] + 1)]
-                + [f"{base}_{c}"   for c in yt_clients]
-                + [f"{base}_tk"]
-                + [f"{base}_cli"]
-                + [f"{base}_browser_cli"]
-            )
-            for b in all_bases:
-                _cleanup(b)
+            self._save_stats()
+            # Every intermediate and final file lives in this task directory.
+            shutil.rmtree(workdir, ignore_errors=True)
             for f in (result if isinstance(result, list) else [result] if result else []):
                 try:
                     if isinstance(f, str) and os.path.isfile(f):
@@ -3576,57 +3987,57 @@ class VideoDownloaderMod(loader.Module):
             return
 
         text = getattr(message, "raw_text", "") or ""
-        if not text or text.startswith("."):
+        if not text or text.startswith(self.get_prefix()):
             return
-        url = self._extract_url(text)
-        if not url:
-            return
-        url = self._normalize(url)
-        if (not self.config.get("allow_any_url", False)
-                and not _is_supported_url(url)):
+        urls = [
+            self._normalize(url)
+            for url in self._extract_urls(text, self._max_links())
+        ]
+        if not self.config.get("allow_any_url", False):
+            urls = [url for url in urls if _is_supported_url(url)]
+        urls = list(dict.fromkeys(urls))
+        if not urls:
             return
 
-        cd = self._cooldown_left()
+        sender_id = getattr(message, "sender_id", None)
+        cd = self._cooldown_left(sender_id)
         if cd:
-            try:
-                m = await message.reply(self.strings("err_cooldown").format(cd))
-                await asyncio.sleep(5)
-                await m.delete()
-            except Exception:
-                pass
+            await self._temporary_reply(message, self.strings("err_cooldown").format(cd))
             return
 
         if self._limit_reached():
-            try:
-                m = await message.reply(self.strings("err_limit").format(self.config["daily_limit"]))
-                await asyncio.sleep(5)
-                await m.delete()
-            except Exception:
-                pass
+            await self._temporary_reply(
+                message, self.strings("err_limit").format(self.config["daily_limit"])
+            )
             return
 
         if self._queue is None:
             return
 
-        qsize = self._queue.qsize()
-        if qsize >= self.config["queue_max"]:
+        for url in urls:
+            qsize = self._queue.qsize()
+            if qsize >= self._queue_limit():
+                await self._temporary_reply(
+                    message, self.strings("err_queue_full").format(self._queue_limit())
+                )
+                return
             try:
-                m = await message.reply(self.strings("err_queue_full").format(self.config["queue_max"]))
-                await asyncio.sleep(5)
-                await m.delete()
+                status = await message.reply(
+                    self.strings("queue_pos").format(pos=qsize + 1) if qsize > 0
+                    else self.strings("loading")
+                )
             except Exception:
-                pass
-            return
+                return
+            self._enqueue(url, message, status)
+        self._mark_download(sender_id)
 
+    async def _temporary_reply(self, message, text: str, delay: int = 5):
         try:
-            status = await message.reply(
-                self.strings("queue_pos").format(pos=qsize + 1) if qsize > 0
-                else self.strings("loading")
-            )
+            reply = await message.reply(text)
+            await asyncio.sleep(delay)
+            await reply.delete()
         except Exception:
-            return
-
-        await self._queue.put(self._process(url, message, status))
+            pass
 
     # ── commands ──────────────────────────────────────────────────────────────
 
@@ -3658,18 +4069,17 @@ class VideoDownloaderMod(loader.Module):
         if self._queue is None:
             return
 
-        qsize = self._queue.qsize()
-        if qsize >= self.config["queue_max"]:
+        if self._queue.qsize() >= self._queue_limit():
             return await utils.answer(
                 message,
-                self.strings("err_queue_full").format(self.config["queue_max"])
+                self.strings("err_queue_full").format(self._queue_limit())
             )
 
         status = await utils.answer(
             message,
-            self.strings("dl_started").format(url=url)
+            self.strings("dl_started").format(url=utils.escape_html(url))
         )
-        await self._queue.put(self._process(url, message, status))
+        self._enqueue(url, message, status)
 
     @loader.command()
     async def vdlmusic(self, message):
@@ -3715,12 +4125,12 @@ class VideoDownloaderMod(loader.Module):
         url = self._normalize(url)
         if self._queue is None:
             return
-        if self._queue.qsize() >= self.config["queue_max"]:
+        if self._queue.qsize() >= self._queue_limit():
             return await utils.answer(
-                message, self.strings("err_queue_full").format(self.config["queue_max"])
+                message, self.strings("err_queue_full").format(self._queue_limit())
             )
         status = await utils.answer(message, self.strings("loading_music"))
-        await self._queue.put(self._process(url, message, status, audio_override=True))
+        self._enqueue(url, message, status, audio_override=True)
 
     @loader.command()
     async def vdlchannels(self, message):
@@ -3816,6 +4226,9 @@ class VideoDownloaderMod(loader.Module):
                 "audio_format (mp3/m4a/wav/opus/flac),\n"
                 "timeout (сек, таймаут завдання),\n"
                 "cli, any_url, ipv4 (0/1),\n"
+                "links (1-10 посилань з повідомлення),\n"
+                "cache (годин кешу, 0 = вимкнено),\n"
+                "source (посилання на джерело в підписі, 0/1),\n"
                 "yt_browser, yt_cookies_mode"
             )
         key, raw = args[0].lower(), args[1]
@@ -3836,6 +4249,9 @@ class VideoDownloaderMod(loader.Module):
             "cli":             ("use_cli_ytdlp",    bool, ""),
             "any_url":         ("allow_any_url",    bool, ""),
             "ipv4":            ("force_ipv4",       bool, ""),
+            "links":           ("max_links",        int,  "посилань"),
+            "source":          ("source_link",      bool, ""),
+            "cache":           ("cache_hours",      int,  "год"),
         }
         if key == "yt_browser":
             self.config["yt_browser_cookies"] = raw.strip() or "firefox"
@@ -3863,38 +4279,43 @@ class VideoDownloaderMod(loader.Module):
             return await utils.answer(message, "<b>❌ Невідомий параметр.</b>")
         cfg_key, cast, unit = mapping[key]
         try:
-            val = bool(int(raw)) if cast is bool else int(raw)
+            val = _parse_bool(raw) if cast is bool else int(raw)
         except ValueError:
-            return await utils.answer(message, "<b>❌ Значення має бути числом.</b>")
+            return await utils.answer(
+                message,
+                "<b>❌ Значення має бути 0/1 (on/off).</b>" if cast is bool
+                else "<b>❌ Значення має бути числом.</b>",
+            )
+        if cast is int:
+            low, high = self.SETTING_LIMITS.get(key, (0, None))
+            if val < low or (high is not None and val > high):
+                bounds = f"{low}–{high}" if high is not None else f"≥ {low}"
+                return await utils.answer(
+                    message, f"<b>❌ {key}: допустимо {bounds}.</b>"
+                )
+        # Validate first, store second: invalid values never reach the config.
         self.config[cfg_key] = val
         if key == "workers":
-            self.config[cfg_key] = max(1, min(4, val))
-            val = self.config[cfg_key]
-            self._start_queue_workers()
-        elif key == "fragments":
-            self.config[cfg_key] = max(1, min(16, val))
-            val = self.config[cfg_key]
-        if key == "queue_max" and self._queue is not None:
-            if val < 1:
-                return await utils.answer(message, "<b>❌ queue_max має бути не менше 1.</b>")
-            pending = self._queue.qsize()
-            if val < pending:
-                self.config[cfg_key] = self._queue.maxsize
-                return await utils.answer(
-                    message,
-                    f"<b>❌ У черзі вже <code>{pending}</code> завдань; queue_max не може бути меншим.</b>",
-                )
-            old_queue = self._queue
-            new_queue = asyncio.Queue(maxsize=val)
-            while not old_queue.empty():
-                new_queue.put_nowait(old_queue.get_nowait())
-                old_queue.task_done()
-            self._queue = new_queue
             self._start_queue_workers()
         if cast is bool:
             await utils.answer(message, f"<b>{key}: {'✅ ON' if val else '❌ OFF'}</b>")
         else:
             await utils.answer(message, f"<b>✅ {key} = <code>{val}</code> {unit}</b>")
+
+    SETTING_LIMITS = {
+        "cooldown": (0, 86400),
+        "limit": (0, 100000),
+        "size": (1, 4000),
+        "auto_delete": (0, 7 * 86400),
+        "retries": (0, 5),
+        "queue_max": (1, 100),
+        "workers": (1, 4),
+        "fragments": (1, 16),
+        "playlist_max": (1, 100),
+        "timeout": (60, 7200),
+        "links": (1, 10),
+        "cache": (0, 24 * 30),
+    }
 
     @loader.command()
     async def vdlt(self, message):
@@ -3919,21 +4340,27 @@ class VideoDownloaderMod(loader.Module):
 
         title, text = result
         self._stats["transcripts"] += 1
-        full = self.strings("transcript_header").format(title=title) + text
+        self._save_stats()
+        # Caption text comes from the video: always escape it for HTML.
+        full = (
+            self.strings("transcript_header").format(title=utils.escape_html(title))
+            + utils.escape_html(text)
+        )
 
         if len(full) > 4096:
-            tmp_path = f"/tmp/transcript_{os.urandom(4).hex()}.txt"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(full)
-            await message.client.send_file(
-                message.chat_id, tmp_path,
-                reply_to=message.id,
-                caption=f"<b>📝 {title}</b>",
-            )
+            workdir = self._new_workdir("transcript")
+            path = os.path.join(workdir, f"{_sanitize_filename(title)[:80]}.txt")
             try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(f"{title}\n\n{text}\n")
+                await message.client.send_file(
+                    message.chat_id, path,
+                    reply_to=message.id,
+                    caption=f"<b>📝 {utils.escape_html(title)}</b>",
+                    parse_mode="html",
+                )
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
             await status.delete()
         else:
             await status.edit(full)
@@ -3945,8 +4372,17 @@ class VideoDownloaderMod(loader.Module):
             return await utils.answer(message, "<b>Черга не ініціалізована.</b>")
         await utils.answer(
             message,
-            f"<b>📋 Черга: <code>{self._queue.qsize()}</code> / <code>{self.config['queue_max']}</code></b>"
-            f"\n<b>⚡ Воркери: <code>{self._queue_workers_count()}</code></b>"
+            f"<b>📋 Черга: <code>{self._queue.qsize()}</code> / <code>{self._queue_limit()}</code></b>"
+            f"\n<b>⚡ Зайнято воркерів: <code>{len(self._busy_workers)}</code> / "
+            f"<code>{self._queue_workers_count()}</code></b>"
+        )
+
+    @loader.command()
+    async def vdlcancel(self, message):
+        """Скасувати всі завдання, що ще чекають у черзі"""
+        dropped = await self._drain_queue("<b>🚫 Завантаження скасовано.</b>")
+        await utils.answer(
+            message, f"<b>🚫 Скасовано завдань у черзі: <code>{dropped}</code></b>"
         )
 
     @loader.command()
@@ -3958,7 +4394,7 @@ class VideoDownloaderMod(loader.Module):
                 return f"✅ є ({age} дн. тому)"
             return "❌ відсутній"
         _merge_platform_cookies()
-        statuses = _cookie_domains_status()
+        statuses = _cookie_domains_status(self._cookie_manager().cookies_file)
         domains = "\n".join(
             f"   {'✅' if ok else '❌'} {name}" for name, ok in statuses.items()
         )
@@ -3967,6 +4403,7 @@ class VideoDownloaderMod(loader.Module):
             self.strings("cookies_status").format(
                 yt=_s(_deployment_path(COOKIES_YOUTUBE)),
                 default=_s(self._cookie_manager().cookies_file),
+                path=utils.escape_html(self._cookie_manager().cookies_file),
                 mode=self.config.get("yt_cookies_mode", "auto"),
                 browser=self._yt_browser_cookies_value(), domains=domains
             )
@@ -3977,7 +4414,7 @@ class VideoDownloaderMod(loader.Module):
         """Оновити yt-dlp до останньої версії"""
         if self.config.get("auto_install_deps", True):
             await self._ensure_runtime_dependencies()
-        ok, info = await self._auto_update_ytdlp(force=True)
+        ok, info = await self._auto_update_ytdlp(force=True, manual=True)
         if ok:
             await utils.answer(message, self.strings("update_ok"))
         else:
@@ -4175,6 +4612,7 @@ class VideoDownloaderMod(loader.Module):
                 audio=s["audio"],
                 photos=s["photos"], playlists=s["playlists"],
                 transcripts=s.get("transcripts", 0),
+                cached=s.get("cached", 0),
                 today=s["today"],
                 limit=self.config["daily_limit"] or "∞",
                 platforms=platforms,
@@ -4184,13 +4622,8 @@ class VideoDownloaderMod(loader.Module):
     @loader.command()
     async def vdlreset(self, message):
         """Скинути статистику"""
-        self._stats = {
-            "total": 0, "ok": 0, "err": 0, "retried": 0,
-            "audio": 0, "photos": 0, "playlists": 0, "today": 0,
-            "transcripts": 0, "timeouts": 0,
-            "day": time.strftime("%Y-%m-%d"),
-            "platforms": defaultdict(int),
-        }
+        self._stats = _empty_stats()
+        self._save_stats()
         await utils.answer(message, self.strings("stats_reset"))
 
     @loader.command()
