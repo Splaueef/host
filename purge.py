@@ -1,5 +1,5 @@
 #    Friendly Telegram (telegram userbot)
-# meta version: 1.0.1
+# meta version: 1.1.0
 #    Copyright (C) 2018-2019 The Authors
 
 #    This program is free software: you can redistribute it and/or modify
@@ -31,6 +31,14 @@ class PurgeMod(loader.Module):
         "from_where": "<b>Which messages should be purged?</b>",
         "not_supergroup_bot": "<b>Purges can only take place in supergroups</b>",
         "delete_what": "<b>What message should be deleted?</b>",
+        "delme_usage": "<b>Usage:</b> <code>{}delme 10</code> (1–500)",
+    }
+
+    strings_uk = {
+        "from_where": "<b>Дайте відповідь на повідомлення, з якого почати очищення.</b>",
+        "not_supergroup_bot": "<b>Очищення можливе лише в супергрупах.</b>",
+        "delete_what": "<b>Яке повідомлення видалити?</b>",
+        "delme_usage": "<b>Використання:</b> <code>{}delme 10</code> (1–500)",
     }
 
     @loader.group_admin_delete_messages
@@ -105,3 +113,29 @@ class PurgeMod(loader.Module):
         await self.allmodules.log(
             "delete", group=message.to_id, affected_uids=[msg.sender_id]
         )
+
+    async def delmecmd(self, message):
+        """<N> - Delete your last N messages in this chat"""
+        args = utils.get_args(message)
+        try:
+            limit = int(args[0]) if args else 0
+        except ValueError:
+            limit = 0
+        if not 1 <= limit <= 500:
+            await utils.answer(
+                message,
+                self.strings("delme_usage", message).format(
+                    utils.escape_html(self.get_prefix())
+                ),
+            )
+            return
+
+        ids = [message.id]
+        async for msg in message.client.iter_messages(
+            message.to_id, from_user="me", max_id=message.id, limit=limit
+        ):
+            ids.append(msg.id)
+        deleted = len(ids) - 1
+        for start in range(0, len(ids), 100):
+            await message.client.delete_messages(message.to_id, ids[start:start + 100])
+        logger.debug("delme removed %s messages", deleted)

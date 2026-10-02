@@ -1,8 +1,9 @@
 # meta developer: @Huai_Baike
-# meta version: 1.0.0
+# meta version: 1.1.0
 # meta syntax: .m <приклад>
 # requires: sympy pint aiohttp matplotlib numpy scipy Pillow
 
+import asyncio
 import io
 import re
 import urllib.parse
@@ -214,37 +215,139 @@ class MathSolverMod(loader.Module):
         tr = standard_transformations + (implicit_multiplication_application,)
         return parse_expr(s, transformations=tr)
 
+    # Symbolic work runs in a worker thread with a time limit: an expensive
+    # ``solve``/``integrate`` must not freeze the whole userbot.
+    SOLVE_TIMEOUT = 20
+
+    async def _compute(self, func, *args):
+        return await asyncio.wait_for(
+            utils.run_sync(func, *args), timeout=self.SOLVE_TIMEOUT
+        )
+
+    @staticmethod
+    def _main_symbol(expr):
+        symbols = sorted(expr.free_symbols, key=lambda item: item.name)
+        for name in ("x", "t", "y"):
+            for symbol in symbols:
+                if symbol.name == name:
+                    return symbol
+        return symbols[0] if symbols else None
+
+    @staticmethod
+    def _code(value, limit=1500):
+        text = str(value)
+        if len(text) > limit:
+            text = text[: limit - 1] + "…"
+        return f"<code>{utils.escape_html(text)}</code>"
+
+    def _solve_text(self, raw: str) -> str:
+        expr = self.parse_math(raw)
+        symbol = self._main_symbol(expr)
+        if symbol is None:
+            exact = sp.nsimplify(expr) if expr.is_number else expr
+            return (
+                f"<b>Результат:</b> {self._code(exact)}\n"
+                f"<b>≈</b> {self._code(expr.evalf(15))}"
+            )
+        lines = []
+        if "=" not in raw:
+            simplified = sp.simplify(expr)
+            factored = sp.factor(simplified)
+            lines.append(f"<b>Спрощено:</b> {self._code(simplified)}")
+            if factored != simplified:
+                lines.append(f"<b>Розклад:</b> {self._code(factored)}")
+        roots = sp.solve(expr, symbol)
+        label = "Корені" if "=" in raw else f"Корені ({symbol} при = 0)"
+        if roots:
+            approx = ", ".join(
+                str(sp.N(root, 6)) for root in roots[:10] if root.is_number
+            )
+            lines.append(f"<b>{label}:</b> {self._code(roots)}")
+            if approx and approx != ", ".join(str(root) for root in roots[:10]):
+                lines.append(f"<b>≈</b> {self._code(approx)}")
+        else:
+            lines.append(f"<b>{label}:</b> немає")
+        return "\n".join(lines)
+
+    async def _reply_math(self, message, raw: str, func, *args):
+        if not raw:
+            return False
+        try:
+            text = await self._compute(func, *args)
+        except asyncio.TimeoutError:
+            text = "<b>⏳ Обчислення займає забагато часу.</b>"
+        except Exception as e:
+            text = f"<b>❌ Помилка:</b> {self._code(e, 500)}"
+        await utils.answer(message, f"<b>📝 Ввід:</b> {self._code(raw, 500)}\n{text}")
+        return True
+
     # ── .m ────────────────────────────────────────────────────────────────────
     async def mcmd(self, message):
-        """<вираз> — Обчислити / знайти корені"""
-        args = utils.get_args_raw(message)
+        """<вираз> — Обчислити, спростити або знайти корені"""
+        args = utils.get_args_raw(message).strip()
         if not args or args.lower() == "help":
-            await message.edit(
+            await utils.answer(
+                message,
                 "<b>🧮 MathSolver — команди:</b>\n\n"
-                "• <code>.m 2x^2+3x-5</code> — спростити\n"
+                "• <code>.m 2x^2+3x-5</code> — спростити й розкласти\n"
                 "• <code>.m x^2-4=0</code> — корені\n"
+                "• <code>.mdiff x^3*sin(x)</code> — похідна\n"
+                "• <code>.mint x^2 0 3</code> — інтеграл (визначений, якщо є межі)\n"
                 "• <code>.conv 50 C в F</code> — конвертер\n"
                 "• <code>.mdraw sqrt(x^2+y^2)</code> — формула картинкою\n"
                 "• <code>.graph sin(x), cos(x)</code> — стандартний графік\n"
                 "• <code>.graph polar: r=cos(3*t)</code> — полярний\n"
                 "• <code>.graph param: x=cos(t), y=sin(t)</code> — параметричний\n"
                 "• <code>.graph heat: sin(x)*cos(y)</code> — heatmap\n"
-                "• <code>.graphhelp</code> — всі підтримувані функції"
+                "• <code>.graphhelp</code> — всі підтримувані функції",
             )
             return
-        try:
-            expr = self.parse_math(args)
-            syms = list(expr.free_symbols)
-            if syms:
-                roots = sp.solve(expr, syms[0])
-                res_text = f"<b>Корені:</b> <code>{roots}</code>"
-            else:
-                res_text = f"<b>Результат:</b> <code>{expr.evalf()}</code>"
-            await message.edit(
-                f"<b>📝 Ввід:</b> <code>{args}</code>\n<b>✅ {res_text}</b>"
+        await self._reply_math(message, args, self._solve_text, args)
+
+    # ── .mdiff / .mint ────────────────────────────────────────────────────────
+    def _diff_text(self, raw: str) -> str:
+        order = 1
+        match = re.match(r"^(\d)\s+(.+)$", raw)
+        if match:
+            order, raw = int(match.group(1)), match.group(2)
+        expr = self.parse_math(raw)
+        symbol = self._main_symbol(expr)
+        if symbol is None:
+            return f"<b>Похідна:</b> {self._code(0)}"
+        result = sp.simplify(sp.diff(expr, symbol, order))
+        mark = "′" * order if order <= 3 else f"^({order})"
+        return f"<b>Похідна{mark} по {symbol}:</b> {self._code(result)}"
+
+    def _integral_text(self, raw: str) -> str:
+        parts = raw.rsplit(maxsplit=2)
+        bounds = None
+        if len(parts) == 3:
+            try:
+                bounds = (self.parse_math(parts[1]), self.parse_math(parts[2]))
+                raw = parts[0]
+            except Exception:
+                bounds = None
+        expr = self.parse_math(raw)
+        symbol = self._main_symbol(expr) or sp.Symbol("x")
+        if bounds:
+            value = sp.integrate(expr, (symbol, *bounds))
+            return (
+                f"<b>∫ від {self._code(bounds[0])} до {self._code(bounds[1])}:</b> "
+                f"{self._code(value)}\n<b>≈</b> {self._code(sp.N(value, 10))}"
             )
-        except Exception as e:
-            await message.edit(f"<b>❌ Помилка:</b> <code>{str(e)}</code>")
+        return f"<b>∫ d{symbol}:</b> {self._code(sp.integrate(expr, symbol))} + C"
+
+    async def mdiffcmd(self, message):
+        """[порядок] <вираз> — Похідна, наприклад .mdiff 2 x^3"""
+        args = utils.get_args_raw(message).strip()
+        if not await self._reply_math(message, args, self._diff_text, args):
+            await utils.answer(message, "<b>Приклад:</b> <code>.mdiff x^3*sin(x)</code>")
+
+    async def mintcmd(self, message):
+        """<вираз> [a b] — Інтеграл, наприклад .mint x^2 0 3"""
+        args = utils.get_args_raw(message).strip()
+        if not await self._reply_math(message, args, self._integral_text, args):
+            await utils.answer(message, "<b>Приклад:</b> <code>.mint x^2 0 3</code>")
 
     # ── .conv ─────────────────────────────────────────────────────────────────
     async def convcmd(self, message):
@@ -252,7 +355,7 @@ class MathSolverMod(loader.Module):
         args = utils.get_args_raw(message)
         args = re.sub(r'\s+(в|in|to)\s+', ' to ', args, flags=re.IGNORECASE)
         if " to " not in args or not ureg:
-            await message.edit("<b>Приклад:</b> <code>.conv 100 km в miles</code>")
+            await utils.answer(message, "<b>Приклад:</b> <code>.conv 100 km в miles</code>")
             return
         try:
             parts = args.split(" to ")
@@ -260,33 +363,42 @@ class MathSolverMod(loader.Module):
             t_str = parts[1].strip().replace("С", "degC").replace("Ф", "degF")
             val = ureg(v_str)
             res = val.to(t_str)
-            await message.edit(f"<b>🔄 {val:~P}</b> ⮕ <b><code>{res:.4g~P}</code></b>")
+            await utils.answer(
+                message,
+                f"<b>🔄 {utils.escape_html(f'{val:~P}')}</b> ⮕ "
+                f"<b>{self._code(f'{res:.4g~P}')}</b>",
+            )
         except Exception as e:
-            await message.edit(f"<b>❌ Невідомо:</b> <code>{str(e)}</code>")
+            await utils.answer(message, f"<b>❌ Невідомо:</b> {self._code(e, 500)}")
 
     # ── .mdraw ────────────────────────────────────────────────────────────────
     async def mdrawcmd(self, message):
         """<формула> — Намалювати формулу як картинку (LaTeX)"""
         args = utils.get_args_raw(message)
         if not args:
+            await utils.answer(message, "<b>Приклад:</b> <code>.mdraw sqrt(x^2+y^2)</code>")
             return
-        await message.edit("<b>🎨 Малюю...</b>")
+        status = await utils.answer(message, "<b>🎨 Малюю...</b>")
         try:
             latex_str = sp.latex(self.parse_math(args))
             url = (
                 "https://latex.codecogs.com/png.image?"
                 f"\\dpi{{300}}\\bg_white\\huge {urllib.parse.quote(latex_str)}"
             )
-            async with aiohttp.ClientSession() as sess, sess.get(url) as r:
-                if r.status == 200:
-                    img = io.BytesIO(await r.read())
-                    img.name = "f.png"
-                    await self.client.send_file(
-                        message.chat_id, img, reply_to=message.reply_to_msg_id
-                    )
-                    await message.delete()
-        except Exception:
-            await message.edit("<b>❌ Помилка рендеру</b>")
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as sess, sess.get(url) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"HTTP {r.status}")
+                img = io.BytesIO(await r.read())
+            img.name = "f.png"
+            await self.client.send_file(
+                message.chat_id, img, reply_to=message.reply_to_msg_id
+            )
+            await (status or message).delete()
+        except Exception as e:
+            await utils.answer(
+                status or message, f"<b>❌ Помилка рендеру:</b> {self._code(e, 300)}"
+            )
 
     # ── .graphhelp ────────────────────────────────────────────────────────────
     async def graphhelpcmd(self, message):

@@ -47,12 +47,47 @@ The purpose of this repository is to maintain hosting-related files used by cust
 .ds reset        — скинути всю статистику (з підтвердженням)
 ```
 
+Підсумок порівнює період із попереднім (вчора / попередні 7 чи 30 днів) і
+показує серію днів поспіль, коли ви писали повідомлення.
+
 Звіти показують лише імена: без посилань на профілі, @юзернеймів чи ID, тож
 їх можна показувати в інших чатах. Юзернейм зберігається локально тільки для
 пошуку `.ds peak @username`. Денні, тижневі й місячні звіти публікуються в
 приватний канал «DailyStat • Reports» о `report_hour`; звіт, пропущений через
 вимкнений Hikka, надсилається після запуску. Дані, старші за `keep_days`
 (типово 120 днів), видаляються автоматично.
+
+## VideoDownloader
+
+`vdlt.py` автоматично завантажує відео, фото й музику з YouTube, TikTok,
+Instagram, X, Reddit, Pinterest, Spotify, SoundCloud та інших сайтів у
+дозволених групах (`.vdladd`) і особистих чатах (`.vdlpm`).
+
+- Повторне посилання надсилається **з кешу миттєво**, без нового завантаження
+  (`.vdlset cache 72` — годин, `0` вимикає; з `auto_delete` кеш не працює).
+- З одного повідомлення завантажується до `links` посилань (типово 3).
+- `.vdlinfo URL` — назва, автор, тривалість і доступні якості без завантаження.
+- `.vdlqueue` / `.vdlcancel` — стан черги та скасування завдань, що чекають.
+- `.vdlset workers 3` змінює кількість паралельних завантажень, не перериваючи
+  поточні; значення `.vdlset` перевіряються до збереження.
+- Статистика (`.vdlstats`) і денний ліміт зберігаються після перезапуску;
+  кулдаун рахується окремо для кожного користувача.
+- Кожне завдання працює у власній теці `.vdl_work/…`, яка видаляється після
+  надсилання; залишки після збою прибираються під час запуску.
+- `ig_password` і `cobalt_api_key` приховані в `.config`.
+
+## Інші модулі — короткий довідник
+
+| Модуль | Команди |
+| --- | --- |
+| DailyNews | `.newsrun`, `.newstoday`, `.newsyesterday`, `.newsweek`, `.newscompare`, `.newsadd`, `.newslist`, `.newsdel @канал 3`, `.newsstatus`, `.newsreset` |
+| QuietSchedule | `.qadd @user daily 22:00 08:00 mute`, `.qadd @user for 2h30m`, `.qlist`, `.qpause id`, `.qresume id`, `.qdel id`, `.qnow` |
+| TimeInfo | `.time`, `.timezone Europe/Kyiv`, `.timestamp`, `.worldtime [зони…]` (список у `.config TimeInfo` → `world_zones`), `.uptime` |
+| MathSolver | `.m`, `.mdiff [порядок] вираз`, `.mint вираз [a b]`, `.conv`, `.mdraw`, `.graph`, `.graphanim` |
+| ChatAnalysis | `!аналіз` — історія чату, топ учасників (лише імена), середнє на день |
+| Purge | `.purge`, `.del`, `.delme N` — видалити свої останні N повідомлень (до 500) |
+| Systemd | `.units`, `.addunit`, `.unit nginx restart`, `.nameunit`, `.delunit` (потрібен `sudo` без пароля) |
+| GemmaSelf | `.gmself`, `.gmclear`, `.gmstatus` |
 
 ## Wallet P2P
 

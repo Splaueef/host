@@ -1,6 +1,6 @@
 # meta developer: @Huai_Baike
 
-__version__ = (4, 1, 1)
+__version__ = (4, 2, 0)
 
 import asyncio
 import hashlib
@@ -127,6 +127,16 @@ class GemmaSelf(loader.Module):
             "⛔️ Ліміт ШІ-запитів вичерпано. "
             "Нові запити відновляться <b>{reset_at}</b>."
         ),
+        "status": (
+            "🤖 <b>GemmaSelf</b>\n\n"
+            "Модель: <code>{model}</code>\n"
+            "Дозволених чатів: <b>{chats}</b>\n"
+            "Поточний чат: <b>{current}</b>\n"
+            "Повідомлень в історії чату: <b>{history}</b>\n"
+            "Денний ліміт на користувача: <b>{limit}</b>\n"
+            "Запитів сьогодні (усі користувачі): <b>{used}</b>\n"
+            "Стрімінг: <b>{stream}</b>"
+        ),
     }
 
     def __init__(self):
@@ -250,9 +260,14 @@ class GemmaSelf(loader.Module):
         if limit <= 0:
             return
 
-        state = self._quota_state()
-        key = self._quota_key(user_id)
-        state[key] = {"day": self._quota_day(), "count": self._quota_used(user_id) + 1}
+        today = self._quota_day()
+        count = self._quota_used(user_id) + 1
+        # Keep only today's counters so the stored dict does not grow forever.
+        state = {
+            key: item for key, item in self._quota_state().items()
+            if isinstance(item, dict) and item.get("day") == today
+        }
+        state[self._quota_key(user_id)] = {"day": today, "count": count}
         self.set("quota", state)
 
     @staticmethod
@@ -352,9 +367,20 @@ class GemmaSelf(loader.Module):
         except Exception as e:
             logger.error("GemmaSelf stream: %s", e)
 
+    def _render(self, text: str) -> str:
+        """Escape model output: it is plain text, never trusted HTML.
+
+        Without this anyone in an allowed chat could make the model emit
+        links or broken markup in a message sent from the owner's account.
+        Only the module's own quota notice is HTML.
+        """
+        if self._is_quota_message(text):
+            return text
+        return utils.escape_html(text[:3800])
+
     async def _safe_edit(self, message, text: str):
         try:
-            await message.edit(text[:4096])
+            await message.edit(self._render(text))
         except Exception as e:
             if "message is not modified" not in str(e).lower():
                 logger.debug("GemmaSelf edit: %s", e)
@@ -386,6 +412,29 @@ class GemmaSelf(loader.Module):
         msg = await utils.answer(message, self.strings["cleared"])
         await asyncio.sleep(2)
         await (msg[0] if isinstance(msg, list) else msg).delete()
+
+    @loader.command()
+    async def gmstatus(self, message):
+        """Показати стан GemmaSelf для поточного чату"""
+        today = self._quota_day()
+        used = sum(
+            int(item.get("count", 0))
+            for item in self._quota_state().values()
+            if isinstance(item, dict) and item.get("day") == today
+        )
+        limit = int(self.config["daily_user_limit"] or 0)
+        await utils.answer(
+            message,
+            self.strings["status"].format(
+                model=utils.escape_html(str(self.config["model"])),
+                chats=len(self.config["allowed_chats"]),
+                current="увімкнено" if message.chat_id in self.config["allowed_chats"] else "вимкнено",
+                history=len(self._get_history(message.chat_id)),
+                limit=limit if limit > 0 else "без ліміту",
+                used=used,
+                stream="так" if self.config["stream"] else "ні",
+            ),
+        )
 
     # ── Watcher ───────────────────────────────────────────────────────────
 
@@ -465,7 +514,7 @@ class GemmaSelf(loader.Module):
                         response = await self._call_ollama(self._get_history(chat_id))
 
                     if response:
-                        await message.reply(response)
+                        await message.reply(self._render(response))
                         self._append(chat_id, "assistant", response)
                         if not self._is_quota_message(response) and not self._quota_exempt(chat_id):
                             self._quota_inc(sender_id)

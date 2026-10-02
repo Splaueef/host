@@ -1,5 +1,5 @@
 #             █ █ ▀ █▄▀ ▄▀█ █▀█ ▀
-# meta version: 1.0.0
+# meta version: 1.1.0
 #             █▀█ █ █ █ █▀█ █▀▄ █
 #              © Copyright 2022
 #           https://t.me/hikariatama
@@ -25,7 +25,7 @@
 
 import asyncio
 import io
-import subprocess
+import re
 from typing import Union
 
 from telethon.tl.types import Message
@@ -94,6 +94,12 @@ class SystemdMod(loader.Module):
         "back_btn": "🔙 Back",
         "close_btn": "✖️ Close",
         "refresh_btn": "🔄 Refresh",
+        "action_failed": (
+            "<emoji document_id=5312526098750252863>🚫</emoji> <b>Action"
+            " </b><code>{}</code><b> failed:</b> <code>{}</code>"
+        ),
+        "bad_unit": "🚫 <b>Invalid unit name:</b> <code>{}</code>",
+        "empty_panel": "<i>No units yet. Add one with</i> <code>{}addunit nginx</code>",
     }
 
     strings_ru = {
@@ -312,81 +318,73 @@ class SystemdMod(loader.Module):
         "_cmd_doc_unit": "<birlik> - Birlikni boshqarish",
     }
 
-    def _get_unit_status_text(self, unit: str) -> str:
-        return (
-            subprocess.run(
-                [
-                    "sudo",
-                    "-S",
-                    "systemctl",
-                    "is-active",
-                    unit,
-                ],
-                check=False,
-                stdout=subprocess.PIPE,
+    # Commands run through ``sudo -n`` (never prompt for a password) in a
+    # subprocess with a timeout, so a misconfigured sudoers or a slow
+    # journalctl can no longer freeze the whole userbot.
+    COMMAND_TIMEOUT = 20
+    UNIT_RE = re.compile(r"[A-Za-z0-9@._:\\-]+")
+
+    @classmethod
+    def _valid_unit(cls, unit: str) -> bool:
+        return bool(unit) and not unit.startswith("-") and bool(cls.UNIT_RE.fullmatch(unit))
+
+    async def _run(self, *command: str, sudo: bool = True) -> tuple:
+        if sudo:
+            command = ("sudo", "-n", *command)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            .stdout.decode()
-            .strip()
-        )
-
-    def _is_running(self, unit: str) -> bool:
-        return self._get_unit_status_text(unit) == "active"
-
-    def _unit_exists(self, unit: str) -> bool:
+        except OSError as error:
+            return 127, "", str(error)
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=self.COMMAND_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            return 124, "", "timeout"
         return (
-            subprocess.run(
-                [
-                    "sudo",
-                    "-S",
-                    "systemctl",
-                    "cat",
-                    unit,
-                ],
-                check=False,
-                stdout=subprocess.PIPE,
-            ).returncode
-            == 0
+            process.returncode,
+            stdout.decode(errors="replace").strip(),
+            stderr.decode(errors="replace").strip(),
         )
+
+    async def _get_unit_status_text(self, unit: str) -> str:
+        _, stdout, _ = await self._run("systemctl", "is-active", unit)
+        return stdout or "unknown"
+
+    async def _is_running(self, unit: str) -> bool:
+        return await self._get_unit_status_text(unit) == "active"
+
+    async def _unit_exists(self, unit: str) -> bool:
+        if not self._valid_unit(unit):
+            return False
+        code, _, _ = await self._run("systemctl", "cat", unit)
+        return code == 0
+
+    async def _answer_call(self, call, text: str):
+        if not isinstance(call, int):
+            await call.answer(text, show_alert=True)
 
     async def _manage_unit(self, call: Union[InlineCall, int], unit: dict, action: str):
-        if action == "start":
-            subprocess.run(
-                ["sudo", "-S", "systemctl", "start", unit["formal"]], check=True
-            )
-        elif action == "stop":
-            subprocess.run(
-                ["sudo", "-S", "systemctl", "stop", unit["formal"]], check=True
-            )
-        elif action == "restart":
-            subprocess.run(
-                ["sudo", "-S", "systemctl", "restart", unit["formal"]], check=True
-            )
+        if action in {"start", "stop", "restart"}:
+            code, _, stderr = await self._run("systemctl", action, unit["formal"])
+            if code:
+                await self._answer_call(call, (stderr or f"exit {code}")[:190])
+                return stderr or f"exit {code}"
         elif action in {"logs", "tail"}:
-            logs = (
-                subprocess.run(
-                    [
-                        "sudo",
-                        "-S",
-                        "journalctl",
-                        "-u",
-                        unit["formal"],
-                        "-n",
-                        "1000",
-                    ],
-                    check=True,
-                    stdout=subprocess.PIPE,
-                )
-                .stdout.decode()
-                .strip()
+            code, logs, stderr = await self._run(
+                "journalctl", "-u", unit["formal"], "-n", "1000", "--no-pager",
+                "-o", "short-iso",
             )
-
-            hostname = (
-                subprocess.run(["hostname"], check=True, stdout=subprocess.PIPE)
-                .stdout.decode()
-                .strip()
-            )
-            logs = logs.replace(f"{hostname} ", "")
-            logs = logs.replace("[" + str(self._get_unit_pid(unit["formal"])) + "]", "")
+            if code:
+                await self._answer_call(call, (stderr or f"exit {code}")[:190])
+                return stderr or f"exit {code}"
 
             if action == "logs":
                 logs = io.BytesIO(logs.encode())
@@ -396,36 +394,32 @@ class SystemdMod(loader.Module):
                     call.form["chat"] if not isinstance(call, int) else call, logs
                 )
             else:
+                # Newest lines that fit into one Telegram message.
                 actual_logs = ""
-                logs = list(reversed(logs.splitlines()))
-                while logs:
-                    chunk = f"{logs.pop()}\n"
-                    if len(actual_logs + chunk) >= 4096:
+                for line in reversed(logs.splitlines()):
+                    chunk = f"{line}\n"
+                    if len(utils.escape_html(chunk + actual_logs)) >= 4000:
                         break
+                    actual_logs = chunk + actual_logs
 
-                    actual_logs += chunk
-
+                text = f"<code>{utils.escape_html(actual_logs or '—')}</code>"
                 if isinstance(call, int):
                     await self.inline.form(
-                        f"<code>{utils.escape_html(actual_logs)}</code>",
-                        call,
-                        reply_markup=self._get_unit_markup(unit),
+                        text, call, reply_markup=self._get_unit_markup(unit)
                     )
-                    return
+                    return None
 
-                await call.edit(
-                    f"<code>{utils.escape_html(actual_logs)}</code>",
-                    reply_markup=self._get_unit_markup(unit),
-                )
+                await call.edit(text, reply_markup=self._get_unit_markup(unit))
                 await call.answer("Action complete")
-                return
+                return None
 
         if isinstance(call, int):
-            return
+            return None
 
         await call.answer("Action complete")
         await asyncio.sleep(2)
         await self._control_service(call, unit)
+        return None
 
     def _get_unit_markup(self, unit: dict) -> list:
         return [
@@ -472,127 +466,93 @@ class SystemdMod(loader.Module):
         ]
 
     async def _control_service(self, call: InlineCall, unit: dict):
+        status = await self._get_unit_status_text(unit["formal"])
         await call.edit(
             self.strings("unit_control").format(
-                unit["name"],
-                unit["formal"],
-                self._get_unit_status_emoji(unit["formal"]),
-                self._get_unit_status_text(unit["formal"]),
+                utils.escape_html(unit["name"]),
+                utils.escape_html(unit["formal"]),
+                self._status_emoji(status),
+                utils.escape_html(status),
             ),
             reply_markup=self._get_unit_markup(unit),
         )
 
-    def _get_unit_pid(self, unit: str) -> str:
-        return (
-            subprocess.run(
-                [
-                    "sudo",
-                    "-S",
-                    "systemctl",
-                    "show",
-                    unit,
-                    "--property=MainPID",
-                    "--value",
-                ],
-                check=False,
-                stdout=subprocess.PIPE,
-            )
-            .stdout.decode()
-            .strip()
+    async def _get_unit_pid(self, unit: str) -> str:
+        _, stdout, _ = await self._run(
+            "systemctl", "show", unit, "--property=MainPID", "--value"
         )
+        return stdout
 
-    def _get_unit_resources_consumption(self, unit: str) -> str:
-        if not self._is_running(unit):
+    async def _get_unit_resources_consumption(self, unit: str) -> str:
+        pid = await self._get_unit_pid(unit)
+        if not pid.isdigit() or pid == "0":
             return ""
+        code, stdout, _ = await self._run(
+            "ps", "-p", pid, "-o", "rss=", "-o", "%cpu=", sudo=False
+        )
+        try:
+            rss, cpu = stdout.split()[:2]
+            ram = human_readable_size(int(rss) * 1024)
+        except ValueError:
+            return ""
+        if code:
+            return ""
+        return f"📟 <code>{ram}</code> | 🗃 <code>{cpu}%</code>"
 
-        pid = self._get_unit_pid(unit)
-        ram = human_readable_size(
-            int(
-                subprocess.run(
-                    [
-                        "ps",
-                        "-p",
-                        pid,
-                        "-o",
-                        "rss",
-                    ],
-                    check=False,
-                    stdout=subprocess.PIPE,
-                )
-                .stdout.decode()
-                .strip()
-                .split("\n")[1]
-            )
-            * 1024
+    async def _unit_line(self, unit: dict) -> str:
+        status = await self._get_unit_status_text(unit["formal"])
+        resources = (
+            await self._get_unit_resources_consumption(unit["formal"])
+            if status == "active"
+            else ""
+        )
+        return (
+            f"{self._status_emoji(status)} <b>{utils.escape_html(unit['name'])}</b>"
+            f" (<code>{utils.escape_html(unit['formal'])}</code>):"
+            f" {utils.escape_html(status)} {resources}"
         )
 
-        cpu = (
-            subprocess.run(
-                [
-                    "ps",
-                    "-p",
-                    pid,
-                    "-o",
-                    r"%cpu",
-                ],
-                check=False,
-                stdout=subprocess.PIPE,
+    async def _get_panel(self):
+        services = self.get("services", [])
+        if not services:
+            return self.strings("panel").format(
+                self.strings("empty_panel").format(utils.escape_html(self.get_prefix()))
             )
-            .stdout.decode()
-            .strip()
-            .split("\n")[1]
-            + "%"
-        )
-
-        return f"📟 <code>{ram}</code> | 🗃 <code>{cpu}</code>"
-
-    def _get_panel(self):
-        return self.strings("panel").format(
-            "\n".join(
-                [
-                    f"{self._get_unit_status_emoji(unit['formal'])} <b>{unit['name']}</b>"
-                    f" (<code>{unit['formal']}</code>):"
-                    f" {self._get_unit_status_text(unit['formal'])} {self._get_unit_resources_consumption(unit['formal'])}"
-                    for unit in self.get("services", [])
-                ]
-            )
-        )
+        lines = await asyncio.gather(*(self._unit_line(unit) for unit in services))
+        return self.strings("panel").format("\n".join(lines))
 
     async def _control_services(self, call: InlineCall, refresh: bool = False):
         await call.edit(
-            self._get_panel(),
-            reply_markup=self._get_services_markup(),
+            await self._get_panel(),
+            reply_markup=await self._get_services_markup(),
         )
 
         if refresh:
             await call.answer("Information updated!")
 
-    def _get_unit_status_emoji(self, unit: str) -> str:
-        status = self._get_unit_status_text(unit)
-        if status == "active":
-            return "🍏"
-        elif status == "inactive":
-            return "🍎"
-        elif status == "failed":
-            return "🚫"
-        elif status == "activating":
-            return "🔄"
-        else:
-            return "❓"
+    @staticmethod
+    def _status_emoji(status: str) -> str:
+        return {
+            "active": "🍏",
+            "inactive": "🍎",
+            "failed": "🚫",
+            "activating": "🔄",
+            "deactivating": "🔄",
+        }.get(status, "❓")
 
-    def _get_services_markup(self) -> list:
+    async def _get_services_markup(self) -> list:
+        services = self.get("services", [])
+        statuses = await asyncio.gather(
+            *(self._get_unit_status_text(service["formal"]) for service in services)
+        )
         return utils.chunks(
             [
                 {
-                    "text": (
-                        self._get_unit_status_emoji(service["formal"])
-                        + " "
-                        + service["name"]
-                    ),
+                    "text": self._status_emoji(status) + " " + service["name"],
                     "callback": self._control_service,
                     "args": (service,),
                 }
-                for service in self.get("services", [])
+                for service, status in zip(services, statuses)
             ],
             2,
         ) + [
@@ -609,10 +569,24 @@ class SystemdMod(loader.Module):
     async def unitscmd(self, message: Message):
         """Open control panel"""
         await self.inline.form(
-            self._get_panel(),
+            await self._get_panel(),
             message,
-            reply_markup=self._get_services_markup(),
+            reply_markup=await self._get_services_markup(),
         )
+
+    async def _check_unit(self, message, unit: str) -> bool:
+        if not self._valid_unit(unit):
+            await utils.answer(
+                message, self.strings("bad_unit").format(utils.escape_html(unit))
+            )
+            return False
+        if not await self._unit_exists(unit):
+            await utils.answer(
+                message,
+                self.strings("unit_doesnt_exist").format(utils.escape_html(unit)),
+            )
+            return False
+        return True
 
     async def addunitcmd(self, message: Message):
         """<unit> <name> - Add new unit"""
@@ -627,25 +601,31 @@ class SystemdMod(loader.Module):
             unit = args
             name = args
 
-        if not self._unit_exists(unit):
-            await utils.answer(message, self.strings("unit_doesnt_exist").format(unit))
+        if not await self._check_unit(message, unit):
             return
 
-        self.set(
-            "services",
-            self.get("services", []) + [{"name": name, "formal": unit}],
+        services = [
+            service for service in self.get("services", []) if service["formal"] != unit
+        ]
+        self.set("services", services + [{"name": name, "formal": unit}])
+        await utils.answer(
+            message,
+            self.strings("unit_added").format(
+                utils.escape_html(unit), utils.escape_html(name)
+            ),
         )
-        await utils.answer(message, self.strings("unit_added").format(unit, name))
 
     async def delunitcmd(self, message: Message):
         """<unit> - Delete unit"""
-        args = utils.get_args_raw(message)
+        args = utils.get_args_raw(message).strip()
         if not args:
             await utils.answer(message, self.strings("args"))
             return
 
         if not any(unit["formal"] == args for unit in self.get("services", [])):
-            await utils.answer(message, self.strings("unit_doesnt_exist").format(args))
+            await utils.answer(
+                message, self.strings("unit_doesnt_exist").format(utils.escape_html(args))
+            )
             return
 
         self.set(
@@ -656,7 +636,7 @@ class SystemdMod(loader.Module):
                 if service["formal"] != args
             ],
         )
-        await utils.answer(message, self.strings("unit_removed").format(args))
+        await utils.answer(message, self.strings("unit_removed").format(utils.escape_html(args)))
 
     async def unitcmd(self, message: Message):
         """<unit> <start|stop|restart|logs|tail> - Perform specific action on unit bypassing main menu"""
@@ -666,29 +646,35 @@ class SystemdMod(loader.Module):
             return
 
         unit, action = args.split(maxsplit=1)
-        if not self._unit_exists(unit):
-            await utils.answer(message, self.strings("unit_doesnt_exist").format(unit))
+        action = action.strip().lower()
+        if action not in {"start", "stop", "restart", "logs", "tail"}:
+            await utils.answer(
+                message,
+                self.strings("action_not_found").format(utils.escape_html(action)),
+            )
+            return
+        if not await self._check_unit(message, unit):
             return
 
-        if action in {"start", "stop", "restart", "logs"}:
-            await self._manage_unit(
-                utils.get_chat_id(message),
-                {"formal": unit, "name": unit},
-                action,
+        error = await self._manage_unit(
+            utils.get_chat_id(message),
+            {"formal": unit, "name": unit},
+            action,
+        )
+        if error:
+            await utils.answer(
+                message,
+                self.strings("action_failed").format(
+                    utils.escape_html(action), utils.escape_html(error[:500])
+                ),
             )
-        elif action == "tail":
-            await self._manage_unit(
-                utils.get_chat_id(message),
-                {"formal": unit, "name": unit},
-                "tail",
-            )
-        else:
-            await utils.answer(message, self.strings("action_not_found").format(action))
             return
 
         await utils.answer(
             message,
-            self.strings("unit_action_done").format(action, unit),
+            self.strings("unit_action_done").format(
+                utils.escape_html(action), utils.escape_html(unit)
+            ),
         )
 
     async def nameunitcmd(self, message: Message):
@@ -699,17 +685,24 @@ class SystemdMod(loader.Module):
             return
 
         unit, name = args.split(maxsplit=1)
-        if not any(unit_["formal"] == unit for unit_ in self.get("services", [])):
-            await utils.answer(message, self.strings("unit_doesnt_exist").format(unit))
+        services = self.get("services", [])
+        if not any(unit_["formal"] == unit for unit_ in services):
+            await utils.answer(
+                message, self.strings("unit_doesnt_exist").format(utils.escape_html(unit))
+            )
             return
 
+        # Keep the unit at its position in the panel.
         self.set(
             "services",
             [
-                service
-                for service in self.get("services", [])
-                if service["formal"] != unit
-            ]
-            + [{"name": name, "formal": unit}],
+                {**service, "name": name} if service["formal"] == unit else service
+                for service in services
+            ],
         )
-        await utils.answer(message, self.strings("unit_renamed").format(unit, name))
+        await utils.answer(
+            message,
+            self.strings("unit_renamed").format(
+                utils.escape_html(unit), utils.escape_html(name)
+            ),
+        )

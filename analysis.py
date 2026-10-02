@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 1.1.0
+# meta version: 1.2.0
 # meta description: 📈 Повний аналіз повідомлень у поточному чаті за командою !аналіз.
 
 import time
@@ -86,6 +86,7 @@ class ChatAnalysisMod(loader.Module):
             side = "me" if getattr(msg, "out", False) or msg.sender_id == self._me.id else "others"
             self._add_message(stats[side], msg)
             self._add_message(stats["all"], msg)
+            self._add_sender(stats, msg)
 
         if stats["all"]["total"] == 0:
             return self.strings["empty"]
@@ -97,7 +98,29 @@ class ChatAnalysisMod(loader.Module):
             "me": self._new_bucket(),
             "others": self._new_bucket(),
             "all": self._new_bucket(),
+            "senders": defaultdict(int),
+            "names": {},
         }
+
+    @staticmethod
+    def _sender_name(msg):
+        sender = getattr(msg, "sender", None)
+        if sender is None:
+            return None
+        name = getattr(sender, "title", None) or " ".join(
+            filter(None, [getattr(sender, "first_name", None), getattr(sender, "last_name", None)])
+        )
+        return name or None
+
+    def _add_sender(self, stats, msg):
+        sender_id = getattr(msg, "sender_id", None)
+        if sender_id is None or getattr(msg, "action", None):
+            return
+        stats["senders"][sender_id] += 1
+        if sender_id not in stats["names"]:
+            name = self._sender_name(msg)
+            if name:
+                stats["names"][sender_id] = name
 
     @staticmethod
     def _new_bucket():
@@ -112,6 +135,7 @@ class ChatAnalysisMod(loader.Module):
             "weekdays": [0] * 7,
             "weeks": defaultdict(int),
             "months": defaultdict(int),
+            "days": defaultdict(int),
         }
 
     @staticmethod
@@ -132,6 +156,7 @@ class ChatAnalysisMod(loader.Module):
         bucket["weekdays"][dt.weekday()] += 1
         bucket["weeks"][week_key] += 1
         bucket["months"][month_key] += 1
+        bucket["days"][dt.strftime("%Y-%m-%d")] += 1
 
         if getattr(msg, "action", None):
             bucket["service"] += 1
@@ -166,9 +191,11 @@ class ChatAnalysisMod(loader.Module):
             f"📌 <b>Тип:</b> {chat_type}",
             f"🧮 <b>Усього повідомлень:</b> {total}",
             f"🗓 <b>Період:</b> {self._range(stats['all'])}",
+            self._format_daily(stats["all"]),
             "",
             self._format_side("🙋 Мої повідомлення", stats["me"], total),
             self._format_side("👥 Повідомлення інших", stats["others"], total),
+            self._format_participants(stats),
             self._format_activity("⏰ Активність по годинах", stats),
             self._format_top_map("📅 Найактивніші тижні", stats),
             self._format_top_map("🗓 Найактивніші місяці", stats, key="months"),
@@ -189,6 +216,34 @@ class ChatAnalysisMod(loader.Module):
             f"• Пікова година: <b>{self._peak_hour(bucket['hours'])}</b>\n"
             f"• Найактивніший день: <b>{self._peak_weekday(bucket['weekdays'])}</b>"
         )
+
+    @staticmethod
+    def _format_daily(bucket):
+        days = bucket["days"]
+        if not days:
+            return ""
+        busiest, count = max(days.items(), key=lambda item: item[1])
+        span = (bucket["last"].date() - bucket["first"].date()).days + 1
+        return (
+            f"📊 <b>У середньому:</b> {bucket['total'] / max(1, span):.1f} на день "
+            f"(активних днів: {len(days)} з {span})\n"
+            f"🏆 <b>Найактивніший день:</b> <code>{busiest}</code> — {count}"
+        )
+
+    def _format_participants(self, stats):
+        senders = stats["senders"]
+        if len(senders) < 3:  # a private chat: "me vs others" already covers it
+            return ""
+        top = sorted(senders.items(), key=lambda item: item[1], reverse=True)
+        total = sum(senders.values()) or 1
+        rows = [f"<b>👥 Найактивніші учасники</b> (усього: {len(senders)})"]
+        for index, (sender_id, count) in enumerate(top[: self.config["top_limit"]], 1):
+            name = "Я" if sender_id == self._me.id else stats["names"].get(sender_id, "Без імені")
+            # Names only: no links or IDs, so the report can be shared safely.
+            rows.append(
+                f"{index}. {utils.escape_html(name[:40])} — <b>{count}</b> ({count / total * 100:.1f}%)"
+            )
+        return "\n".join(rows)
 
     def _format_activity(self, title, stats):
         active_hours = [(h, stats["all"]["hours"][h], stats["me"]["hours"][h], stats["others"]["hours"][h]) for h in range(24) if stats["all"]["hours"][h]]

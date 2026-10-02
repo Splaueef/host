@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 3.4.1
+# meta version: 3.4.2
 # meta description: 🧭 Центр команд, автооновлення та синхронізація статистики Hikka.
 # scope: inline
 # scope: hikka_only
@@ -323,6 +323,7 @@ class ModuleHubMod(loader.Module):
         "vdlstats",
         "vdlhelp",
         "newsstatus",
+        "newslist",
         "newsrun",
         "newstoday",
         "newsyesterday",
@@ -401,6 +402,8 @@ class ModuleHubMod(loader.Module):
         "onlinestatus",
         "sysinfo",
         "time",
+        "worldtime",
+        "gmstatus",
         "timezone",
         "timestamp",
         "uptime",
