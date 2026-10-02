@@ -216,10 +216,6 @@ class NekoSpy(loader.Module):
         "chat": f"{groups} <b>Sto tracciando i messaggi nei gruppi</b>\n",
         "pm": f"{pm} <b>Sto tracciando i messaggi nei messaggi privati</b>\n",
         "deleted_pm": (
-            '🗑 <b><a href="{}">{}</a> ha cancellato <a href="{message_url}">il'
-            " messaggio</a> in privato. Contenuto:</b>\n{}"
-        ),
-        "deleted_pm": (
             '🗑 <b><a href="{}">{}</a> ha eliminato <a'
             ' href="{message_url}">un messaggio</a> in privato. Contenuto:</b>\n{}'
         ),

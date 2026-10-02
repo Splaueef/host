@@ -1,5 +1,5 @@
 #             █ █ ▀ █▄▀ ▄▀█ █▀█ ▀
-# meta version: 1.0.0
+# meta version: 1.1.0
 #             █▀█ █ █ █ █▀█ █▀▄ █
 #              © Copyright 2022
 #           https://t.me/hikariatama
@@ -19,6 +19,7 @@
 # scope: inline
 # scope: hikka_only
 
+import logging
 import re
 
 import requests as rqsts
@@ -26,6 +27,8 @@ from telethon.tl.types import Message
 
 from .. import loader, utils
 from ..inline.types import InlineCall
+
+logger = logging.getLogger(__name__)
 
 
 def get_message(i: dict) -> str:
@@ -43,12 +46,21 @@ def get_message(i: dict) -> str:
 class TeledocsMod(loader.Module):
     """Telethon docs in your pocket"""
 
-    strings = {"name": "Teledocs"}
+    strings = {
+        "name": "Teledocs",
+        "usage": "ℹ️ <b>Використання:</b> <code>{}tl SendMessageRequest</code>",
+        "not_found": "🔎 <b>Нічого не знайдено за запитом</b> <code>{}</code>",
+        "unavailable": "⚠️ <b>Документацію Telethon зараз не вдалося завантажити.</b>",
+    }
+
+    _tl = None
 
     @staticmethod
     def _find(haystack: list, needle: str):
         if needle in haystack:
             return 0
+        if not haystack or not needle:
+            return -1
 
         haystack_index, needle_index, penalty, started = 0, 0, 0, False
         while True:
@@ -119,6 +131,11 @@ class TeledocsMod(loader.Module):
         )
 
     def search(self, query: str):
+        if not self._tl:
+            return []
+        query = (query or "").strip().lower()
+        if not query:
+            return []
         found_requests = self._get_search_array(
             self._tl["requests"],
             self._tl["requests_urls"],
@@ -134,15 +151,6 @@ class TeledocsMod(loader.Module):
             self._tl["constructors_urls"],
             query,
         )
-        original = self._tl["requests"] + self._tl["constructors"]
-        original_urls = self._tl["requests_urls"] + self._tl["constructors_urls"]
-        destination = []
-        destination_urls = []
-        for item, link in zip(original, original_urls):
-            if item.lower().replace("request", "") == query:
-                destination += [item]
-                destination_urls += [link]
-
         return (
             self._build_list(found_requests, True)
             + self._build_list(found_types)
@@ -150,15 +158,28 @@ class TeledocsMod(loader.Module):
         )
 
     async def client_ready(self, client, db):
-        self._tl = (
-            await utils.run_sync(
+        await self._load_docs()
+
+    async def _load_docs(self):
+        """Download the docs index; failures must not break module loading."""
+        if self._tl:
+            return True
+        try:
+            response = await utils.run_sync(
                 rqsts.get,
                 "https://github.com/hikariatama/assets/raw/master/tl_docs.json",
+                timeout=30,
             )
-        ).json()
+            response.raise_for_status()
+            self._tl = response.json()
+        except Exception:
+            logger.exception("Teledocs: cannot download Telethon docs index")
+            self._tl = None
+        return bool(self._tl)
 
     @loader.inline_everyone
     async def tl_inline_handler(self, query: InlineCall):
+        await self._load_docs()
         return [
             {
                 "title": i["result"],
@@ -171,7 +192,17 @@ class TeledocsMod(loader.Module):
 
     async def tlcmd(self, message: Message):
         """<ref> - Return telethon reference"""
-        await utils.answer(
-            message,
-            get_message(self.search(utils.get_args_raw(message))[0]),
-        )
+        query = utils.get_args_raw(message).strip()
+        if not query:
+            return await utils.answer(
+                message,
+                self.strings["usage"].format(utils.escape_html(self.get_prefix())),
+            )
+        if not await self._load_docs():
+            return await utils.answer(message, self.strings["unavailable"])
+        results = self.search(query)
+        if not results:
+            return await utils.answer(
+                message, self.strings["not_found"].format(utils.escape_html(query))
+            )
+        await utils.answer(message, get_message(results[0]))

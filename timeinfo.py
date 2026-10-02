@@ -1,5 +1,5 @@
 # meta developer: @Codex
-# meta version: 1.0.0
+# meta version: 1.0.1
 # meta description: Точний час VPS, час Hikka, UTC, Unix timestamp і аптайм модуля.
 
 import datetime
@@ -87,7 +87,7 @@ class TimeInfoMod(loader.Module):
         self._started_at = time.monotonic()
 
     def _hikka_timezone(self):
-        return ZoneInfo(self.config["timezone"])
+        return ZoneInfo(str(self.config["timezone"]).strip())
 
     @staticmethod
     def _render_time(value):
@@ -97,7 +97,7 @@ class TimeInfoMod(loader.Module):
         """Показати точний час VPS, Hikka, UTC, Unix timestamp та аптайм"""
         try:
             hikka_tz = self._hikka_timezone()
-        except ZoneInfoNotFoundError:
+        except (ZoneInfoNotFoundError, ValueError):
             return await utils.answer(
                 message,
                 self.strings("bad_timezone", message).format(
@@ -126,7 +126,7 @@ class TimeInfoMod(loader.Module):
         zone_name = requested or str(self.config["timezone"])
         try:
             zone = ZoneInfo(zone_name)
-        except ZoneInfoNotFoundError:
+        except (ZoneInfoNotFoundError, ValueError):
             return await utils.answer(
                 message,
                 self.strings("bad_timezone", message).format(
@@ -135,7 +135,7 @@ class TimeInfoMod(loader.Module):
             )
 
         if requested:
-            self.config["timezone"] = requested
+            self.config["timezone"] = zone_name
             return await utils.answer(
                 message,
                 self.strings("timezone_set", message).format(

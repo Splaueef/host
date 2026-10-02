@@ -1,13 +1,15 @@
 # meta developer: @Huang_Baike
-# meta version: 1.0.0
+# meta version: 1.1.0
 # meta description: Планувальник тиші: вимикає сповіщення та/або архівує чати за розкладом.
 
 import datetime
 import logging
+import re
 import time
 import uuid
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from telethon import utils as telethon_utils
 from telethon.errors import RPCError
 from telethon.tl.functions.account import UpdateNotifySettingsRequest
 from telethon.tl.types import InputNotifyPeer, InputPeerNotifySettings
@@ -71,8 +73,8 @@ class QuietScheduleMod(loader.Module):
 
     def _tz(self):
         try:
-            return ZoneInfo(self.config["timezone"])
-        except ZoneInfoNotFoundError:
+            return ZoneInfo(str(self.config["timezone"]).strip())
+        except (ZoneInfoNotFoundError, ValueError):
             return ZoneInfo("UTC")
 
     def _now(self):
@@ -90,7 +92,23 @@ class QuietScheduleMod(loader.Module):
     @staticmethod
     def _weekdays(value):
         names = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
-        return [names[item.strip().lower()] for item in value.split(",") if item.strip()]
+        days = []
+        for item in value.split(","):
+            item = item.strip().lower()
+            if not item:
+                continue
+            if item not in names:
+                raise ValueError(f"невідомий день тижня: {item}")
+            if names[item] not in days:
+                days.append(names[item])
+        if not days:
+            raise ValueError("не вказано днів тижня")
+        return days
+
+    @classmethod
+    def _checked_time(cls, value):
+        cls._parse_time(value)
+        return value
 
     def _actions(self, tokens):
         acts = {"mute": self.config["default_mute"], "archive": self.config["default_archive"]}
@@ -100,7 +118,28 @@ class QuietScheduleMod(loader.Module):
 
     async def _entity_id(self, message, token):
         entity = await message.client.get_entity(token)
-        return utils.get_entity_url(entity) or str(getattr(entity, "id", token)), entity
+        return telethon_utils.get_peer_id(entity), entity
+
+    @staticmethod
+    def _peer_ref(peer):
+        """Convert a stored peer into a value Telethon's ``get_entity`` accepts.
+
+        Older versions stored ``tg://user?id=…`` / ``tg://resolve?domain=…``
+        links, which Telethon cannot resolve, so such jobs never applied.
+        """
+        if isinstance(peer, int):
+            return peer
+        text = str(peer).strip()
+        match = re.fullmatch(r"tg://user\?id=(-?\d+)", text)
+        if match:
+            return int(match.group(1))
+        match = re.fullmatch(r"tg://resolve\?domain=([A-Za-z0-9_]+)", text)
+        if match:
+            return match.group(1)
+        try:
+            return int(text)
+        except ValueError:
+            return text
 
     def _describe(self, job):
         actions = ", ".join(k for k in ("mute", "archive") if job.get(k)) or "нічого"
@@ -111,7 +150,8 @@ class QuietScheduleMod(loader.Module):
         else:
             days = ",".join(["mon", "tue", "wed", "thu", "fri", "sat", "sun"][d] for d in job["weekdays"])
             period = f"weekly {days} {job['start_time']} → {job['end_time']}"
-        return f"{job['id']} | {job['peer']} | {period} | {actions} | active={job.get('active', False)}"
+        target = job.get("title") or job["peer"]
+        return f"{job['id']} | {target} | {period} | {actions} | active={job.get('active', False)}"
 
     def _active_now(self, job, now):
         if job["type"] == "once":
@@ -133,12 +173,12 @@ class QuietScheduleMod(loader.Module):
         return current, False
 
     async def _set_mute(self, peer, mute):
-        entity = await self._client.get_entity(peer)
+        entity = await self._client.get_entity(self._peer_ref(peer))
         until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=366) if mute else None
         await self._client(UpdateNotifySettingsRequest(InputNotifyPeer(entity), InputPeerNotifySettings(mute_until=until)))
 
     async def _set_archive(self, peer, archive):
-        entity = await self._client.get_entity(peer)
+        entity = await self._client.get_entity(self._peer_ref(peer))
         await self._client.edit_folder(entity, folder=1 if archive else 0)
 
     async def _apply(self, job, active):
@@ -161,16 +201,16 @@ class QuietScheduleMod(loader.Module):
                 if expired and not active:
                     jobs.remove(job)
                     changed = True
-            except (ValueError, RPCError, TypeError) as e:
-                logger.warning("QuietSchedule job failed: %s", e)
+            except Exception as e:  # one broken job must not stop the others
+                logger.warning("QuietSchedule job %s failed: %s", job.get("id"), e)
         if changed:
             self.set("jobs", jobs)
 
     async def qnowcmd(self, message):
         """Показати точну дату та час у налаштованій таймзоні"""
         try:
-            now = datetime.datetime.now(ZoneInfo(self.config["timezone"])).strftime("%Y-%m-%d %H:%M:%S %Z")
-        except ZoneInfoNotFoundError:
+            now = datetime.datetime.now(ZoneInfo(str(self.config["timezone"]).strip())).strftime("%Y-%m-%d %H:%M:%S %Z")
+        except (ZoneInfoNotFoundError, ValueError):
             return await utils.answer(message, self.strings("bad_tz", message).format(utils.escape_html(self.config["timezone"])))
         await utils.answer(message, self.strings("now", message).format(now, utils.escape_html(self.config["timezone"])))
 
@@ -187,11 +227,17 @@ class QuietScheduleMod(loader.Module):
             peer, entity = await self._entity_id(message, args[0])
             tz = self._tz()
             mode = args[1].lower()
-            job = {"id": uuid.uuid4().hex[:8], "peer": peer, "active": False}
+            # Plain text: _describe() output is HTML-escaped where it is shown.
+            title = (
+                getattr(entity, "title", None)
+                or " ".join(filter(None, [getattr(entity, "first_name", None), getattr(entity, "last_name", None)]))
+                or str(peer)
+            )
+            job = {"id": uuid.uuid4().hex[:8], "peer": peer, "title": title, "active": False}
             if mode == "daily":
-                job.update({"type": "daily", "start_time": args[2], "end_time": args[3], **self._actions(args[4:])})
+                job.update({"type": "daily", "start_time": self._checked_time(args[2]), "end_time": self._checked_time(args[3]), **self._actions(args[4:])})
             elif mode == "weekly":
-                job.update({"type": "weekly", "weekdays": self._weekdays(args[2]), "start_time": args[3], "end_time": args[4], **self._actions(args[5:])})
+                job.update({"type": "weekly", "weekdays": self._weekdays(args[2]), "start_time": self._checked_time(args[3]), "end_time": self._checked_time(args[4]), **self._actions(args[5:])})
             else:
                 start = self._parse_dt(args[1], args[2], tz)
                 end = self._parse_dt(args[3], args[4], tz)
