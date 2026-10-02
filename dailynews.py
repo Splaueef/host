@@ -1,5 +1,5 @@
 # meta developer: @Codex
-# meta version: 2.2.0
+# meta version: 2.3.0
 # meta description: Два AI-дайджести на день без повторів у форматі Telegram Rich Text.
 
 import asyncio
@@ -82,6 +82,13 @@ class DailyNewsMod(loader.Module):
             "Підтримуються нові рядки, пробіли, коми та крапки з комою."
         ),
         "sources_added": "✅ <b>Додано каналів:</b> {}\n<b>Усього джерел:</b> {}{}",
+        "sources_list": "📚 <b>Джерела DailyNews ({}):</b>\n{}",
+        "sources_empty": "📭 <b>Список джерел порожній.</b> Додай канали командою <code>{}newsadd</code>.",
+        "sources_removed": "🗑 <b>Видалено каналів:</b> {}\n<b>Залишилось джерел:</b> {}",
+        "sources_remove_usage": (
+            "❌ <b>Вкажи канали або номери зі списку</b> <code>{}newslist</code>.\n"
+            "Приклад: <code>{}newsdel @channel 3</code>"
+        ),
         "status": (
             "📰 <b>DailyNews</b>\n\n"
             "Джерела: <b>{sources}</b>\n"
@@ -460,7 +467,8 @@ class DailyNewsMod(loader.Module):
         finally:
             self._running = False
 
-    async def newsruncmd(self, message):
+    @loader.command()
+    async def newsrun(self, message):
         """Негайно зібрати та опублікувати дайджест"""
         missing = self._missing_config()
         if missing:
@@ -479,7 +487,8 @@ class DailyNewsMod(loader.Module):
                 message, self.strings("failed", message).format(html.escape(str(error)[:500]))
             )
 
-    async def newsstatuscmd(self, message):
+    @loader.command()
+    async def newsstatus(self, message):
         """Показати стан та розклад DailyNews"""
         try:
             times = ", ".join(slot.strftime("%H:%M") for slot in self._publish_times())
@@ -506,7 +515,8 @@ class DailyNewsMod(loader.Module):
             return False
         return True
 
-    async def newstodaycmd(self, message):
+    @loader.command()
+    async def newstoday(self, message):
         """Примусово зібрати новини від початку сьогоднішнього дня до цієї миті"""
         if not await self._check_period_config(message):
             return
@@ -514,7 +524,8 @@ class DailyNewsMod(loader.Module):
         since = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         await self._run_period(message, since, now_local, "today")
 
-    async def newsyesterdaycmd(self, message):
+    @loader.command()
+    async def newsyesterday(self, message):
         """Зібрати та опублікувати новини за вчорашній календарний день"""
         if not await self._check_period_config(message):
             return
@@ -523,7 +534,8 @@ class DailyNewsMod(loader.Module):
         )
         await self._run_period(message, today - datetime.timedelta(days=1), today, "yesterday")
 
-    async def newsweekcmd(self, message):
+    @loader.command()
+    async def newsweek(self, message):
         """Зібрати та опублікувати новини за останні сім календарних днів"""
         if not await self._check_period_config(message):
             return
@@ -533,7 +545,8 @@ class DailyNewsMod(loader.Module):
         )
         await self._run_period(message, since, now_local, "week")
 
-    async def newscomparecmd(self, message):
+    @loader.command()
+    async def newscompare(self, message):
         """Знайти повторення новин між каналами за останні 2 дні"""
         missing = [
             key for key in ("sources", "api_key", "agent_id")
@@ -608,7 +621,8 @@ class DailyNewsMod(loader.Module):
                 message, self.strings("failed", message).format(html.escape(str(error)[:500]))
             )
 
-    async def newsaddcmd(self, message):
+    @loader.command()
+    async def newsadd(self, message):
         """Додати одразу список каналів (аргументи або текст повідомлення у відповіді)"""
         raw = utils.get_args_raw(message).strip()
         if not raw:
@@ -638,7 +652,55 @@ class DailyNewsMod(loader.Module):
             ),
         )
 
-    async def newsresetcmd(self, message):
+    @loader.command()
+    async def newslist(self, message):
+        """Показати список каналів-джерел з номерами"""
+        sources = self._sources()
+        if not sources:
+            return await utils.answer(
+                message,
+                self.strings("sources_empty", message).format(html.escape(self.get_prefix())),
+            )
+        lines = "\n".join(
+            f"{index}. <code>{html.escape(source)}</code>"
+            for index, source in enumerate(sources, 1)
+        )
+        await utils.answer(
+            message, self.strings("sources_list", message).format(len(sources), lines)
+        )
+
+    @loader.command()
+    async def newsdel(self, message):
+        """Видалити канали зі списку джерел: .newsdel @channel 3"""
+        prefix = html.escape(self.get_prefix())
+        tokens = self._parse_sources(utils.get_args_raw(message))
+        current = self._sources()
+        if not tokens:
+            return await utils.answer(
+                message,
+                self.strings("sources_remove_usage", message).format(prefix, prefix),
+            )
+
+        def normalized(value):
+            return value.lstrip("@").casefold()
+
+        to_remove = set()
+        for token in tokens:
+            if token.isdigit() and 1 <= int(token) <= len(current):
+                to_remove.add(current[int(token) - 1])
+                continue
+            to_remove.update(
+                source for source in current if normalized(source) == normalized(token)
+            )
+        remaining = [source for source in current if source not in to_remove]
+        self.config["sources"] = ",".join(remaining)
+        await utils.answer(
+            message,
+            self.strings("sources_removed", message).format(len(to_remove), len(remaining)),
+        )
+
+    @loader.command()
+    async def newsreset(self, message):
         """Скинути стан автозапусків і повторів за поточний день"""
         self.set("last_run", None)
         self.set("completed_slots", {})

@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 2.1.0
+# meta version: 2.2.0
 # meta description: 📊 Статистика вашої активності в Telegram — повідомлення, чати, піки по годинах.
 
 import datetime
@@ -696,6 +696,62 @@ class DailyStatMod(loader.Module):
         ]
         return matches[0] if len(matches) == 1 else None
 
+    PERIOD_DAYS = {"today": 1, "week": 7, "month": 30}
+
+    def _previous_data(self, period, end=None):
+        """Counters for the same-length period right before the current one."""
+        days = self.PERIOD_DAYS.get(period, 1)
+        end = end or datetime.date.today()
+        return self._merge_days(
+            self._last_keys(days, end - datetime.timedelta(days=days))
+        )
+
+    def _streak(self, end=None) -> int:
+        """Consecutive days (up to today or yesterday) with sent messages."""
+        day = end or datetime.date.today()
+        if not self._get_day(day.isoformat())["sent"]:
+            day -= datetime.timedelta(days=1)
+        streak = 0
+        stats = self.get("stats", {})
+        while isinstance(stats, dict) and day.isoformat() in stats:
+            if not self._get_day(day.isoformat())["sent"]:
+                break
+            streak += 1
+            day -= datetime.timedelta(days=1)
+        return streak
+
+    @staticmethod
+    def _delta(current: int, previous: int) -> str:
+        if not previous:
+            return "нове" if current else "без змін"
+        change = round((current - previous) / previous * 100)
+        if change == 0:
+            return "без змін"
+        return f"{'📈 +' if change > 0 else '📉 '}{change}%"
+
+    def _trend_text(self, data, previous, period_name) -> str:
+        if previous is None:
+            return ""
+        current_total = data["sent"] + data["received"]
+        previous_total = previous["sent"] + previous["received"]
+        text = (
+            f"\n🔁 <b>Порівняно з {period_name}</b>\n"
+            f"├ 📤 Надіслано: <b>{self._delta(data['sent'], previous['sent'])}</b>"
+            f" <i>(було {previous['sent']})</i>\n"
+            f"└ 📊 Разом: <b>{self._delta(current_total, previous_total)}</b>"
+            f" <i>(було {previous_total})</i>\n"
+        )
+        streak = self._streak()
+        if streak > 1:
+            text += f"🔥 Серія активних днів: <b>{streak}</b>\n"
+        return text
+
+    PREVIOUS_NAMES = {
+        "today": "вчора",
+        "week": "попередніми 7 днями",
+        "month": "попередніми 30 днями",
+    }
+
     def _period_data(self, period):
         if period == "week":
             return self._merge_days(self._week_keys()), "останні 7 днів", 7
@@ -763,10 +819,14 @@ class DailyStatMod(loader.Module):
             return self.strings["stat_header"].format(period=label) + (
                 self._format_peak(data) or self.strings["no_data"]
             )
-        return self._summary_text(data, label, days)
+        return self._summary_text(data, label, days, period)
 
-    def _summary_text(self, data, label, days=1) -> str:
+    def _summary_text(self, data, label, days=1, period=None) -> str:
         text = self._format_stat(data, label, days=days)
+        if period in self.PREVIOUS_NAMES:
+            text += self._trend_text(
+                data, self._previous_data(period), self.PREVIOUS_NAMES[period]
+            )
         text += self._format_senders(data, self.config["top_count"])
         text += self._format_top(data, self.config["top_count"])
         return text
@@ -1025,7 +1085,7 @@ class DailyStatMod(loader.Module):
         data, label, days = self._period_data(period)
         if data["sent"] == 0 and data["received"] == 0:
             return await utils.answer(message, self.strings["no_data"])
-        await utils.answer(message, self._summary_text(data, label, days))
+        await utils.answer(message, self._summary_text(data, label, days, period))
 
     async def _ds_today(self, message):
         await self._send_period(message, "today")

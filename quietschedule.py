@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 1.1.0
+# meta version: 1.2.0
 # meta description: Планувальник тиші: вимикає сповіщення та/або архівує чати за розкладом.
 
 import datetime
@@ -37,7 +37,9 @@ class QuietScheduleMod(loader.Module):
             "<code>.qadd @user 2026-07-11 22:00 2026-07-12 08:00 mute archive</code> — разово.\n"
             "<code>.qadd @user daily 22:00 08:00 mute archive</code> — щодня.\n"
             "<code>.qadd @user weekly mon,wed,fri 22:00 08:00 mute</code> — щотижня.\n"
+            "<code>.qadd @user for 2h30m mute</code> — тиша на певний час від зараз.\n"
             "<code>.qlist</code> — список.\n"
+            "<code>.qpause id</code> / <code>.qresume id</code> — призупинити / відновити.\n"
             "<code>.qdel id</code> — видалити.\n\n"
             "Дії можна не вказувати — будуть використані значення з конфігу."
         ),
@@ -47,6 +49,8 @@ class QuietScheduleMod(loader.Module):
         "empty": "📭 <b>Розкладів немає.</b>",
         "list_header": "📋 <b>QuietSchedule:</b>\n\n{}",
         "bad_args": "❌ <b>Не можу розібрати аргументи.</b>\n\n{}",
+        "paused": "⏸ <b>Розклад призупинено:</b> <code>{}</code>",
+        "resumed": "▶️ <b>Розклад відновлено:</b> <code>{}</code>",
     }
 
     def __init__(self):
@@ -105,6 +109,18 @@ class QuietScheduleMod(loader.Module):
             raise ValueError("не вказано днів тижня")
         return days
 
+    @staticmethod
+    def _parse_duration(value):
+        """Parse durations like ``90m``, ``2h``, ``1h30m`` or ``1d``."""
+        parts = re.findall(r"(\d+)\s*([dhm])", value.lower())
+        if not parts or re.sub(r"(\d+)\s*([dhm])", "", value.lower()).strip():
+            raise ValueError(f"некоректна тривалість: {value}")
+        units = {"d": 86400, "h": 3600, "m": 60}
+        seconds = sum(int(amount) * units[unit] for amount, unit in parts)
+        if not 60 <= seconds <= 366 * 86400:
+            raise ValueError("тривалість має бути від 1 хвилини до 366 днів")
+        return datetime.timedelta(seconds=seconds)
+
     @classmethod
     def _checked_time(cls, value):
         cls._parse_time(value)
@@ -151,7 +167,8 @@ class QuietScheduleMod(loader.Module):
             days = ",".join(["mon", "tue", "wed", "thu", "fri", "sat", "sun"][d] for d in job["weekdays"])
             period = f"weekly {days} {job['start_time']} → {job['end_time']}"
         target = job.get("title") or job["peer"]
-        return f"{job['id']} | {target} | {period} | {actions} | active={job.get('active', False)}"
+        state = "paused" if job.get("paused") else f"active={job.get('active', False)}"
+        return f"{job['id']} | {target} | {period} | {actions} | {state}"
 
     def _active_now(self, job, now):
         if job["type"] == "once":
@@ -195,6 +212,8 @@ class QuietScheduleMod(loader.Module):
         for job in list(jobs):
             try:
                 active, expired = self._active_now(job, now)
+                if job.get("paused"):
+                    active = False
                 if active != job.get("active", False):
                     await self._apply(job, active)
                     changed = True
@@ -206,7 +225,8 @@ class QuietScheduleMod(loader.Module):
         if changed:
             self.set("jobs", jobs)
 
-    async def qnowcmd(self, message):
+    @loader.command()
+    async def qnow(self, message):
         """Показати точну дату та час у налаштованій таймзоні"""
         try:
             now = datetime.datetime.now(ZoneInfo(str(self.config["timezone"]).strip())).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -214,14 +234,16 @@ class QuietScheduleMod(loader.Module):
             return await utils.answer(message, self.strings("bad_tz", message).format(utils.escape_html(self.config["timezone"])))
         await utils.answer(message, self.strings("now", message).format(now, utils.escape_html(self.config["timezone"])))
 
-    async def qhelpcmd(self, message):
+    @loader.command()
+    async def qhelp(self, message):
         """Довідка QuietSchedule"""
         await utils.answer(message, self.strings("help", message))
 
-    async def qaddcmd(self, message):
+    @loader.command()
+    async def qadd(self, message):
         """Додати розклад: .qadd @user ..."""
         args = utils.get_args(message)
-        if len(args) < 4:
+        if len(args) < 3:
             return await utils.answer(message, self.strings("bad_args", message).format(self.strings("help", message)))
         try:
             peer, entity = await self._entity_id(message, args[0])
@@ -236,6 +258,10 @@ class QuietScheduleMod(loader.Module):
             job = {"id": uuid.uuid4().hex[:8], "peer": peer, "title": title, "active": False}
             if mode == "daily":
                 job.update({"type": "daily", "start_time": self._checked_time(args[2]), "end_time": self._checked_time(args[3]), **self._actions(args[4:])})
+            elif mode == "for":
+                start = self._now()
+                end = start + self._parse_duration(args[2])
+                job.update({"type": "once", "start": start.isoformat(), "end": end.isoformat(), **self._actions(args[3:])})
             elif mode == "weekly":
                 job.update({"type": "weekly", "weekdays": self._weekdays(args[2]), "start_time": self._checked_time(args[3]), "end_time": self._checked_time(args[4]), **self._actions(args[5:])})
             else:
@@ -254,7 +280,8 @@ class QuietScheduleMod(loader.Module):
         except (IndexError, ValueError, ZoneInfoNotFoundError, RPCError) as e:
             await utils.answer(message, self.strings("bad_args", message).format(utils.escape_html(str(e)) + "\n\n" + self.strings("help", message)))
 
-    async def qlistcmd(self, message):
+    @loader.command()
+    async def qlist(self, message):
         """Показати всі розклади"""
         jobs = self.get("jobs", [])
         if not jobs:
@@ -262,7 +289,8 @@ class QuietScheduleMod(loader.Module):
         text = "\n".join(f"<code>{utils.escape_html(self._describe(job))}</code>" for job in jobs)
         await utils.answer(message, self.strings("list_header", message).format(text))
 
-    async def qdelcmd(self, message):
+    @loader.command()
+    async def qdel(self, message):
         """Видалити розклад за id"""
         job_id = utils.get_args_raw(message).strip()
         jobs = self.get("jobs", [])
@@ -274,3 +302,25 @@ class QuietScheduleMod(loader.Module):
                 self.set("jobs", jobs)
                 return await utils.answer(message, self.strings("removed", message).format(utils.escape_html(job_id)))
         await utils.answer(message, self.strings("not_found", message).format(utils.escape_html(job_id)))
+
+    async def _set_paused(self, message, paused):
+        job_id = utils.get_args_raw(message).strip()
+        jobs = self.get("jobs", [])
+        for job in jobs:
+            if job["id"] == job_id:
+                job["paused"] = paused
+                self.set("jobs", jobs)
+                await self._process_jobs()
+                key = "paused" if paused else "resumed"
+                return await utils.answer(message, self.strings(key, message).format(utils.escape_html(job_id)))
+        await utils.answer(message, self.strings("not_found", message).format(utils.escape_html(job_id)))
+
+    @loader.command()
+    async def qpause(self, message):
+        """Призупинити розклад за id (звук і архів повертаються)"""
+        await self._set_paused(message, True)
+
+    @loader.command()
+    async def qresume(self, message):
+        """Відновити призупинений розклад за id"""
+        await self._set_paused(message, False)

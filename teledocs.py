@@ -190,7 +190,8 @@ class TeledocsMod(loader.Module):
             if i["description"][0]
         ][:50]
 
-    async def tlcmd(self, message: Message):
+    @loader.command()
+    async def tl(self, message: Message):
         """<ref> - Return telethon reference"""
         query = utils.get_args_raw(message).strip()
         if not query:

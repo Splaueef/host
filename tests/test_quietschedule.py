@@ -39,6 +39,7 @@ def _load_module():
         return cls
 
     loader.tds = tds
+    loader.command = lambda *args, **kwargs: (lambda value: value)
     loader.loop = lambda *args, **kwargs: (lambda value: value)
     loader.ConfigValue = lambda name, default, *args, **kwargs: (name, default)
     loader.ModuleConfig = _Config
@@ -121,12 +122,12 @@ class QuietScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.module._client = None  # keep _process_jobs from touching Telegram
 
         bad = types.SimpleNamespace(client=client, args=["@a", "daily", "25:00", "08:00"])
-        await self.module.qaddcmd(bad)
+        await self.module.qadd(bad)
         self.assertEqual(self.module.get("jobs", []), [])
 
         self.module._process_jobs = mock.AsyncMock()
         good = types.SimpleNamespace(client=client, args=["@a", "daily", "22:00", "08:00"])
-        await self.module.qaddcmd(good)
+        await self.module.qadd(good)
         (job,) = self.module.get("jobs")
         self.assertEqual(job["peer"], 77)
         self.assertEqual(job["title"], "Alice")
@@ -138,6 +139,50 @@ class QuietScheduleTests(unittest.IsolatedAsyncioTestCase):
         noon = datetime.datetime(2026, 10, 1, 12, 0, tzinfo=tz)
         self.assertEqual(self.module._active_now(job, late), (True, False))
         self.assertEqual(self.module._active_now(job, noon), (False, False))
+
+    def test_duration_parser(self):
+        parse = self.module._parse_duration
+        self.assertEqual(parse("1h30m"), datetime.timedelta(minutes=90))
+        self.assertEqual(parse("2d"), datetime.timedelta(days=2))
+        for bad in ("abc", "10", "0m", "5x", "400d"):
+            with self.assertRaises(ValueError):
+                parse(bad)
+
+    async def test_for_mode_creates_active_once_job(self):
+        user = types.SimpleNamespace(id=5, first_name="Bob", last_name=None)
+        client = types.SimpleNamespace(get_entity=mock.AsyncMock(return_value=user))
+        self.module._client = None
+        self.module.config.update({"default_mute": True, "default_archive": False})
+        self.module._apply = mock.AsyncMock()
+
+        await self.module.qadd(types.SimpleNamespace(client=client, args=["@b", "for", "2h"]))
+
+        (job,) = self.module.get("jobs")
+        self.assertEqual(job["type"], "once")
+        start = datetime.datetime.fromisoformat(job["start"])
+        end = datetime.datetime.fromisoformat(job["end"])
+        self.assertEqual(end - start, datetime.timedelta(hours=2))
+        self.module._apply.assert_awaited_once_with(job, True)
+
+    async def test_paused_job_is_deactivated_and_resumed(self):
+        job = {"id": "abc", "peer": 1, "type": "daily", "start_time": "00:00",
+               "end_time": "23:59", "mute": True, "active": True}
+        self.module.set("jobs", [job])
+
+        async def apply(target, active):
+            target["active"] = active
+
+        self.module._apply = mock.AsyncMock(side_effect=apply)
+        self.module._now = lambda: datetime.datetime(2026, 10, 1, 12, 0)
+
+        await self.module.qpause(types.SimpleNamespace(args=["abc"]))
+        self.assertTrue(job["paused"])
+        self.assertFalse(job["active"])
+        self.assertIn("paused", self.module._describe(job))
+
+        await self.module.qresume(types.SimpleNamespace(args=["abc"]))
+        self.assertFalse(job["paused"])
+        self.assertTrue(job["active"])
 
 
 if __name__ == "__main__":

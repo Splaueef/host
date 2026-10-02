@@ -1,8 +1,9 @@
 # meta developer: @Codex
-# meta version: 1.0.1
+# meta version: 1.1.0
 # meta description: Точний час VPS, час Hikka, UTC, Unix timestamp і аптайм модуля.
 
 import datetime
+import re
 import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -74,6 +75,9 @@ class TimeInfoMod(loader.Module):
             "<code>.timestamp 2026-09-03 12:00:00</code>"
         ),
         "uptime": "⏱ <b>Аптайм модуля TimeInfo:</b> <code>{}</code>",
+        "cfg_world_zones": "IANA-таймзони для .worldtime через кому",
+        "worldtime": "🌍 <b>Світовий час</b>\n\n{}",
+        "worldtime_bad": "\n\n⚠️ <b>Пропущено невідомі таймзони:</b> <code>{}</code>",
     }
 
     def __init__(self):
@@ -82,7 +86,12 @@ class TimeInfoMod(loader.Module):
                 "timezone",
                 "Europe/Kyiv",
                 lambda: self.strings("cfg_timezone"),
-            )
+            ),
+            loader.ConfigValue(
+                "world_zones",
+                "Europe/Kyiv,Europe/London,America/New_York,Asia/Tokyo",
+                lambda: self.strings("cfg_world_zones"),
+            ),
         )
         self._started_at = time.monotonic()
 
@@ -93,7 +102,8 @@ class TimeInfoMod(loader.Module):
     def _render_time(value):
         return value.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + f" {value.tzname()}"
 
-    async def timecmd(self, message):
+    @loader.command()
+    async def time(self, message):
         """Показати точний час VPS, Hikka, UTC, Unix timestamp та аптайм"""
         try:
             hikka_tz = self._hikka_timezone()
@@ -120,7 +130,8 @@ class TimeInfoMod(loader.Module):
             ),
         )
 
-    async def timezonecmd(self, message):
+    @loader.command()
+    async def timezone(self, message):
         """Показати або змінити таймзону Hikka: .timezone Europe/Kyiv"""
         requested = utils.get_args_raw(message).strip()
         zone_name = requested or str(self.config["timezone"])
@@ -153,7 +164,8 @@ class TimeInfoMod(loader.Module):
             ),
         )
 
-    async def timestampcmd(self, message):
+    @loader.command()
+    async def timestamp(self, message):
         """Конвертувати Unix timestamp або дату в часовій зоні Hikka"""
         raw = utils.get_args_raw(message).strip()
         try:
@@ -181,7 +193,8 @@ class TimeInfoMod(loader.Module):
             ),
         )
 
-    async def uptimecmd(self, message):
+    @loader.command()
+    async def uptime(self, message):
         """Показати, скільки часу завантажений модуль TimeInfo"""
         await utils.answer(
             message,
@@ -189,3 +202,45 @@ class TimeInfoMod(loader.Module):
                 _format_duration(time.monotonic() - self._started_at)
             ),
         )
+
+    @staticmethod
+    def _day_shift(value, reference):
+        delta = (value.date() - reference.date()).days
+        if delta > 0:
+            return " (завтра)"
+        if delta < 0:
+            return " (вчора)"
+        return ""
+
+    @loader.command()
+    async def worldtime(self, message):
+        """Світовий час: .worldtime [Europe/Paris Asia/Dubai …]"""
+        raw = utils.get_args_raw(message).strip()
+        names = [
+            item for item in re.split(r"[\s,;]+", raw or str(self.config["world_zones"]))
+            if item
+        ]
+        now = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            reference = now.astimezone(self._hikka_timezone())
+        except (ZoneInfoNotFoundError, ValueError):
+            reference = now
+        rows, invalid = [], []
+        for name in names[:20]:
+            try:
+                local = now.astimezone(ZoneInfo(name))
+            except (ZoneInfoNotFoundError, ValueError):
+                invalid.append(name)
+                continue
+            city = name.rsplit("/", 1)[-1].replace("_", " ")
+            rows.append(
+                f"🕐 <b>{utils.escape_html(city)}</b> — "
+                f"<code>{local:%H:%M}</code> <i>{_format_offset(local)}"
+                f"{self._day_shift(local, reference)}</i>"
+            )
+        text = self.strings("worldtime", message).format("\n".join(rows) or "—")
+        if invalid:
+            text += self.strings("worldtime_bad", message).format(
+                utils.escape_html(", ".join(invalid))
+            )
+        await utils.answer(message, text)

@@ -29,6 +29,7 @@ def _load_module():
         return cls
 
     loader.tds = tds
+    loader.command = lambda *args, **kwargs: (lambda value: value)
     loader.ConfigValue = lambda name, default, *args, **kwargs: (name, default)
     loader.ModuleConfig = _Config
     utils.get_args_raw = lambda message: message.args
@@ -66,13 +67,13 @@ class TimeInfoTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_timezone_command_changes_configuration(self):
         message = types.SimpleNamespace(args="America/New_York")
-        await self.module.timezonecmd(message)
+        await self.module.timezone(message)
         self.assertEqual(self.module.config["timezone"], "America/New_York")
         self.assertIn("змінено", timeinfo.utils.answer.await_args.args[1])
 
     async def test_timestamp_converts_naive_iso_in_hikka_timezone(self):
         message = types.SimpleNamespace(args="2026-09-03 12:00:00")
-        await self.module.timestampcmd(message)
+        await self.module.timestamp(message)
         rendered = timeinfo.utils.answer.await_args.args[1]
         self.assertIn("2026-09-03 12:00:00.000 EEST", rendered)
         self.assertIn("2026-09-03 09:00:00.000 UTC", rendered)
@@ -80,9 +81,21 @@ class TimeInfoTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_timezone_is_reported_without_changing_config(self):
         message = types.SimpleNamespace(args="Mars/Olympus")
-        await self.module.timezonecmd(message)
+        await self.module.timezone(message)
         self.assertEqual(self.module.config["timezone"], "Europe/Kyiv")
         self.assertIn("Невідома таймзона", timeinfo.utils.answer.await_args.args[1])
+
+    async def test_worldtime_lists_configured_and_reports_unknown_zones(self):
+        await self.module.worldtime(types.SimpleNamespace(args=""))
+        rendered = timeinfo.utils.answer.await_args.args[1]
+        self.assertIn("New York", rendered)
+        self.assertIn("Tokyo", rendered)
+
+        await self.module.worldtime(types.SimpleNamespace(args="Asia/Dubai Mars/Base"))
+        rendered = timeinfo.utils.answer.await_args.args[1]
+        self.assertIn("Dubai", rendered)
+        self.assertIn("UTC+04:00", rendered)
+        self.assertIn("Mars/Base", rendered)
 
 
 if __name__ == "__main__":
