@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 2.0.0
+# meta version: 2.1.0
 # meta description: 📊 Статистика вашої активності в Telegram — повідомлення, чати, піки по годинах.
 
 import datetime
@@ -62,6 +62,7 @@ class DailyStatMod(loader.Module):
             "<code>{prefix}ds top</code> — топ чатів сьогодні\n"
             "<code>{prefix}ds peak</code> — активність по годинах\n"
             "<code>{prefix}ds peak @username</code> — піки співрозмовника\n"
+            "<code>{prefix}ds peak users</code> — піки всіх співрозмовників\n"
             "<code>{prefix}ds scan</code> — відновити статистику за сьогодні\n"
             "<code>{prefix}ds reset</code> — скинути всю статистику"
         ),
@@ -92,7 +93,14 @@ class DailyStatMod(loader.Module):
                 "Година автоматичної публікації (за локальним часом сервера)",
                 validator=loader.validators.Integer(minimum=0, maximum=23),
             ),
+            loader.ConfigValue(
+                "keep_days",
+                120,
+                "Скільки днів зберігати статистику (старіші дні видаляються)",
+                validator=loader.validators.Integer(minimum=31, maximum=3650),
+            ),
         )
+        self._last_prune = None
 
     async def client_ready(self, client, db):
         self._client = client
@@ -135,13 +143,40 @@ class DailyStatMod(loader.Module):
     def _today_key(self) -> str:
         return datetime.date.today().isoformat()
 
-    def _week_keys(self) -> list:
-        today = datetime.date.today()
-        return [(today - datetime.timedelta(days=i)).isoformat() for i in range(7)]
+    @staticmethod
+    def _last_keys(days: int, end=None) -> list:
+        end = end or datetime.date.today()
+        return [(end - datetime.timedelta(days=i)).isoformat() for i in range(days)]
 
-    def _month_keys(self) -> list:
-        today = datetime.date.today()
-        return [(today - datetime.timedelta(days=i)).isoformat() for i in range(30)]
+    def _week_keys(self, end=None) -> list:
+        return self._last_keys(7, end)
+
+    def _month_keys(self, end=None) -> list:
+        return self._last_keys(30, end)
+
+    def _prune_old_days(self, today=None):
+        """Drop days older than ``keep_days`` so the database does not grow forever."""
+        today = today or datetime.date.today()
+        if self._last_prune == today:
+            return
+        self._last_prune = today
+        stats = self.get("stats", {})
+        if not isinstance(stats, dict):
+            return
+        try:
+            keep_days = int(self.config["keep_days"])
+        except (KeyError, TypeError, ValueError):
+            keep_days = 120
+        oldest = (today - datetime.timedelta(days=keep_days - 1)).isoformat()
+        # ISO dates sort lexicographically; unknown keys are kept untouched.
+        stale = [
+            key for key in stats
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(key)) and key < oldest
+        ]
+        if stale:
+            for key in stale:
+                stats.pop(key, None)
+            self.set("stats", stats)
 
     @staticmethod
     def _calendar_month_keys(day=None) -> list:
@@ -553,14 +588,16 @@ class DailyStatMod(loader.Module):
 
     @staticmethod
     def _format_name(info: dict, limit: int = 36) -> str:
-        raw_name = str(info.get("name") or "Unknown")
+        """Return a plain, escaped display name.
+
+        Usernames are kept only for local search (``.ds peak @user``) and are
+        never rendered: no profile links, no @mentions and no IDs, so the
+        output can be shown or forwarded without exposing anyone's profile.
+        """
+        raw_name = " ".join(str(info.get("name") or "Unknown").split())
         if len(raw_name) > limit:
             raw_name = raw_name[:limit - 1].rstrip() + "…"
-        name = utils.escape_html(raw_name)
-        username = str(info.get("username") or "")
-        if re.fullmatch(r"[A-Za-z0-9_]{3,32}", username):
-            return f'<a href="https://t.me/{username}">{name}</a>'
-        return name
+        return utils.escape_html(raw_name or "Unknown")
 
     def _format_senders(self, data: dict, n: int) -> str:
         top = sorted(
@@ -619,10 +656,10 @@ class DailyStatMod(loader.Module):
             text += f"<code>{h:02d}:00  {bar}</code>  <b>{v}</b>\n"
         return text
 
-    def _format_user_peak(self, user: dict) -> str:
+    def _format_user_peak(self, user: dict, label: str = "сьогодні") -> str:
         name = self._format_name(user)
         text = (
-            f"📊 <b>DailyStat</b>\n🗓 <i>сьогодні</i>\n\n"
+            f"📊 <b>DailyStat</b>\n🗓 <i>{label}</i>\n\n"
             f"👤 <b>{name}</b>\n"
         )
         text += "\n📤 <b>Я писав</b>\n"
@@ -643,6 +680,8 @@ class DailyStatMod(loader.Module):
 
     def _find_user(self, data: dict, query: str):
         query = query.strip().lstrip("@").casefold()
+        if not query:
+            return None
         if query in data["users"]:
             return data["users"][query]
         matches = [
@@ -672,7 +711,7 @@ class DailyStatMod(loader.Module):
                 "callback": self._panel_callback,
                 "args": (value, user_id, "summary"),
             }
-        return [
+        rows = [
             [button("Сьогодні", "today"), button("7 днів", "week"),
              button("30 днів", "month")],
             [
@@ -683,13 +722,16 @@ class DailyStatMod(loader.Module):
             ],
             [{"text": "👤 Обрати користувача", "input": "@username, ім’я або ID",
               "handler": self._user_input, "args": (period,)}],
-            ([{"text": "✖️ Прибрати користувача", "callback": self._panel_callback,
-               "args": (period, None, "summary")}]
-             if user_id is not None else []),
-            [{"text": "🔄 Оновити", "callback": self._panel_callback,
-              "args": (period, user_id, "summary")},
-             {"text": "✖️ Закрити", "action": "close"}],
         ]
+        if user_id is not None:
+            # Telegram rejects keyboards with empty rows, so add it only when used.
+            rows.append([{"text": "✖️ Прибрати користувача",
+                          "callback": self._panel_callback,
+                          "args": (period, None, "summary")}])
+        rows.append([{"text": "🔄 Оновити", "callback": self._panel_callback,
+                      "args": (period, user_id, "summary")},
+                     {"text": "✖️ Закрити", "action": "close"}])
+        return rows
 
     def _panel_text(self, period="today", user_id=None, view="summary"):
         data, label, days = self._period_data(period)
@@ -721,6 +763,9 @@ class DailyStatMod(loader.Module):
             return self.strings["stat_header"].format(period=label) + (
                 self._format_peak(data) or self.strings["no_data"]
             )
+        return self._summary_text(data, label, days)
+
+    def _summary_text(self, data, label, days=1) -> str:
         text = self._format_stat(data, label, days=days)
         text += self._format_senders(data, self.config["top_count"])
         text += self._format_top(data, self.config["top_count"])
@@ -764,9 +809,7 @@ class DailyStatMod(loader.Module):
         icons = {"day": "🌙", "week": "🗓", "month": "📆"}
         text = f"{icons[kind]} <b>Автоматичний звіт DailyStat</b>\n"
         text += f"<i>{label}</i>\n\n"
-        text += self._format_stat(data, label, days=days).split("\n\n", 1)[1]
-        text += self._format_senders(data, self.config["top_count"])
-        text += self._format_top(data, self.config["top_count"])
+        text += self._summary_text(data, label, days).split("\n\n", 1)[1]
         return text
 
     async def _publish_report(self, report_key, data, label, days, kind):
@@ -778,9 +821,16 @@ class DailyStatMod(loader.Module):
         channel = self._report_channel or await self._ensure_report_channel()
         if not channel:
             return
-        await self._client.send_message(
-            channel, self._report_text(data, label, days, kind), parse_mode="html"
-        )
+        try:
+            await self._client.send_message(
+                channel, self._report_text(data, label, days, kind), parse_mode="html"
+            )
+        except Exception:
+            # Not marked as published: the next scheduler tick retries and
+            # re-resolves the channel in case it was deleted or became private.
+            logger.exception("DailyStat: could not publish %s", report_key)
+            self._report_channel = None
+            return
         self.set("published_reports", (sent + [report_key])[-400:])
 
     @loader.loop(interval=60, autostart=True)
@@ -788,25 +838,30 @@ class DailyStatMod(loader.Module):
         if not getattr(self, "_client", None):
             return
         now = datetime.datetime.now().astimezone()
-        if now.hour != self.config["report_hour"]:
-            return
         today = now.date()
-        day_key = today.isoformat()
+        self._prune_old_days(today)
+        # Yesterday is always eligible so reports missed while Hikka was offline
+        # at ``report_hour`` are still delivered once on the next start.
+        await self._publish_reports_for(today - datetime.timedelta(days=1))
+        if now.hour >= self.config["report_hour"]:
+            await self._publish_reports_for(today)
+
+    async def _publish_reports_for(self, day):
+        day_key = day.isoformat()
         await self._publish_report(
             "day:" + day_key, self._get_day(day_key),
-            today.strftime("%d.%m.%Y"), 1, "day"
+            day.strftime("%d.%m.%Y"), 1, "day"
         )
-        if today.weekday() == 6:
+        if day.weekday() == 6:
             await self._publish_report(
-                "week:" + day_key, self._merge_days(self._week_keys()),
-                "підсумок за останні 7 днів", 7, "week"
+                "week:" + day_key, self._merge_days(self._week_keys(day)),
+                "підсумок за 7 днів до " + day.strftime("%d.%m.%Y"), 7, "week"
             )
-        tomorrow = today + datetime.timedelta(days=1)
-        if tomorrow.month != today.month:
-            keys = self._calendar_month_keys(today)
+        if (day + datetime.timedelta(days=1)).month != day.month:
+            keys = self._calendar_month_keys(day)
             await self._publish_report(
-                "month:" + today.strftime("%Y-%m"), self._merge_days(keys),
-                today.strftime("підсумок за %m.%Y"), len(keys), "month"
+                "month:" + day.strftime("%Y-%m"), self._merge_days(keys),
+                day.strftime("підсумок за %m.%Y"), len(keys), "month"
             )
 
     def _help_text(self) -> str:
@@ -821,6 +876,15 @@ class DailyStatMod(loader.Module):
         scanned = 0
 
         async for dialog in self._client.iter_dialogs():
+            # ``dialog.date`` is the time of the last message. Dialogs that were
+            # silent all day cannot contain today's messages, so skip the
+            # history request entirely; this makes a scan far faster.
+            last_date = getattr(dialog, "date", None)
+            if isinstance(last_date, datetime.datetime):
+                if last_date.tzinfo is None:
+                    last_date = last_date.replace(tzinfo=datetime.timezone.utc)
+                if last_date < start:
+                    continue
             is_private = bool(getattr(dialog, "is_user", False))
             entity = getattr(dialog, "entity", None)
             chat_id = getattr(dialog, "id", None)
@@ -938,9 +1002,9 @@ class DailyStatMod(loader.Module):
             await self._ds_today(message)
         elif args in {"reset", "reset confirm"}:
             await self._ds_reset(message, confirmed=args == "reset confirm")
-        elif args in {"week", "тиждень"}:
+        elif args in {"week", "тиждень", "7"}:
             await self._ds_week(message)
-        elif args in {"month", "місяць"}:
+        elif args in {"month", "місяць", "30"}:
             await self._ds_month(message)
         elif args == "top":
             await self._ds_top(message)
@@ -957,35 +1021,20 @@ class DailyStatMod(loader.Module):
                 self.strings["unknown_arg"].format(argument, self._help_text()),
             )
 
-    async def _ds_today(self, message):
-        data = self._get_day(self._today_key())
+    async def _send_period(self, message, period):
+        data, label, days = self._period_data(period)
         if data["sent"] == 0 and data["received"] == 0:
             return await utils.answer(message, self.strings["no_data"])
+        await utils.answer(message, self._summary_text(data, label, days))
 
-        text = self._format_stat(data, "сьогодні")
-        text += self._format_senders(data, self.config["top_count"])
-        text += self._format_top(data, self.config["top_count"])
-        await utils.answer(message, text)
+    async def _ds_today(self, message):
+        await self._send_period(message, "today")
 
     async def _ds_week(self, message):
-        data = self._merge_days(self._week_keys())
-        if data["sent"] == 0 and data["received"] == 0:
-            return await utils.answer(message, self.strings["no_data"])
-
-        text = self._format_stat(data, "останні 7 днів", days=7)
-        text += self._format_senders(data, self.config["top_count"])
-        text += self._format_top(data, self.config["top_count"])
-        await utils.answer(message, text)
+        await self._send_period(message, "week")
 
     async def _ds_month(self, message):
-        data = self._merge_days(self._month_keys())
-        if data["sent"] == 0 and data["received"] == 0:
-            return await utils.answer(message, self.strings["no_data"])
-
-        text = self._format_stat(data, "останні 30 днів", days=30)
-        text += self._format_senders(data, self.config["top_count"])
-        text += self._format_top(data, self.config["top_count"])
-        await utils.answer(message, text)
+        await self._send_period(message, "month")
 
     async def _ds_top(self, message):
         data = self._get_day(self._today_key())
@@ -1047,9 +1096,7 @@ class DailyStatMod(loader.Module):
                 self.strings["scan_failed"].format(error_text[:500]),
             )
         text = self.strings["scan_done"].format(chats=chats) + "\n\n"
-        text += self._format_stat(data, "сьогодні")
-        text += self._format_senders(data, self.config["top_count"])
-        text += self._format_top(data, self.config["top_count"])
+        text += self._summary_text(data, "сьогодні")
         await utils.answer(status or message, text)
 
     async def _ds_reset(self, message, confirmed=False):

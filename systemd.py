@@ -608,7 +608,7 @@ class SystemdMod(loader.Module):
 
     async def unitscmd(self, message: Message):
         """Open control panel"""
-        form = await self.inline.form(
+        await self.inline.form(
             self._get_panel(),
             message,
             reply_markup=self._get_services_markup(),

@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 3.4.0
+# meta version: 3.4.1
 # meta description: 🧭 Центр команд, автооновлення та синхронізація статистики Hikka.
 # scope: inline
 # scope: hikka_only
@@ -82,6 +82,8 @@ class ModuleHubMod(loader.Module):
         "teledocs": "teledocs.py",
         "purge": "purge.py",
         "eval": "eval.py",
+        "airalert": "airalert.py",
+        "sessionguard": "sessionguard.py",
     }
 
     MODULES = {
@@ -247,6 +249,18 @@ class ModuleHubMod(loader.Module):
             "icon": "🧪",
             "description": "Виконання коду в пісочницях різних мов.",
         },
+        "airalert": {
+            "class": "AirAlertMod",
+            "name": "AirAlert",
+            "icon": "🚨",
+            "description": "Повітряні тривоги з @air_alert_ua для вибраних регіонів.",
+        },
+        "sessionguard": {
+            "class": "SessionGuardMod",
+            "name": "SessionGuard",
+            "icon": "🛡",
+            "description": "Автоматично завершує нові невідомі сесії Telegram.",
+        },
     }
 
     SECTIONS = (
@@ -258,10 +272,20 @@ class ModuleHubMod(loader.Module):
         ("🎮 Розваги", ("minigames",)),
         ("🎁 Подарунки", ("giftmonitor", "hiddengifts")),
         ("💱 P2P", ("walletp2p",)),
-        ("🛠 Система", ("nekospy", "systemd", "backup", "sysinfo", "alwaysonline")),
+        (
+            "🛠 Система",
+            (
+                "nekospy",
+                "systemd",
+                "backup",
+                "sysinfo",
+                "alwaysonline",
+                "sessionguard",
+            ),
+        ),
         (
             "🧰 Інструменти",
-            ("scheduler", "timeinfo", "teledocs", "eval"),
+            ("scheduler", "timeinfo", "teledocs", "eval", "airalert"),
         ),
     )
 
@@ -349,6 +373,8 @@ class ModuleHubMod(loader.Module):
         "restoreall",
         "qnow",
         "qhelp",
+        "sessionguard",
+        "alertforward",
         "qlist",
         "ms",
         "hgift",

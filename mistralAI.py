@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 from urllib.parse import quote
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 import aiohttp
 from .. import loader, utils

@@ -20,6 +20,7 @@ nekospy
 purge
 quietschedule
 rkapi
+sessionguard
 stats
 sysinfo
 systemd

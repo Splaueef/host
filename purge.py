@@ -1,5 +1,5 @@
 #    Friendly Telegram (telegram userbot)
-# meta version: 1.0.0
+# meta version: 1.0.1
 #    Copyright (C) 2018-2019 The Authors
 
 #    This program is free software: you can redistribute it and/or modify
@@ -89,11 +89,16 @@ class PurgeMod(loader.Module):
             if await message.client.is_bot():
                 await utils.answer(message, self.strings("delete_what", message))
                 return
-            msg = await message.client.iter_messages(
+            msg = None
+            async for msg in message.client.iter_messages(
                 message.to_id, 1, max_id=message.id
-            ).__anext__()
+            ):
+                break
         else:
             msg = await message.get_reply_message()
+        if msg is None:
+            await utils.answer(message, self.strings("delete_what", message))
+            return
         msgs.append(msg.id)
         logger.debug(msgs)
         await message.client.delete_messages(message.to_id, msgs)

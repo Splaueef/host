@@ -457,6 +457,99 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(target, status)
         self.assertIn("bad &lt;dialog&gt;", text)
 
+    def test_output_never_contains_profile_links_or_usernames(self):
+        today = self.module._today_key()
+        day = self.module._get_day(today)
+        self.module._add_sent(day, 7, "Alice", False, 8, "alice_private")
+        self.module._add_received(day, 7, "Alice", 9, "alice_private")
+        self.module._save_day(today, day)
+
+        rendered = "".join(
+            [
+                self.module._panel_text("today"),
+                self.module._panel_text("today", 7, "peak"),
+                self.module._format_user_peak(day["users"]["7"]),
+                self.module._report_text(day, "сьогодні", 1, "day"),
+            ]
+        )
+
+        self.assertIn("Alice", rendered)
+        self.assertNotIn("<a ", rendered)
+        self.assertNotIn("t.me", rendered)
+        self.assertNotIn("alice_private", rendered)
+        # Search by the stored username still works locally.
+        self.assertIs(
+            self.module._find_user(day, "@alice_private")["id"], 7
+        )
+
+    def test_panel_markup_has_no_empty_rows(self):
+        for user_id in (None, 7):
+            markup = self.module._period_markup("today", user_id)
+            self.assertTrue(all(markup), markup)
+
+    def test_old_days_are_pruned(self):
+        self.module.config = {"top_count": 5, "keep_days": 31}
+        today = datetime.date(2026, 9, 30)
+        self.module.set(
+            "stats",
+            {
+                "2026-09-30": {"sent": 1},
+                "2026-08-31": {"sent": 1},
+                "2026-08-30": {"sent": 1},
+            },
+        )
+
+        self.module._prune_old_days(today)
+
+        self.assertEqual(
+            set(self.module.get("stats")), {"2026-09-30", "2026-08-31"}
+        )
+
+    async def test_missed_report_for_yesterday_is_published_later(self):
+        self.module.config = {"top_count": 5, "report_hour": 23, "keep_days": 120}
+        self.module._report_channel = 123
+        self.module._client = types.SimpleNamespace(send_message=mock.AsyncMock())
+        yesterday = datetime.date.today() - datetime.timedelta(days=1)
+        self.module.set("stats", {yesterday.isoformat(): {"sent": 3}})
+
+        await self.module.report_scheduler()
+
+        self.assertIn(
+            "day:" + yesterday.isoformat(), self.module.get("published_reports")
+        )
+
+    async def test_failed_report_is_retried(self):
+        self.module._report_channel = 123
+        self.module._client = types.SimpleNamespace(
+            send_message=mock.AsyncMock(side_effect=RuntimeError("boom"))
+        )
+        self.module._ensure_report_channel = mock.AsyncMock(return_value=None)
+        day = self.module._empty_day()
+        day["sent"] = 1
+
+        await self.module._publish_report("day:x", day, "x", 1, "day")
+
+        self.assertEqual(self.module.get("published_reports", []), [])
+        self.assertIsNone(self.module._report_channel)
+
+    async def test_scan_skips_dialogs_without_activity_today(self):
+        now = datetime.datetime.now().astimezone()
+        old = types.SimpleNamespace(
+            is_user=True,
+            entity=types.SimpleNamespace(id=5, first_name="Old"),
+            date=now - datetime.timedelta(days=3),
+        )
+
+        class FailingClient(_HistoryClient):
+            def iter_messages(client_self, entity, **kwargs):
+                raise AssertionError("silent dialogs must not be read")
+
+        self.module._client = FailingClient([old], {})
+
+        day, scanned = await self.module._scan_today()
+
+        self.assertEqual((scanned, day["sent"]), (0, 0))
+
 
 if __name__ == "__main__":
     unittest.main()

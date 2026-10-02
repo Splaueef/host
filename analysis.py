@@ -1,15 +1,15 @@
 # meta developer: @Huai_Baike
-# meta version: 1.0.0
+# meta version: 1.1.0
 # meta description: 📈 Повний аналіз повідомлень у поточному чаті за командою !аналіз.
 
-import calendar
-import datetime
 import time
 from collections import defaultdict
 
 from telethon.tl.types import PeerUser
 
 from .. import loader, utils
+
+WEEKDAYS = ("понеділок", "вівторок", "середа", "четвер", "пʼятниця", "субота", "неділя")
 
 
 @loader.tds
@@ -83,7 +83,7 @@ class ChatAnalysisMod(loader.Module):
             if not self._is_countable(msg):
                 continue
 
-            side = "me" if msg.sender_id == self._me.id else "others"
+            side = "me" if getattr(msg, "out", False) or msg.sender_id == self._me.id else "others"
             self._add_message(stats[side], msg)
             self._add_message(stats["all"], msg)
 
@@ -119,7 +119,8 @@ class ChatAnalysisMod(loader.Module):
         return bool(getattr(msg, "message", None) or getattr(msg, "media", None) or getattr(msg, "action", None))
 
     def _add_message(self, bucket, msg):
-        dt = msg.date.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        # Server-local time: hour peaks in UTC were confusing for most users.
+        dt = msg.date.astimezone().replace(tzinfo=None)
         iso_year, iso_week, _ = dt.isocalendar()
         month_key = dt.strftime("%Y-%m")
         week_key = f"{iso_year}-W{iso_week:02d}"
@@ -208,7 +209,7 @@ class ChatAnalysisMod(loader.Module):
     def _range(bucket):
         if not bucket["first"]:
             return "—"
-        return f"{bucket['first']:%Y-%m-%d %H:%M} → {bucket['last']:%Y-%m-%d %H:%M} UTC"
+        return f"{bucket['first']:%Y-%m-%d %H:%M} → {bucket['last']:%Y-%m-%d %H:%M}"
 
     @staticmethod
     def _peak_hour(hours):
@@ -222,4 +223,4 @@ class ChatAnalysisMod(loader.Module):
         if not any(weekdays):
             return "—"
         day = max(range(7), key=lambda d: weekdays[d])
-        return f"{calendar.day_name[day]} ({weekdays[day]})"
+        return f"{WEEKDAYS[day]} ({weekdays[day]})"

@@ -1,5 +1,5 @@
 # meta developer: @Codex
-# meta version: 2.1.1
+# meta version: 2.2.0
 # meta description: Два AI-дайджести на день без повторів у форматі Telegram Rich Text.
 
 import asyncio
@@ -8,6 +8,7 @@ import html
 import json
 import logging
 import re
+import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
@@ -21,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 MISTRAL_CONVERSATIONS_URL = "https://api.mistral.ai/v1/conversations"
 TELEGRAM_BOT_API_URL = "https://api.telegram.org/bot{token}/sendRichMessage"
+# After a failed scheduled edition wait before retrying instead of calling the
+# paid Mistral API every scheduler tick (30 s) while it is down.
+RETRY_DELAY_SECONDS = 600
 
 
 def _content_to_text(value):
@@ -121,6 +125,7 @@ class DailyNewsMod(loader.Module):
         self._client = None
         self._session = None
         self._running = False
+        self._retry_after = 0.0
 
     async def client_ready(self, client, db):
         self._client = client
@@ -195,7 +200,7 @@ class DailyNewsMod(loader.Module):
                 missing.append(key)
         try:
             self._timezone()
-        except ZoneInfoNotFoundError:
+        except (ZoneInfoNotFoundError, ValueError):
             missing.append("timezone")
         try:
             self._publish_times()
@@ -205,7 +210,9 @@ class DailyNewsMod(loader.Module):
 
     @loader.loop(interval=30, autostart=True)
     async def news_scheduler(self):
-        if not self._client or self._running or self._missing_config():
+        if not self._client or self._running or time.monotonic() < self._retry_after:
+            return
+        if self._missing_config():
             return
         now = datetime.datetime.now(self._timezone())
         run_date = now.date().isoformat()
@@ -230,8 +237,11 @@ class DailyNewsMod(loader.Module):
             )
         except (aiohttp.ClientError, asyncio.TimeoutError, RPCError, RuntimeError, ValueError):
             # loader.loop must survive temporary Telegram/Mistral failures. A failed
-            # edition is intentionally not marked as sent, so the next tick retries.
+            # edition is intentionally not marked as sent and is retried later.
             logger.exception("DailyNews scheduled run failed")
+            self._retry_after = time.monotonic() + RETRY_DELAY_SECONDS
+        else:
+            self._retry_after = 0.0
 
     @staticmethod
     def _peer(value):
@@ -471,13 +481,15 @@ class DailyNewsMod(loader.Module):
 
     async def newsstatuscmd(self, message):
         """Показати стан та розклад DailyNews"""
+        try:
+            times = ", ".join(slot.strftime("%H:%M") for slot in self._publish_times())
+        except ValueError:
+            times = "некоректний час у конфігу"
         await utils.answer(
             message,
             self.strings("status", message).format(
                 sources=len(self._sources()),
-                times=html.escape(
-                    ", ".join(slot.strftime("%H:%M") for slot in self._publish_times())
-                ),
+                times=html.escape(times),
                 timezone=html.escape(str(self.config["timezone"])),
                 target=html.escape(str(self.config["target"]) or "—"),
                 last_run=html.escape(str(self.get("last_run", "—"))),
@@ -485,14 +497,27 @@ class DailyNewsMod(loader.Module):
             ),
         )
 
+    async def _check_period_config(self, message):
+        missing = self._missing_config()
+        if missing:
+            await utils.answer(
+                message, self.strings("bad_config", message).format(html.escape(", ".join(missing)))
+            )
+            return False
+        return True
+
     async def newstodaycmd(self, message):
         """Примусово зібрати новини від початку сьогоднішнього дня до цієї миті"""
+        if not await self._check_period_config(message):
+            return
         now_local = datetime.datetime.now(self._timezone())
         since = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         await self._run_period(message, since, now_local, "today")
 
     async def newsyesterdaycmd(self, message):
         """Зібрати та опублікувати новини за вчорашній календарний день"""
+        if not await self._check_period_config(message):
+            return
         today = datetime.datetime.now(self._timezone()).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
@@ -500,6 +525,8 @@ class DailyNewsMod(loader.Module):
 
     async def newsweekcmd(self, message):
         """Зібрати та опублікувати новини за останні сім календарних днів"""
+        if not await self._check_period_config(message):
+            return
         now_local = datetime.datetime.now(self._timezone())
         since = (now_local - datetime.timedelta(days=6)).replace(
             hour=0, minute=0, second=0, microsecond=0

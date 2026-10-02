@@ -164,7 +164,6 @@ def _fmt_user(data: dict) -> str:
     # Рівень (тільки з owner_view)
     if su:
         wlvl   = _n(su.get("work_level"))
-        wlp    = _n(su.get("work_xp"))
         shield = _n(su.get("shield"))
         docs   = _n(su.get("docs"))
         if any([wlvl, shield, docs]):
@@ -191,7 +190,7 @@ def _fmt_user(data: dict) -> str:
             link      = _href(c.get("link"))
             cm        = _n(c.get("messages"))
             if not link or raw_title.startswith("Chat -"):
-                t_str = f"🔒 <i>приватний</i>"
+                t_str = "🔒 <i>приватний</i>"
             else:
                 t_str = f'<a href="{link}">{_esc(raw_title)}</a>'
             L.append(f"{_bar(cm, max_m)}  <b>{cm:,}</b>  {t_str}")
@@ -309,7 +308,7 @@ def _fmt_pets(data: dict) -> str:
         if mood:    bars.append(f"😊 {mood:.0f}")
         if hunger:  bars.append(f"🍖 {hunger:.0f}")
         if energy:  bars.append(f"⚡ {energy:.0f}")
-        if bars: L.append(f"    ╰ " + "  ".join(bars))
+        if bars: L.append("    ╰ " + "  ".join(bars))
 
         # Опікуни
         if len(owners) > 1:
@@ -1007,7 +1006,7 @@ class WerwolfStatsMod(loader.Module):
         currency   = args[2].lower() if len(args) >= 3 else "coins"
 
         if currency not in ("coins", "gold"):
-            await utils.answer(message, f"❌ Валюта: <code>coins</code> або <code>gold</code>"); return
+            await utils.answer(message, "❌ Валюта: <code>coins</code> або <code>gold</code>"); return
         try:
             amount = float(amount_str.replace(",", "."))
         except ValueError:
