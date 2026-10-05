@@ -175,6 +175,8 @@ class _Client:
         self.next_topic = 100
         self.next_message = 1
         self.fail_topic_once = None
+        # User IDs whose private chat has no messages before the current one.
+        self.fresh_users = set()
 
     async def __call__(self, request):
         name = type(request).__name__
@@ -214,6 +216,9 @@ class _Client:
 
     async def get_me(self):
         return types.SimpleNamespace(id=ME)
+
+    async def get_messages(self, user_id, limit=None, max_id=None):
+        return [] if user_id in self.fresh_users else [object()]
 
     async def get_input_entity(self, peer):
         return peer
@@ -410,6 +415,47 @@ class AgentBotTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.module._topics(), {})
         self.assertIn("42", agentbot.utils.answer.await_args.args[1])
+
+    async def test_first_contact_gets_greeting_once(self):
+        client = _Client()
+        client.fresh_users.add(42)
+        await self.module.client_ready(client, None)
+        user = _User(42, "Ann")
+
+        await self.module.watcher(_private(user, "Привіт"))
+
+        greetings = [item for item in client.sent if item[0] == 42]
+        self.assertEqual(len(greetings), 1)
+        self.assertIn("Привіт, Ann!", greetings[0][1])
+        self.assertIn("відповість вам у цьому чаті", greetings[0][1])
+        topic_id = self.module._topics()["42"]
+        self.assertEqual(client.sent[-1][2], topic_id)
+        self.assertIn("автопривітання", client.sent[-1][1])
+
+        # Neither later messages nor a recreated topic greet the person again.
+        await self.module.watcher(_private(user, "Ще", message_id=2))
+        self.module._save_topics({})
+        await self.module.watcher(_private(user, "Знову", message_id=3))
+        self.assertEqual(len([item for item in client.sent if item[0] == 42]), 1)
+
+    async def test_existing_dialog_is_not_greeted(self):
+        client = _Client()
+        await self.module.client_ready(client, None)
+
+        await self.module.watcher(_private(_User(42), "Привіт", message_id=50))
+
+        self.assertFalse([item for item in client.sent if item[0] == 42])
+        self.assertIn("42", self.module._topics())
+
+    async def test_empty_greeting_disables_it(self):
+        client = _Client()
+        client.fresh_users.add(42)
+        await self.module.client_ready(client, None)
+        self.module.config["greeting"] = ""
+
+        await self.module.watcher(_private(_User(42)))
+
+        self.assertFalse([item for item in client.sent if item[0] == 42])
 
 
 if __name__ == "__main__":

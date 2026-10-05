@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 1.0.0
+# meta version: 1.1.0
 # meta description: Агент-бот: кожен діалог в особистих стає окремою гілкою у форум-групі.
 
 """Relay private dialogs into forum topics so a whole team can answer them."""
@@ -30,6 +30,13 @@ TOPIC_ERRORS = (
     "MESSAGE_ID_INVALID",
     "REPLY_MESSAGE_ID_INVALID",
 )
+DEFAULT_GREETING = (
+    "Привіт, {name}! 👋 Це акаунт підтримки проєкту @RotKranz.\n\n"
+    "Напишіть своє запитання прямо тут — команда підтримки побачить "
+    "його й відповість вам у цьому чаті.\n\n"
+    "Розробник бота: @Huai_Baike\n"
+    "Група підтримки: @RotKranzUK"
+)
 GROUP_ERRORS = (
     "CHANNEL_INVALID",
     "CHANNEL_PRIVATE",
@@ -51,6 +58,11 @@ class AgentBotMod(loader.Module):
         "cfg_ignore_contacts": "Не створювати гілки для ваших контактів",
         "cfg_send_photo": "Додавати фото профілю до картки користувача",
         "cfg_report_errors": "Повідомляти в гілці, якщо відповідь не доставлено",
+        "cfg_greeting": (
+            "Привітання, яке отримує людина, коли пише вам уперше. "
+            "{name} підставляє її ім'я; порожнє значення вимикає привітання"
+        ),
+        "greeting_sent": "🤖 <b>Надіслано автопривітання:</b>\n\n{}",
         "group_about": (
             "Діалоги AgentBot: кожна гілка — окремий співрозмовник. "
             "Не видаляйте рядок нижче.\n{marker}"
@@ -170,6 +182,12 @@ class AgentBotMod(loader.Module):
                 lambda: self.strings("cfg_report_errors"),
                 validator=loader.validators.Boolean(),
             ),
+            loader.ConfigValue(
+                "greeting",
+                DEFAULT_GREETING,
+                lambda: self.strings("cfg_greeting"),
+                validator=loader.validators.String(),
+            ),
         )
         self._client = None
         self._me_id = None
@@ -177,6 +195,7 @@ class AgentBotMod(loader.Module):
         self._group_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
         self._user_locks = {}
+        self._new_topics = set()
         self._own_ids = collections.OrderedDict()
         self._dm_to_group = collections.OrderedDict()
         self._group_to_dm = collections.OrderedDict()
@@ -437,6 +456,7 @@ class AgentBotMod(loader.Module):
             topics = self._topics()
             topics[key] = topic_id
             self._save_topics(topics)
+            self._new_topics.add(user.id)
             await self._send_card(user, topic_id)
             return topic_id
 
@@ -599,6 +619,55 @@ class AgentBotMod(loader.Module):
             self._mark_own(sent)
             return sent
 
+    # --------------------------------------------------------------- greeting
+
+    def _greeted(self):
+        raw = self.get("greeted", [])
+        return {str(item) for item in raw} if isinstance(raw, list) else set()
+
+    async def _is_first_contact(self, user_id, message_id):
+        try:
+            earlier = await self._client.get_messages(
+                user_id, limit=1, max_id=message_id
+            )
+        except FloodWaitError:
+            raise
+        except (RPCError, ValueError, TypeError) as error:
+            logger.info("AgentBot could not read history of %s: %s", user_id, error)
+            return False
+        return not earlier
+
+    async def _greet(self, user, message, topic_id):
+        """Greet a person once, and only when this is their very first message."""
+        if user.id not in self._new_topics:
+            return
+        self._new_topics.discard(user.id)
+        template = str(self.config["greeting"] or "").strip()
+        greeted = self._greeted()
+        if not template or str(user.id) in greeted:
+            return
+        if not await self._is_first_contact(user.id, message.id):
+            return
+
+        text = template.replace(
+            "{name}", utils.escape_html(self._display_name(user))
+        )
+        try:
+            await self._client.send_message(user.id, text, parse_mode="html")
+        except FloodWaitError:
+            raise
+        except (RPCError, ValueError) as error:
+            logger.info("AgentBot could not greet %s: %s", user.id, error)
+            return
+        greeted.add(str(user.id))
+        self.set("greeted", sorted(greeted, key=int))
+        try:
+            await self._send_group(
+                self.strings("greeting_sent").format(text), topic_id
+            )
+        except (RPCError, ValueError) as error:
+            logger.info("AgentBot could not log the greeting: %s", error)
+
     # ---------------------------------------------------------------- watcher
 
     async def _accepts_sender(self, message):
@@ -642,6 +711,7 @@ class AgentBotMod(loader.Module):
             topic_id = await self._topic_for(sender, stale=topic_id)
             sent = await self._copy_to_group(message, topic_id)
         self._link_messages(sender.id, message.id, getattr(sent, "id", None))
+        await self._greet(sender, message, topic_id)
 
     @staticmethod
     def _topic_of(message):
