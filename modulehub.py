@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 3.4.2
+# meta version: 3.5.0
 # meta description: 🧭 Центр команд, автооновлення та синхронізація статистики Hikka.
 # scope: inline
 # scope: hikka_only
@@ -84,6 +84,7 @@ class ModuleHubMod(loader.Module):
         "eval": "eval.py",
         "airalert": "airalert.py",
         "sessionguard": "sessionguard.py",
+        "agentbot": "agentbot.py",
     }
 
     MODULES = {
@@ -261,6 +262,12 @@ class ModuleHubMod(loader.Module):
             "icon": "🛡",
             "description": "Автоматично завершує нові невідомі сесії Telegram.",
         },
+        "agentbot": {
+            "class": "AgentBotMod",
+            "name": "AgentBot",
+            "icon": "🤖",
+            "description": "Особисті діалоги як гілки у спільній форум-групі.",
+        },
     }
 
     SECTIONS = (
@@ -285,7 +292,14 @@ class ModuleHubMod(loader.Module):
         ),
         (
             "🧰 Інструменти",
-            ("scheduler", "timeinfo", "teledocs", "eval", "airalert"),
+            (
+                "scheduler",
+                "timeinfo",
+                "teledocs",
+                "eval",
+                "airalert",
+                "agentbot",
+            ),
         ),
     )
 
@@ -375,6 +389,7 @@ class ModuleHubMod(loader.Module):
         "qnow",
         "qhelp",
         "sessionguard",
+        "agentbot",
         "alertforward",
         "qlist",
         "ms",
