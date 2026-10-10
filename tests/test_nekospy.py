@@ -102,6 +102,82 @@ class LocalBackupTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.temporary_directory.cleanup()
 
+    def test_export_encrypts_all_files_and_excludes_symlinks(self):
+        import pyzipper
+
+        sent = self.module._backup_root / "sent" / "photo.jpg"
+        sent.write_bytes(b"private photo")
+        received = self.module._backup_root / "received" / "nested"
+        received.mkdir()
+        (received / "video.mp4").write_bytes(b"private video")
+        (self.module._backup_root / "other.txt").write_bytes(b"other")
+        outside = pathlib.Path(self.temporary_directory.name) / "outside.txt"
+        outside.write_bytes(b"outside")
+        (self.module._backup_root / "link.txt").symlink_to(outside)
+        (self.module._backup_root / "linked-dir").symlink_to(received, target_is_directory=True)
+        destination = pathlib.Path(self.temporary_directory.name) / "export.zip"
+        self.assertEqual(self.module._create_backup_archive(destination), 3)
+        with pyzipper.AESZipFile(destination) as archive:
+            self.assertEqual(set(archive.namelist()), {
+                "NekoSpyBSP/sent/photo.jpg",
+                "NekoSpyBSP/received/nested/video.mp4",
+                "NekoSpyBSP/other.txt",
+            })
+            with self.assertRaises(RuntimeError):
+                archive.read("NekoSpyBSP/sent/photo.jpg")
+            archive.setpassword(b"wrong")
+            with self.assertRaises(RuntimeError):
+                archive.read("NekoSpyBSP/sent/photo.jpg")
+            archive.setpassword(b"789456123")
+            self.assertEqual(archive.read("NekoSpyBSP/sent/photo.jpg"), b"private photo")
+            self.assertEqual(archive.read("NekoSpyBSP/received/nested/video.mp4"), b"private video")
+            self.assertTrue(all(info.flag_bits & 1 for info in archive.infolist()))
+
+    async def test_export_sends_to_current_chat_and_removes_temporary_archive(self):
+        (self.module._backup_root / "sent" / "file.txt").write_bytes(b"saved")
+        self.module.strings = lambda key: nekospy.NekoSpy.strings[key]
+        uploaded = []
+
+        async def send_file(chat, path, **kwargs):
+            uploaded.append(pathlib.Path(path))
+            self.assertEqual(chat, 123)
+            self.assertTrue(uploaded[-1].is_file())
+            self.assertTrue(kwargs["force_document"])
+
+        self.module._client = types.SimpleNamespace(send_file=mock.AsyncMock(side_effect=send_file))
+        message = types.SimpleNamespace(chat_id=123)
+        with mock.patch.object(nekospy.utils, "answer", mock.AsyncMock(return_value=message), create=True):
+            await self.module.spybackup(message)
+        self.assertEqual(len(uploaded), 1)
+        self.assertFalse(uploaded[0].exists())
+        self.assertTrue((self.module._backup_root / "sent" / "file.txt").exists())
+
+    async def test_empty_export_does_not_upload(self):
+        self.module.strings = lambda key: nekospy.NekoSpy.strings[key]
+        self.module._client = types.SimpleNamespace(send_file=mock.AsyncMock())
+        message = types.SimpleNamespace(chat_id=123)
+        with mock.patch.object(nekospy.utils, "answer", mock.AsyncMock(return_value=message), create=True) as answer:
+            await self.module.spybackup(message)
+        self.module._client.send_file.assert_not_awaited()
+        self.assertEqual(answer.await_args.args[1], self.module.strings("backup_empty"))
+
+    async def test_failed_upload_removes_archive_and_reports_error(self):
+        (self.module._backup_root / "received" / "file.txt").write_bytes(b"saved")
+        self.module.strings = lambda key: nekospy.NekoSpy.strings[key]
+        uploaded = []
+
+        async def fail_upload(chat, path, **kwargs):
+            uploaded.append(pathlib.Path(path))
+            raise RuntimeError("Upload failed")
+
+        self.module._client = types.SimpleNamespace(send_file=mock.AsyncMock(side_effect=fail_upload))
+        message = types.SimpleNamespace(chat_id=123)
+        with mock.patch.object(nekospy.utils, "answer", mock.AsyncMock(return_value=message), create=True) as answer:
+            with self.assertLogs(nekospy.logger, level="ERROR"):
+                await self.module.spybackup(message)
+        self.assertFalse(uploaded[0].exists())
+        self.assertEqual(answer.await_args.args[1], self.module.strings("backup_failed"))
+
     def test_prepare_creates_sent_and_received_directories(self):
         self.assertEqual(
             {path.name for path in self.module._backup_root.iterdir()},
