@@ -1,4 +1,4 @@
-__version__ = (1, 4, 0)
+__version__ = (1, 5, 0)
 
 # ©️ Dan Gazizullin, 2021-2022
 # This file is a part of Hikka Userbot
@@ -11,12 +11,15 @@ __version__ = (1, 4, 0)
 # meta developer: @rotkranz
 # scope: hikka_only
 # scope: hikka_min 1.6.0
+# requires: pyzipper
 
 import asyncio
 import contextlib
 import io
 import logging
+import os
 import re
+import tempfile
 import time
 import typing
 from functools import partial
@@ -51,6 +54,10 @@ class NekoSpy(loader.Module):
 
     strings = {
     "name": "NekoSpy",
+    "backup_empty": "📂 <b>У NekoSpyBSP немає файлів для архівування.</b>",
+    "backup_working": "🔐 <b>Створюю зашифрований архів NekoSpyBSP…</b>",
+    "backup_done": "🔐 <b>Архів NekoSpyBSP: {} файлів.</b>",
+    "backup_failed": "⚠️ <b>Не вдалося створити або надіслати архів. Подробиці в журналі Hikka.</b>",
     "state": f"{rei} <b>Режим шпигування зараз {{}}</b>",
     "spybl": f"{rei} <b>Поточний чат додано до чорного списку шпигування.</b>",
     "spybl_removed": f"{rei} <b>Поточний чат видалено з чорного списку шпигування.</b>",
@@ -762,6 +769,56 @@ class NekoSpy(loader.Module):
         }
         for directory in self._backup_dirs.values():
             directory.mkdir(parents=True, exist_ok=True)
+
+    def _create_backup_archive(self, destination: Path) -> int:
+        """Archive regular backup files with AES; never follow symbolic links."""
+        import pyzipper
+
+        if self._backup_root.is_symlink() or not self._backup_root.is_dir():
+            return 0
+        root = self._backup_root.resolve()
+        count = 0
+        with pyzipper.AESZipFile(
+            destination, "w", compression=pyzipper.ZIP_DEFLATED,
+            encryption=pyzipper.WZ_AES,
+        ) as archive:
+            archive.setpassword(b"789456123")
+            archive.setencryption(pyzipper.WZ_AES, nbits=256)
+            for directory, subdirectories, filenames in os.walk(root):
+                subdirectories[:] = sorted(
+                    name for name in subdirectories
+                    if not (Path(directory) / name).is_symlink()
+                )
+                for name in sorted(filenames):
+                    path = Path(directory) / name
+                    if path.is_symlink() or not path.is_file():
+                        continue
+                    relative = path.resolve().relative_to(root)
+                    archive.write(path, f"{self.backup_root_name}/{relative.as_posix()}")
+                    count += 1
+        return count
+
+    @loader.command()
+    async def spybackup(self, message: Message):
+        """Надіслати всі файли NekoSpyBSP у поточний чат як AES ZIP (пароль: 789456123)."""
+        status = await utils.answer(message, self.strings("backup_working"))
+        try:
+            with tempfile.TemporaryDirectory(prefix="nekospy-export-") as temporary:
+                archive = Path(temporary) / "NekoSpyBSP.zip"
+                count = await asyncio.to_thread(self._create_backup_archive, archive)
+                if not count:
+                    await utils.answer(status, self.strings("backup_empty"))
+                    return
+                await self._client.send_file(
+                    utils.get_chat_id(message),
+                    str(archive),
+                    force_document=True,
+                    caption=self.strings("backup_done").format(count),
+                )
+            await utils.answer(status, self.strings("backup_done").format(count))
+        except Exception:
+            logger.exception("Failed to export NekoSpyBSP archive")
+            await utils.answer(status, self.strings("backup_failed"))
 
     @staticmethod
     def _safe_filename(filename: str) -> str:

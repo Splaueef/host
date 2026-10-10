@@ -78,6 +78,13 @@ Instagram, X, Reddit, Pinterest, Spotify, SoundCloud та інших сайті�
 
 ## Інші модулі — короткий довідник
 
+NekoSpy: команда `.spybackup` надсилає в поточний чат усі звичайні файли
+з `NekoSpyBSP` (включно з підпапками) як `NekoSpyBSP.zip`, зашифрований
+AES-256 із паролем `789456123`. Команда доступна власнику Hikka;
+локальні копії залишаються на місці. Потрібна залежність `pyzipper`
+(оголошена в модулі); для розпакування використовуйте програму з підтримкою
+AES ZIP, наприклад 7-Zip.
+
 | Модуль | Команди |
 | --- | --- |
 | DailyNews | `.newsrun`, `.newstoday`, `.newsyesterday`, `.newsweek`, `.newscompare`, `.newsadd`, `.newslist`, `.newsdel @канал 3`, `.newsstatus`, `.newsreset` |

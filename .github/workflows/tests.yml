@@ -17,7 +17,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pyflakes aiohttp matplotlib sympy numpy Pillow -r hikka_hub/requirements.txt
+          pip install pytest pyflakes aiohttp matplotlib sympy numpy Pillow pyzipper -r hikka_hub/requirements.txt
       - name: Pyflakes
         run: python -m pyflakes *.py hikka_hub/*.py
       - name: Pytest
