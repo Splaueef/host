@@ -28,4 +28,5 @@ systemd
 teledocs
 timeinfo
 vdlt
+voicechat
 walletp2p
