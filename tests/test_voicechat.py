@@ -1878,3 +1878,61 @@ class RadioTest(unittest.IsolatedAsyncioTestCase):
             await self.mod._restore_all()
         self.assertEqual(self._sources(), ["http://127.0.0.1/tg/10"])
         self.assertTrue(self._player().radio)
+
+
+class _SlowInline(_Inline):
+    """Hikka's form() that waits for the bot's confirmation."""
+
+    def __init__(self):
+        super().__init__()
+        self.confirmed = asyncio.Event()
+
+    async def form(self, text, message=None, reply_markup=None, **kwargs):
+        await self.confirmed.wait()
+        return await super().form(text, message, reply_markup, **kwargs)
+
+
+class SlowPanelTest(unittest.IsolatedAsyncioTestCase):
+    _player = PlaybackTest._player
+    _end = PlaybackTest._end
+
+    def setUp(self):
+        PlaybackTest.setUp(self)
+        self.mod.inline = _SlowInline()
+        self.mod._client.edit_message = mock.AsyncMock()
+        self.mod._client.delete_messages = mock.AsyncMock()
+        status = types.SimpleNamespace(id=77)
+        vc_utils.answer.side_effect = lambda message, *a, **k: status
+        self.addCleanup(
+            setattr, vc_utils.answer, "side_effect", lambda message, *a, **k: message
+        )
+        patcher = mock.patch.object(voicechat, "PANEL_TIMEOUT", 0.01)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_unconfirmed_panel_does_not_block_playback(self):
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcadd(_Message("https://b"))
+        player = self._player()
+        self.assertIsNone(player.panel)
+        self.assertEqual(player.now_message, 77)  # the text stands in
+        self.assertFalse(player.lock.locked())
+
+        await self._end("AUDIO", "VIDEO")
+        self.assertEqual(self.calls.played[-1][1], "https://b")
+        self.assertEqual(len(self.mod.inline.forms), 0)  # no second panel
+        self.assertIn("https://b", self.mod._client.edit_message.await_args.args[2])
+
+        self.mod.inline.confirmed.set()
+        await asyncio.sleep(0.05)
+        self.assertIsNotNone(player.panel)
+        self.assertIn("https://b", player.panel.text)
+        self.assertIsNone(player.now_message)
+        self.mod._client.delete_messages.assert_awaited_with(CHAT, 77)
+
+    async def test_late_panel_after_stop_is_closed(self):
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcstop(_Message())
+        self.mod.inline.confirmed.set()
+        await asyncio.sleep(0.05)
+        self.assertIn("зупинено", self.mod.inline.forms[-1].text)

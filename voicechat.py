@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 2.4.0
+# meta version: 2.4.1
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -92,6 +92,10 @@ OVERLOAD_SAMPLES = 2  # ticks in a row (PANEL_REFRESH apart)
 RELAX_PERCENT = 55.0  # below this a new track may step back up
 QUALITY_STEPS = ("4k", "1440p", "1080p", "720p", "480p", "360p")
 PANEL_REFRESH = 15.0
+# Hikka's inline.form() posts the panel and then waits, with no time limit,
+# until the bot hears that it was sent; only then it hands the panel over.
+# Playback does not wait longer than this: the chat gets the text for now.
+PANEL_TIMEOUT = 20.0
 SEEK_STEP = 10
 VOLUME_STEP = 10
 RESTORE_DELAY = 15.0
@@ -1273,6 +1277,7 @@ class Player:
         self.ticker = None
         self.last_panel_text = None
         self.now_message = None  # id of the "now playing" text, edited in place
+        self.panel_task = None  # a panel Hikka has not handed over yet
         self.radio = False
         self.radio_channel = None  # overrides the radio_channel config value
         self.radio_order = []  # message ids of the current round
@@ -3903,16 +3908,32 @@ class VoiceChatMod(loader.Module):
         """Post a fresh control panel (replacing ``status`` if given)."""
         if player.current is None:
             return False
+        if player.panel_task is not None and not player.panel_task.done():
+            return False  # one is still on its way; the text stands in
         old = player.panel
         text = self._panel_text(player)
-        try:
-            panel = await self.inline.form(
+        task = asyncio.ensure_future(
+            self.inline.form(
                 text,
                 message=status if status is not None else player.chat_id,
                 reply_markup=self._panel_markup(player),
                 disable_security=True,
                 silent=True,
             )
+        )
+        try:
+            panel = await asyncio.wait_for(asyncio.shield(task), PANEL_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "VoiceChat: the inline bot has not confirmed the panel in %ss, "
+                "showing text until it does",
+                PANEL_TIMEOUT,
+            )
+            player.panel_task = task
+            task.add_done_callback(
+                lambda done: asyncio.ensure_future(self._adopt_panel(player, done))
+            )
+            return False
         except Exception as error:
             logger.info("VoiceChat panel unavailable: %s", error)
             return False
@@ -3924,6 +3945,30 @@ class VoiceChatMod(loader.Module):
             with contextlib.suppress(Exception):
                 await old.delete()
         return True
+
+    async def _adopt_panel(self, player, task):
+        """Take over a panel Hikka handed over after PANEL_TIMEOUT."""
+        if player.panel_task is task:
+            player.panel_task = None
+        if task.cancelled() or task.exception() is not None or not task.result():
+            return
+        panel = task.result()
+        if self._players.get(player.chat_id) is not player or player.current is None:
+            with contextlib.suppress(Exception):
+                await panel.edit(self.strings("stopped"), reply_markup=[])
+            return
+        old, player.panel = player.panel, panel
+        player.last_panel_text = None
+        if player.now_message is not None:
+            # The stand-in text (Hikka deletes it itself when it was the
+            # command's answer).
+            with contextlib.suppress(Exception):
+                await self._client.delete_messages(player.chat_id, player.now_message)
+            player.now_message = None
+        if old is not None and old is not panel:
+            with contextlib.suppress(Exception):
+                await old.delete()
+        await self._refresh_panel(player)
 
     async def _refresh_panel(self, player):
         """Edit the panel in place; False when there is none or it failed."""
