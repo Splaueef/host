@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 2.4.1
+# meta version: 2.4.2
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -93,9 +93,13 @@ RELAX_PERCENT = 55.0  # below this a new track may step back up
 QUALITY_STEPS = ("4k", "1440p", "1080p", "720p", "480p", "360p")
 PANEL_REFRESH = 15.0
 # Hikka's inline.form() posts the panel and then waits, with no time limit,
-# until the bot hears that it was sent; only then it hands the panel over.
-# Playback does not wait longer than this: the chat gets the text for now.
+# until the bot hears that it was sent (``chosen_inline_result``, which
+# Telegram reports only with inline feedback on in @BotFather); without it
+# the panel can never be edited.  Hikka's edit() also reports failure by
+# returning False, not by raising.  After this long, or this many failed
+# edits in a row, the panel becomes a text message the account edits itself.
 PANEL_TIMEOUT = 20.0
+PANEL_FAILURES = 3
 SEEK_STEP = 10
 VOLUME_STEP = 10
 RESTORE_DELAY = 15.0
@@ -1277,7 +1281,8 @@ class Player:
         self.ticker = None
         self.last_panel_text = None
         self.now_message = None  # id of the "now playing" text, edited in place
-        self.panel_task = None  # a panel Hikka has not handed over yet
+        self.panel_failures = 0
+        self.last_now_text = None
         self.radio = False
         self.radio_channel = None  # overrides the radio_channel config value
         self.radio_order = []  # message ids of the current round
@@ -1630,6 +1635,14 @@ class VoiceChatMod(loader.Module):
         ),
         "radio_next": "📻 Далі з радіо: {}",
         "panel_radio": "\n📻 Радіо: грає музика з каналу",
+        "inline_broken": (
+            "⚠️ <b>Inline-бот не дає оновлювати панель</b>: Telegram не "
+            "повідомляє йому, що панель надіслано. Тому панель тепер текстова "
+            "й без кнопок, керуйте командами.\n"
+            "Щоб повернути кнопки: @BotFather → <code>/setinlinefeedback</code> "
+            "→ {bot} → <b>Enabled</b>, потім <code>{p}vcnow</code>."
+        ),
+        "inline_your_bot": "бот Hikka",
     }
 
     def __init__(self):
@@ -1802,6 +1815,8 @@ class VoiceChatMod(loader.Module):
         self._restore_task = None
         self._warm_task = None
         self._health_task = None
+        self._inline_broken = False
+        self._inline_hint_sent = False
 
     async def client_ready(self, client, db):
         self._client = client
@@ -3076,32 +3091,43 @@ class VoiceChatMod(loader.Module):
             return
         if self._panel_enabled() and await self._show_panel(player, status):
             return
-        if status is None and not self.config["announce"]:
+        if self._panel_enabled():
+            text = self._now_text(player)  # the text panel
+        elif status is None and not self.config["announce"]:
             return
-        message = await self._say(
-            player.chat_id, status, note or self._playing_text(player.current)
-        )
+        else:
+            text = note or self._now_text(player)
+        message = await self._say(player.chat_id, status, text)
         message_id = getattr(message, "id", None)
         player.now_message = message_id if isinstance(message_id, int) else None
+        player.last_now_text = text
+
+    def _now_text(self, player):
+        """The "now playing" text: the whole panel (progress, volume …) when
+        a panel is wanted but the inline bot cannot keep one."""
+        if self._panel_enabled():
+            return self._panel_text(player)
+        return self._playing_text(player.current)
 
     async def _edit_now(self, player, text=None):
         """Edit the existing panel / "now playing" text; False if there is none."""
-        if self._panel_enabled() and player.panel is not None and text is None:
+        if player.panel is not None and text is None:
             return await self._refresh_panel(player)
         if player.now_message is None:
             return False
+        text = text or self._now_text(player)
+        if text == player.last_now_text:
+            return True
         try:
             await self._client.edit_message(
-                player.chat_id,
-                player.now_message,
-                text or self._playing_text(player.current),
-                link_preview=False,
+                player.chat_id, player.now_message, text, link_preview=False
             )
         except Exception as error:
             if "not modified" in str(error).lower():
                 return True
             player.now_message = None
             return False
+        player.last_now_text = text
         return True
 
     def _icon(self, track):
@@ -3428,7 +3454,7 @@ class VoiceChatMod(loader.Module):
                 with contextlib.suppress(Exception):
                     await self._calls.pause(player.chat_id)
                     player.mark_paused()
-        await self._refresh_panel(player)
+        await self._update_panel(player)
         if self.config["announce"]:
             with contextlib.suppress(Exception):
                 await self._client.send_message(
@@ -3906,12 +3932,11 @@ class VoiceChatMod(loader.Module):
 
     async def _show_panel(self, player, status=None):
         """Post a fresh control panel (replacing ``status`` if given)."""
-        if player.current is None:
+        if player.current is None or self._inline_broken:
             return False
-        if player.panel_task is not None and not player.panel_task.done():
-            return False  # one is still on its way; the text stands in
         old = player.panel
         text = self._panel_text(player)
+        posted_at = time.time()
         task = asyncio.ensure_future(
             self.inline.form(
                 text,
@@ -3922,17 +3947,10 @@ class VoiceChatMod(loader.Module):
             )
         )
         try:
-            panel = await asyncio.wait_for(asyncio.shield(task), PANEL_TIMEOUT)
+            panel = await asyncio.wait_for(task, PANEL_TIMEOUT)
         except asyncio.TimeoutError:
-            logger.warning(
-                "VoiceChat: the inline bot has not confirmed the panel in %ss, "
-                "showing text until it does",
-                PANEL_TIMEOUT,
-            )
-            player.panel_task = task
-            task.add_done_callback(
-                lambda done: asyncio.ensure_future(self._adopt_panel(player, done))
-            )
+            await self._delete_stray_panel(player.chat_id, posted_at)
+            await self._inline_failed(player, "no chosen_inline_result")
             return False
         except Exception as error:
             logger.info("VoiceChat panel unavailable: %s", error)
@@ -3941,34 +3959,64 @@ class VoiceChatMod(loader.Module):
             return False
         player.panel = panel
         player.last_panel_text = text
+        player.panel_failures = 0
         if old is not None and old is not panel:
             with contextlib.suppress(Exception):
                 await old.delete()
-        return True
-
-    async def _adopt_panel(self, player, task):
-        """Take over a panel Hikka handed over after PANEL_TIMEOUT."""
-        if player.panel_task is task:
-            player.panel_task = None
-        if task.cancelled() or task.exception() is not None or not task.result():
-            return
-        panel = task.result()
-        if self._players.get(player.chat_id) is not player or player.current is None:
-            with contextlib.suppress(Exception):
-                await panel.edit(self.strings("stopped"), reply_markup=[])
-            return
-        old, player.panel = player.panel, panel
-        player.last_panel_text = None
         if player.now_message is not None:
-            # The stand-in text (Hikka deletes it itself when it was the
-            # command's answer).
+            # The text panel that stood in for it.
             with contextlib.suppress(Exception):
                 await self._client.delete_messages(player.chat_id, player.now_message)
             player.now_message = None
-        if old is not None and old is not panel:
+        return True
+
+    async def _delete_stray_panel(self, chat_id, since):
+        """Remove the panel Hikka posted but never handed over."""
+        bot_id = getattr(self.inline, "bot_id", None)
+        if not bot_id:
+            return
+        with contextlib.suppress(Exception):
+            async for message in self._client.iter_messages(chat_id, limit=15):
+                date = getattr(message, "date", None)
+                if date is not None and date.timestamp() < since - 10:
+                    break
+                if message.out and getattr(message, "via_bot_id", None) == bot_id:
+                    await message.delete()
+
+    async def _inline_failed(self, player, reason):
+        """The inline bot cannot keep a panel: use text for this session."""
+        logger.warning(
+            "VoiceChat: the inline panel cannot be edited (%s), using a text panel",
+            reason,
+        )
+        self._inline_broken = True
+        panel, player.panel = player.panel, None
+        player.last_panel_text = None
+        if panel is not None:
             with contextlib.suppress(Exception):
-                await old.delete()
-        await self._refresh_panel(player)
+                await panel.delete()
+        if not self._inline_hint_sent:
+            self._inline_hint_sent = True
+            bot = getattr(self.inline, "bot_username", None)
+            with contextlib.suppress(Exception):
+                await self._client.send_message(
+                    player.chat_id,
+                    self.strings("inline_broken").format(
+                        bot=f"@{bot}" if bot else self.strings("inline_your_bot"),
+                        p=self.get_prefix(),
+                    ),
+                )
+
+    async def _update_panel(self, player):
+        """Bring the panel, inline or text, up to date (ticker, buttons)."""
+        if player.current is None:
+            return
+        if player.panel is not None:
+            if await self._refresh_panel(player) or player.panel is not None:
+                return
+            await self._show_now(player)  # the inline panel was given up
+        elif player.now_message is not None and self._panel_enabled():
+            await self._edit_now(player)
 
     async def _refresh_panel(self, player):
         """Edit the panel in place; False when there is none or it failed."""
@@ -3978,11 +4026,20 @@ class VoiceChatMod(loader.Module):
         if text == player.last_panel_text:
             return True
         try:
-            await player.panel.edit(text, reply_markup=self._panel_markup(player))
-            player.last_panel_text = text
+            result = await player.panel.edit(
+                text, reply_markup=self._panel_markup(player)
+            )
         except Exception as error:
             logger.debug("VoiceChat panel refresh failed: %s", error)
+            result = False
+        if result is False:  # Hikka returns False instead of raising
+            player.panel_failures += 1
+            if player.panel_failures >= PANEL_FAILURES:
+                # Callers that only refresh post the text panel instead.
+                await self._inline_failed(player, "edits keep failing")
             return False
+        player.panel_failures = 0
+        player.last_panel_text = text
         return True
 
     async def _close_panel(self, player):
@@ -4009,7 +4066,7 @@ class VoiceChatMod(loader.Module):
             await asyncio.sleep(PANEL_REFRESH)
             with contextlib.suppress(Exception):
                 await self._watch_load(player)
-            await self._refresh_panel(player)
+            await self._update_panel(player)
             self._save_state(periodic=True)
 
     async def _panel_action(self, call, chat_id, action):
@@ -4034,7 +4091,7 @@ class VoiceChatMod(loader.Module):
             text = f"❌ {str(error)[:150] or type(error).__name__}"
         await toast(text or "")
         if self._players.get(chat_id) is player:
-            await self._refresh_panel(player)
+            await self._update_panel(player)
 
     async def _act(self, player, action, value=None):
         """Shared by commands and panel buttons; returns a short toast."""
@@ -4300,7 +4357,7 @@ class VoiceChatMod(loader.Module):
                 else:
                     text = self.strings("queued_many").format(count=len(tracks))
                 await self._say(chat_id, status, text)
-                await self._refresh_panel(player)
+                await self._update_panel(player)
                 return
 
             first, rest = tracks[0], tracks[1:]
@@ -4374,7 +4431,7 @@ class VoiceChatMod(loader.Module):
             return await utils.answer(message, self.strings("already_paused"))
         await self._act(player, "pause")
         await utils.answer(message, self.strings("paused").format(self.get_prefix()))
-        await self._refresh_panel(player)
+        await self._update_panel(player)
 
     @loader.group_member
     @loader.command(ru_doc="Продовжити")
@@ -4387,7 +4444,7 @@ class VoiceChatMod(loader.Module):
             return await utils.answer(message, self.strings("not_paused"))
         await self._act(player, "resume")
         await utils.answer(message, self.strings("resumed"))
-        await self._refresh_panel(player)
+        await self._update_panel(player)
 
     @loader.group_member
     @loader.command(ru_doc="Наступний трек")
@@ -4449,7 +4506,7 @@ class VoiceChatMod(loader.Module):
         except Exception as error:
             return await utils.answer(message, self._error_text(track, error))
         await utils.answer(message, self.strings("seeked").format(fmt_time(target)))
-        await self._refresh_panel(player)
+        await self._update_panel(player)
 
     @loader.group_member
     @loader.command(ru_doc="<1-200> — гучність")
@@ -4463,7 +4520,7 @@ class VoiceChatMod(loader.Module):
             return await utils.answer(message, self.strings("volume_usage"))
         await self._act(player, "volume", int(value))
         await utils.answer(message, self.strings("volume").format(value))
-        await self._refresh_panel(player)
+        await self._update_panel(player)
 
     @loader.group_member
     @loader.command(ru_doc="Повтор поточного треку")
@@ -4476,7 +4533,7 @@ class VoiceChatMod(loader.Module):
         await utils.answer(
             message, self.strings("loop_on" if player.loop else "loop_off")
         )
-        await self._refresh_panel(player)
+        await self._update_panel(player)
 
     @loader.group_member
     @loader.command(ru_doc="[N] — звукова доріжка (мова озвучки)")
@@ -4521,7 +4578,7 @@ class VoiceChatMod(loader.Module):
                 utils.escape_html(self._audio_track_label(streams[index], index))
             ),
         )
-        await self._refresh_panel(player)
+        await self._update_panel(player)
 
     @loader.group_member
     @loader.command(ru_doc="Черга")
@@ -4577,7 +4634,7 @@ class VoiceChatMod(loader.Module):
             message, self.strings("removed").format(self._title_html(track)),
             link_preview=False,
         )
-        await self._refresh_panel(player)
+        await self._update_panel(player)
 
     @loader.group_member
     @loader.command(ru_doc="<N> <M> — пересунути трек у черзі")
@@ -4606,7 +4663,7 @@ class VoiceChatMod(loader.Module):
             self.strings("moved").format(pos=target + 1, title=self._title_html(track)),
             link_preview=False,
         )
-        await self._refresh_panel(player)
+        await self._update_panel(player)
 
     @loader.group_member
     @loader.command(ru_doc="Очистити чергу")
@@ -4668,7 +4725,7 @@ class VoiceChatMod(loader.Module):
             if player is not None:
                 player.radio = False
                 self._drop_radio_next(player)
-                await self._refresh_panel(player)
+                await self._update_panel(player)
             return await utils.answer(message, self.strings("radio_off"))
 
         if action not in ("on", "reload"):
@@ -4722,7 +4779,7 @@ class VoiceChatMod(loader.Module):
         self._store_settings(chat_id, radio=True)
         if not idle:
             self._schedule_prefetch(player)
-            await self._refresh_panel(player)
+            await self._update_panel(player)
             return await utils.answer(
                 status, self.strings("radio_on_later").format(count=len(songs))
             )
@@ -4735,7 +4792,14 @@ class VoiceChatMod(loader.Module):
         player = await self._active(message, "view")
         if player is None:
             return
+        self._inline_broken = False  # e.g. inline feedback was switched on
         if self._panel_enabled() and await self._show_panel(player, message):
+            return
+        if self._panel_enabled() and player.now_message is not None:
+            with contextlib.suppress(Exception):
+                await self._client.delete_messages(player.chat_id, player.now_message)
+            player.now_message = None
+            await self._show_now(player, message)
             return
         await utils.answer(message, self._panel_text(player), link_preview=False)
 

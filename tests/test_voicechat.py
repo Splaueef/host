@@ -1899,6 +1899,7 @@ class SlowPanelTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         PlaybackTest.setUp(self)
         self.mod.inline = _SlowInline()
+        self.mod.inline.bot_username = "hikka_test_bot"
         self.mod._client.edit_message = mock.AsyncMock()
         self.mod._client.delete_messages = mock.AsyncMock()
         status = types.SimpleNamespace(id=77)
@@ -1910,29 +1911,83 @@ class SlowPanelTest(unittest.IsolatedAsyncioTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    async def test_unconfirmed_panel_does_not_block_playback(self):
+    def _hints(self):
+        return [
+            c.args[1]
+            for c in self.mod._client.send_message.await_args_list
+            if "setinlinefeedback" in c.args[1]
+        ]
+
+    async def test_unconfirmed_panel_turns_into_a_text_panel(self):
         await self.mod.vcplay(_Message("https://a"))
         await self.mod.vcadd(_Message("https://b"))
         player = self._player()
         self.assertIsNone(player.panel)
-        self.assertEqual(player.now_message, 77)  # the text stands in
+        self.assertEqual(player.now_message, 77)
         self.assertFalse(player.lock.locked())
+        self.assertEqual(len(self._hints()), 1)
+        self.assertIn("@hikka_test_bot", self._hints()[0])
 
+        # The text panel keeps its progress current …
+        player.started_at -= 30
+        await self.mod._update_panel(player)
+        chat, message_id, text = self.mod._client.edit_message.await_args.args
+        self.assertEqual((chat, message_id), (CHAT, 77))
+        self.assertIn("0:30", text)
+
+        # … and shows the next track without new panels or hints.
         await self._end("AUDIO", "VIDEO")
         self.assertEqual(self.calls.played[-1][1], "https://b")
-        self.assertEqual(len(self.mod.inline.forms), 0)  # no second panel
+        self.assertEqual(len(self.mod.inline.forms), 0)
         self.assertIn("https://b", self.mod._client.edit_message.await_args.args[2])
+        self.assertEqual(len(self._hints()), 1)
 
-        self.mod.inline.confirmed.set()
-        await asyncio.sleep(0.05)
-        self.assertIsNotNone(player.panel)
-        self.assertIn("https://b", player.panel.text)
-        self.assertIsNone(player.now_message)
+    async def test_vcnow_tries_the_inline_panel_again(self):
+        await self.mod.vcplay(_Message("https://a"))
+        self.mod.inline.confirmed.set()  # e.g. inline feedback switched on
+        await self.mod.vcnow(_Message())
+        self.assertIsNotNone(self._player().panel)
+        self.assertIsNone(self._player().now_message)
         self.mod._client.delete_messages.assert_awaited_with(CHAT, 77)
 
-    async def test_late_panel_after_stop_is_closed(self):
+
+class _DeadPanel(_Panel):
+    async def edit(self, text, reply_markup=None):
+        return False  # what Hikka returns without an inline_message_id
+
+
+class _DeadInline(_Inline):
+    async def form(self, text, message=None, reply_markup=None, **kwargs):
+        panel = _DeadPanel(text, reply_markup)
+        self.forms.append(panel)
+        return panel
+
+
+class DeadPanelTest(unittest.IsolatedAsyncioTestCase):
+    setUp = PlaybackTest.setUp
+    _player = PlaybackTest._player
+
+    async def test_panel_that_cannot_be_edited_is_replaced_by_text(self):
+        self.mod.inline = _DeadInline()
+        self.mod._client.send_message = mock.AsyncMock(
+            side_effect=lambda chat, text, **k: types.SimpleNamespace(id=5)
+        )
+        self.mod._client.edit_message = mock.AsyncMock()
         await self.mod.vcplay(_Message("https://a"))
-        await self.mod.vcstop(_Message())
-        self.mod.inline.confirmed.set()
-        await asyncio.sleep(0.05)
-        self.assertIn("зупинено", self.mod.inline.forms[-1].text)
+        player = self._player()
+        panel = player.panel
+        for seconds in range(1, voicechat.PANEL_FAILURES + 1):
+            player.started_at -= 15
+            await self.mod._update_panel(player)
+        self.assertIsNone(player.panel)
+        self.assertTrue(panel.deleted)
+        self.assertEqual(player.now_message, 5)
+        texts = [c.args[1] for c in self.mod._client.send_message.await_args_list]
+        self.assertTrue(any("setinlinefeedback" in t for t in texts))
+        self.assertIn("0:45", texts[-1])  # the text panel, progress included
+
+        player.started_at -= 15
+        await self.mod._update_panel(player)
+        self.assertIn("1:00", self.mod._client.edit_message.await_args.args[2])
+        await self.mod._show_now(player)
+        self.assertEqual(len(self.mod.inline.forms), 1)  # no new inline panels
