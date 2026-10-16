@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 2.4.0
+# meta version: 2.4.1
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
