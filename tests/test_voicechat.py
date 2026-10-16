@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib.util
+import os
 import pathlib
 import sys
 import time
@@ -539,17 +540,24 @@ class _TgClient:
         self.data = data
         self.expire_first = expire_first
         self.downloads = 0
+        self.requested = []
         self.refetched = False
         self.download_media = mock.AsyncMock()
 
-    async def iter_download(self, message, offset=0, request_size=0, file_size=None):
+    async def iter_download(
+        self, message, offset=0, request_size=0, file_size=None, limit=None
+    ):
         assert offset % request_size == 0, offset
         self.downloads += 1
         if self.expire_first and not self.refetched:
             raise RuntimeError("FILE_REFERENCE_EXPIRED")
-        while offset < len(self.data):
+        sent = 0
+        while offset < len(self.data) and (limit is None or sent < limit):
+            await asyncio.sleep(0)
+            self.requested.append(offset)
             yield self.data[offset:offset + request_size]
             offset += request_size
+            sent += 1
 
     async def get_messages(self, chat_id, ids=None):
         self.refetched = True
@@ -558,7 +566,14 @@ class _TgClient:
 
 class TelegramStreamTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        import tempfile
+
         self.data = bytes(range(256)) * 9000  # ~2.2 MB, several chunks
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        patcher = mock.patch.object(voicechat, "WORK_DIR", folder.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.streamer = voicechat.TelegramStreamer()
         self.addAsyncCleanup(self.streamer.close)
 
@@ -609,6 +624,38 @@ class TelegramStreamTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body, self.data[-10:])
         status, _, _ = await self._get(url, f"bytes={len(self.data)}-")
         self.assertEqual(status, 416)
+
+    async def test_each_chunk_is_fetched_once_for_all_readers(self):
+        client = _TgClient(self.data)
+        message = types.SimpleNamespace(chat_id=-1, id=5)
+        url = await self.streamer.register(client, message, len(self.data))
+        # Two "ffmpeg" readers (sound and picture) plus a seek back.
+        results = await asyncio.gather(self._get(url), self._get(url))
+        self.assertTrue(all(body == self.data for _, _, body in results))
+        _, _, body = await self._get(url, "bytes=100-199")
+        self.assertEqual(body, self.data[100:200])
+        self.assertEqual(sorted(client.requested), sorted(set(client.requested)))
+        cache = self.streamer.cache(url)
+        self.assertTrue(cache.complete)
+        self.assertEqual(cache.progress, 1.0)
+
+    async def test_prebuffer_waits_for_the_start_and_cleans_up(self):
+        client = _TgClient(self.data)
+        message = types.SimpleNamespace(chat_id=-1, id=5)
+        url = await self.streamer.register(client, message, len(self.data))
+        cache = self.streamer.cache(url)
+        reports = []
+
+        async def report(fraction, cache):
+            reports.append(fraction)
+
+        await self.streamer.prebuffer(url, 0, 3 * voicechat.TG_CHUNK, report)
+        self.assertGreaterEqual(cache.buffered_from(0), 3)
+        path = cache.path
+        self.assertTrue(os.path.exists(path))
+        self.streamer.unregister(url)
+        await asyncio.sleep(0.05)
+        self.assertFalse(os.path.exists(path))
 
     async def test_unregistered_token_is_gone(self):
         client = _TgClient(self.data)

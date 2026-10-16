@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 1.6.0
+# meta version: 1.7.0
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -652,6 +652,171 @@ class BrowserSession:
 # their index at the end work, and seeking only fetches the part it needs.
 TG_CHUNK = 512 * 1024  # Telegram wants offsets aligned to the request size.
 TG_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+TG_RETRIES = 4
+# Free disk space kept aside when caching a file for streaming.
+TG_DISK_RESERVE = 300 * 1024 * 1024
+
+
+class TgCache:
+    """One download of a Telegram file shared by every reader.
+
+    py-tgcalls runs separate ffmpeg processes for sound and picture and
+    ffmpeg reopens the stream on every seek, so without this the same bytes
+    would be fetched again and again.  Several workers download chunks in
+    parallel (Telethon pipelines the requests over one connection), the
+    chunks around the current playback position first, then the rest of
+    the file in the background, into a sparse file on disk.
+    """
+
+    def __init__(self, item, path, workers=4):
+        self.item = item
+        self.size = item["size"]
+        self.chunks = max(1, -(-self.size // TG_CHUNK))
+        self.have = bytearray(self.chunks)
+        self.done = 0
+        self.focus = 0
+        self.inflight = set()
+        self.path = path
+        self.workers = max(1, int(workers))
+        self.error = None
+        self.started = time.monotonic()
+        self.fetched_bytes = 0
+        self._cond = asyncio.Condition()
+        self._tasks = []
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.truncate(self.size)  # sparse: no space used up front
+        self._fd = os.open(path, os.O_RDWR)
+
+    @property
+    def complete(self):
+        return self.done >= self.chunks
+
+    @property
+    def progress(self):
+        return self.done / self.chunks
+
+    @property
+    def speed(self):
+        """Download speed in bytes per second."""
+        return self.fetched_bytes / max(time.monotonic() - self.started, 0.001)
+
+    def start(self):
+        if not self._tasks and not self.complete:
+            self.started = time.monotonic()
+            self.fetched_bytes = 0
+            self._tasks = [
+                asyncio.ensure_future(self._worker()) for _ in range(self.workers)
+            ]
+
+    def _next(self):
+        for index in range(self.focus, self.chunks):
+            if not self.have[index] and index not in self.inflight:
+                return index
+        for index in range(0, self.focus):
+            if not self.have[index] and index not in self.inflight:
+                return index
+        return None
+
+    async def _worker(self):
+        while True:
+            async with self._cond:
+                index = self._next()
+                while index is None:
+                    if self.complete or self.error:
+                        return
+                    await self._cond.wait()
+                    index = self._next()
+                self.inflight.add(index)
+            try:
+                data = await self._fetch(index)
+                os.pwrite(self._fd, data, index * TG_CHUNK)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning("VoiceChat could not fetch chunk %s: %s", index, error)
+                async with self._cond:
+                    self.inflight.discard(index)
+                    self.error = error
+                    self._cond.notify_all()
+                return
+            async with self._cond:
+                self.inflight.discard(index)
+                if not self.have[index]:
+                    self.have[index] = 1
+                    self.done += 1
+                    self.fetched_bytes += len(data)
+                self._cond.notify_all()
+
+    async def _fetch(self, index):
+        expected = min(TG_CHUNK, self.size - index * TG_CHUNK)
+        for attempt in range(TG_RETRIES):
+            try:
+                async for chunk in self.item["client"].iter_download(
+                    self.item["message"],
+                    offset=index * TG_CHUNK,
+                    request_size=TG_CHUNK,
+                    limit=1,
+                    file_size=self.size,
+                ):
+                    data = bytes(chunk)
+                    if len(data) >= expected:
+                        return data[:expected]
+                    raise IOError("short chunk")
+                raise IOError("empty chunk")
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if attempt == TG_RETRIES - 1:
+                    raise
+                if "FILE_REFERENCE" in str(error).upper():
+                    await self._refresh_reference()
+                else:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+
+    async def _refresh_reference(self):
+        message = self.item["message"]
+        fresh = await self.item["client"].get_messages(
+            message.chat_id, ids=message.id
+        )
+        if fresh is not None:
+            self.item["message"] = fresh
+
+    async def wait_for(self, index):
+        """Wait until chunk ``index`` is on disk, steering workers to it."""
+        if self.have[index]:
+            return
+        self.start()
+        async with self._cond:
+            if not self.have[index]:
+                self.focus = index
+                self._cond.notify_all()
+            while not self.have[index]:
+                if self.error is not None:
+                    raise IOError(f"Telegram download failed: {self.error}")
+                await self._cond.wait()
+
+    def buffered_from(self, index):
+        """Number of chunks available in a row starting at ``index``."""
+        count = 0
+        while index + count < self.chunks and self.have[index + count]:
+            count += 1
+        return count
+
+    def read(self, start, length):
+        return os.pread(self._fd, length, start)
+
+    async def close(self):
+        for task in self._tasks:
+            task.cancel()
+        for task in self._tasks:
+            with contextlib.suppress(BaseException):
+                await task
+        self._tasks = []
+        with contextlib.suppress(OSError):
+            os.close(self._fd)
+        with contextlib.suppress(OSError):
+            os.remove(self.path)
 
 
 def parse_range(header, size):
@@ -677,11 +842,12 @@ def parse_range(header, size):
 class TelegramStreamer:
     """Serves Telegram documents to ffmpeg over local HTTP with Range."""
 
-    def __init__(self):
+    def __init__(self, workers=4):
         self._server = None
         self._port = None
         self._items = {}
         self._lock = asyncio.Lock()
+        self.workers = workers
 
     async def _ensure(self):
         async with self._lock:
@@ -694,20 +860,57 @@ class TelegramStreamer:
     async def register(self, client, message, size, mime=None, ext=""):
         await self._ensure()
         token = secrets.token_urlsafe(16)
-        self._items[token] = {
+        item = {
             "client": client,
             "message": message,
             "size": int(size),
             "mime": mime or "application/octet-stream",
+            "cache": None,
         }
+        os.makedirs(WORK_DIR, exist_ok=True)
+        if shutil.disk_usage(WORK_DIR).free > int(size) + TG_DISK_RESERVE:
+            item["cache"] = TgCache(
+                item, os.path.join(WORK_DIR, f"tg-{token}.part"), self.workers
+            )
+        self._items[token] = item
         safe_ext = ext if re.fullmatch(r"\.\w{1,8}", ext or "") else ""
         return f"http://127.0.0.1:{self._port}/{token}{safe_ext}"
 
+    @staticmethod
+    def _token(url):
+        return (url or "").rsplit("/", 1)[-1].split(".", 1)[0]
+
+    def cache(self, url):
+        item = self._items.get(self._token(url))
+        return item and item["cache"]
+
     def unregister(self, url):
-        token = (url or "").rsplit("/", 1)[-1].split(".", 1)[0]
-        self._items.pop(token, None)
+        item = self._items.pop(self._token(url), None)
+        if item and item["cache"] is not None:
+            asyncio.ensure_future(item["cache"].close())
+
+    async def prebuffer(self, url, start_byte, length, report=None, timeout=60):
+        """Wait until ``length`` bytes from ``start_byte`` are downloaded."""
+        cache = self.cache(url)
+        if cache is None:
+            return
+        first = min(cache.chunks - 1, max(0, int(start_byte)) // TG_CHUNK)
+        need = min(cache.chunks - first, max(1, -(-int(length) // TG_CHUNK)))
+        deadline = time.monotonic() + timeout
+        await cache.wait_for(first)
+        while cache.buffered_from(first) < need and time.monotonic() < deadline:
+            if cache.error is not None:
+                raise IOError(f"Telegram download failed: {cache.error}")
+            if report is not None:
+                await report(cache.buffered_from(first) / need, cache)
+            # Keep the workers on this region rather than the file's tail.
+            cache.focus = first + cache.buffered_from(first)
+            await asyncio.sleep(0.5)
 
     async def close(self):
+        for item in list(self._items.values()):
+            if item["cache"] is not None:
+                await item["cache"].close()
         self._items.clear()
         if self._server is not None:
             self._server.close()
@@ -770,6 +973,20 @@ class TelegramStreamer:
                 await writer.wait_closed()
 
     async def _send(self, item, start, end, writer):
+        cache = item["cache"]
+        if cache is None:
+            return await self._send_direct(item, start, end, writer)
+        position = start
+        while position <= end:
+            index = position // TG_CHUNK
+            await cache.wait_for(index)
+            stop = min(end + 1, (index + 1) * TG_CHUNK)
+            writer.write(cache.read(position, stop - position))
+            await writer.drain()
+            position = stop
+
+    async def _send_direct(self, item, start, end, writer):
+        """Without disk space for a cache: stream straight from Telegram."""
         aligned = start - start % TG_CHUNK
         skip = start - aligned
         remaining = end - start + 1
@@ -1066,6 +1283,13 @@ class VoiceChatMod(loader.Module):
             "повного завантаження на сервер)"
         ),
         "tg_stream_label": "потік із Telegram",
+        "cfg_tg_workers": (
+            "Скільки частин файлу з Telegram качати паралельно (більше — "
+            "швидше, 4–8 зазвичай достатньо)"
+        ),
+        "cfg_tg_prebuffer": "Скільки секунд відео набрати в буфер перед стартом",
+        "buffering": "⏳ <b>Буферизація:</b> {percent}% · {speed} МБ/с",
+        "now_download": "\nЗавантажено: {percent}% · {speed} МБ/с",
         "queue_empty": "📭 <b>Черга порожня.</b>",
         "queue_head": "🎶 <b>Черга ({}):</b>",
         "queue_more": "… і ще {}",
@@ -1135,6 +1359,18 @@ class VoiceChatMod(loader.Module):
                 True,
                 lambda: self.strings("cfg_tg_stream"),
                 validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "tg_workers",
+                4,
+                lambda: self.strings("cfg_tg_workers"),
+                validator=loader.validators.Integer(minimum=1, maximum=16),
+            ),
+            loader.ConfigValue(
+                "tg_prebuffer",
+                8,
+                lambda: self.strings("cfg_tg_prebuffer"),
+                validator=loader.validators.Integer(minimum=0, maximum=60),
             ),
             loader.ConfigValue(
                 "max_file_mb",
@@ -1929,6 +2165,7 @@ class VoiceChatMod(loader.Module):
         duration = getattr(file, "duration", None)
 
         if self.config["tg_stream"] and file.size:
+            self._streamer.workers = int(self.config["tg_workers"])
             url = await self._streamer.register(
                 self._client, reply, file.size, file.mime_type, file.ext or ""
             )
@@ -2002,6 +2239,9 @@ class VoiceChatMod(loader.Module):
         if not track.path:
             args += http_args(track.headers)
             args += hls_args(track.video_url, track.audio_url)
+        if track.has_video:
+            # Output option (after -i): sharper scaling than the default.
+            args += ["-atmid", "-sws_flags", "lanczos+accurate_rnd"]
         return shlex.join(args) if args else None
 
     def _fps(self, track):
@@ -2092,9 +2332,41 @@ class VoiceChatMod(loader.Module):
             return fmt_time(track.duration)
         return self.strings("unknown")
 
-    async def _start(self, player, track, offset=0):
+    async def _prebuffer(self, track, offset=0, status=None):
+        """Fill a few seconds of a Telegram file before the call starts it."""
+        seconds = int(self.config["tg_prebuffer"])
+        if not track.stream_url or seconds <= 0:
+            return
+        cache = self._streamer.cache(track.stream_url)
+        if cache is None or cache.complete:
+            return
+        duration = float(track.duration or 0)
+        rate = cache.size / duration if duration else 1024 * 1024
+        start = cache.size * min(1.0, offset / duration) if duration else 0
+        last = [0.0]
+
+        async def report(fraction, cache):
+            now = time.monotonic()
+            if status is None or now - last[0] < 2:
+                return
+            last[0] = now
+            with contextlib.suppress(Exception):
+                await utils.answer(
+                    status,
+                    self.strings("buffering").format(
+                        percent=int(fraction * 100),
+                        speed=f"{cache.speed / 1048576:.1f}",
+                    ),
+                )
+
+        await self._streamer.prebuffer(
+            track.stream_url, start, rate * seconds, report
+        )
+
+    async def _start(self, player, track, offset=0, status=None):
         """Resolve ``track`` and put it on air.  Caller holds ``player.lock``."""
         await self._resolve(track)
+        await self._prebuffer(track, offset, status)
         stream = await self._stream(track, offset)
         from pytgcalls.types import GroupCallConfig
 
@@ -2357,7 +2629,7 @@ class VoiceChatMod(loader.Module):
             status = await utils.answer(status, self.strings("resolving"))
             player.loop = False
             try:
-                await self._start(player, first)
+                await self._start(player, first, status=status)
             except Exception as error:
                 logger.exception("VoiceChat could not start playback")
                 self._drop_track_file(first, player)
@@ -2550,8 +2822,18 @@ class VoiceChatMod(loader.Module):
                 loop=self.strings("on" if player.loop else "off"),
                 quality=self._quality_label(track),
                 queued=len(player.queue),
-            ),
+            )
+            + self._download_line(track),
             link_preview=False,
+        )
+
+    def _download_line(self, track):
+        cache = self._streamer.cache(track.stream_url) if track.stream_url else None
+        if cache is None or cache.complete:
+            return ""
+        return self.strings("now_download").format(
+            percent=int(cache.progress * 100),
+            speed=f"{cache.speed / 1048576:.1f}",
         )
 
     def _browser_status(self):
