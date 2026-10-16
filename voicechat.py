@@ -1,6 +1,6 @@
 # meta developer: @Huang_Baike
-# meta version: 1.2.0
-# meta description: 🎙 Відтворення відео й музики з YouTube та інших сайтів у груповому дзвінку.
+# meta version: 1.4.0
+# meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
 """Stream YouTube (and anything yt-dlp understands) into Telegram group calls.
@@ -15,15 +15,19 @@ the account's authorisation key: no second login and no extra session file.
 import asyncio
 import collections
 import contextlib
+import html
 import importlib.util
 import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
+import urllib.request
+from urllib.parse import urljoin, urlsplit
 
 from .. import loader, utils
 
@@ -60,6 +64,10 @@ MAX_FPS = 60
 DEFAULT_FPS = 30
 RESOLVE_TTL = 4 * 60 * 60
 END_GRACE = 4.0
+# py-tgcalls adds -reconnect_at_eof to every URL, which keeps ffmpeg waiting
+# at the end of HLS streams, so the end event never comes.  When the known
+# duration has passed (pauses excluded), the next track starts anyway.
+WATCHDOG_SLACK = 6.0
 STALE_END = 1.5
 MAX_FAILED_IN_ROW = 3
 
@@ -152,19 +160,221 @@ def fit_frame(width, height, cap):
     return out_w, out_h
 
 
-def clamp_fps(fps):
+def clamp_fps(fps, cap=MAX_FPS):
+    cap = max(1, min(MAX_FPS, int(cap or MAX_FPS)))
     try:
         fps = float(fps or 0)
     except (TypeError, ValueError):
         fps = 0
     if fps <= 0:
-        return DEFAULT_FPS
-    return max(1, min(MAX_FPS, int(round(fps))))
+        return min(DEFAULT_FPS, cap)
+    return max(1, min(cap, int(round(fps))))
 
 
 def _chat_id(message):
     """Marked chat ID (``-100…`` for channels), as py-tgcalls expects it."""
     return getattr(message, "chat_id", None) or 0
+
+
+# ---------------------------------------------------------------- any site
+#
+# yt-dlp knows ~1800 sites.  For everything else the page itself is read:
+# <video>/<source> tags, og:video meta tags, media URLs inside player configs
+# (JW Player, Playerjs, Plyr, Video.js…) and, failing that, the embedded
+# <iframe> players, which go through yt-dlp and the same search in turn.
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+PAGE_LIMIT = 3 * 1024 * 1024
+SCRAPE_DEPTH = 2
+SCRAPE_FRAMES = 6
+MEDIA_URL_RE = re.compile(
+    r"""(?:https?:)?//[^\s"'<>()\\]+?\."""
+    r"""(?:m3u8|mpd|mp4|m4v|webm|mkv|mov|flv|mp3|m4a|aac|ogg|oga|opus|flac|wav)"""
+    r"""(?:\?[^\s"'<>\\]*)?""",
+    re.IGNORECASE,
+)
+SOURCE_TAG_RE = re.compile(
+    r"""<(?:video|audio|source)\b[^>]*?\s(?:data-)?src\s*=\s*["']([^"']+)["']""",
+    re.IGNORECASE,
+)
+FRAME_TAG_RE = re.compile(
+    r"""<(?:iframe|frame|embed)\b[^>]*?\s(?:data-)?src\s*=\s*["']([^"']+)["']""",
+    re.IGNORECASE,
+)
+META_TAG_RE = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)
+META_MEDIA_NAMES = (
+    "og:video",
+    "og:video:url",
+    "og:video:secure_url",
+    "og:audio",
+    "og:audio:url",
+    "twitter:player:stream",
+)
+TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+MEDIA_TYPES = ("video/", "audio/", "application/vnd.apple.mpegurl",
+               "application/x-mpegurl", "application/dash+xml")
+EXT_RANK = {
+    "m3u8": 0, "mpd": 1, "mp4": 2, "webm": 2, "mkv": 2, "mov": 2, "m4v": 2,
+    "flv": 3, "mp3": 4, "m4a": 4, "aac": 4, "ogg": 4, "oga": 4, "opus": 4,
+    "flac": 4, "wav": 4,
+}
+CODEC_NAMES = {
+    "avc1": "h264", "avc3": "h264", "hev1": "h265", "hvc1": "h265",
+    "hevc": "h265", "vp09": "vp9", "vp08": "vp8", "av01": "av1",
+    "mp4a": "aac", "ec-3": "eac3", "ac-3": "ac3",
+}
+
+
+def codec_name(codec):
+    if not codec or codec == "none":
+        return None
+    base = str(codec).split(".")[0].lower()
+    return CODEC_NAMES.get(base, base)
+
+
+def http_args(headers):
+    """ffmpeg input options for HTTP headers.
+
+    ffmpeg keeps only the last ``-headers`` option, so User-Agent and Referer
+    go through their own options and one remaining header through -headers.
+    """
+    headers = {str(k).lower(): str(v) for k, v in (headers or {}).items() if v}
+    args = []
+    if headers.get("user-agent"):
+        args += ["-user_agent", headers["user-agent"]]
+    if headers.get("referer"):
+        args += ["-referer", headers["referer"]]
+    for name in ("cookie", "origin"):
+        if headers.get(name):
+            args += ["-headers", f"{name.title()}: {headers[name]}"]
+            break
+    return args
+
+
+_HLS_OPTIONS = None
+
+
+def _hls_demuxer_options():
+    """Options this ffmpeg build's HLS demuxer knows (they vary by version)."""
+    global _HLS_OPTIONS
+    if _HLS_OPTIONS is None:
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-h", "demuxer=hls"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            _HLS_OPTIONS = set(re.findall(r"^\s*-(\w+)", result.stdout, re.M))
+        except (OSError, subprocess.SubprocessError):
+            _HLS_OPTIONS = set()
+    return _HLS_OPTIONS
+
+
+def hls_args(*urls):
+    """Let HLS playlists use segments with odd extensions (.jpg, .txt …)."""
+    if not any(".m3u8" in (url or "").lower() for url in urls):
+        return []
+    known = _hls_demuxer_options()
+    args = []
+    if "allowed_extensions" in known:
+        args += ["-allowed_extensions", "ALL"]
+    if "extension_picky" in known:  # ffmpeg 7.1+
+        args += ["-extension_picky", "0"]
+    return args
+
+
+def page_headers(page_url):
+    parts = urlsplit(page_url)
+    return {
+        "User-Agent": BROWSER_UA,
+        "Referer": page_url,
+        "Origin": f"{parts.scheme}://{parts.netloc}",
+    }
+
+
+def _media_rank(url):
+    path = urlsplit(url).path.lower()
+    ext = path.rsplit(".", 1)[-1] if "." in path else ""
+    height = re.search(r"(2160|1440|1080|720|480|360|240)", url)
+    return (EXT_RANK.get(ext, 5), -int(height.group(1)) if height else 0)
+
+
+def find_media(page, base_url):
+    """Media URLs in a page, the most promising first."""
+    text = html.unescape(
+        page.replace("\\/", "/").replace("\\u002F", "/").replace("\\u0026", "&")
+    )
+    found = []
+    for tag in META_TAG_RE.findall(text):
+        name = re.search(r"""(?:property|name)\s*=\s*["']([^"']+)""", tag, re.I)
+        content = re.search(r"""content\s*=\s*["']([^"']+)""", tag, re.I)
+        if name and content and name.group(1).lower() in META_MEDIA_NAMES:
+            found.append(content.group(1))
+    found += SOURCE_TAG_RE.findall(text)
+    found += MEDIA_URL_RE.findall(text)
+    urls = []
+    for url in found:
+        url = urljoin(base_url, url.strip())
+        if url.startswith(("http://", "https://")) and url not in urls:
+            urls.append(url)
+    return sorted(urls, key=_media_rank)
+
+
+def find_frames(page, base_url):
+    frames = []
+    for url in FRAME_TAG_RE.findall(html.unescape(page)):
+        url = urljoin(base_url, url.strip())
+        if url.startswith(("http://", "https://")) and url not in frames:
+            frames.append(url)
+    return frames
+
+
+def page_title(page):
+    match = TITLE_RE.search(page or "")
+    if not match:
+        return None
+    return html.unescape(re.sub(r"\s+", " ", match.group(1))).strip() or None
+
+
+def _strip_reconnect_at_eof(command):
+    """Drop ``-reconnect_at_eof 1`` from an ffmpeg argument list.
+
+    py-tgcalls adds it to every URL.  ffmpeg then treats each normal end of
+    file as a dropped connection: HLS playlists never get past their first
+    segment and plain files never end.  The other reconnect flags stay.
+    """
+    result = []
+    skip = False
+    for index, part in enumerate(command):
+        if skip:
+            skip = False
+            continue
+        if part == "-reconnect_at_eof" and index + 1 < len(command):
+            skip = True
+            continue
+        result.append(part)
+    return result
+
+
+def patch_pytgcalls():
+    """Install the ``-reconnect_at_eof`` fix into py-tgcalls (idempotent)."""
+    from pytgcalls import ffmpeg
+    from pytgcalls.types.stream import media_stream
+
+    original = ffmpeg.build_command
+    if getattr(original, "_voicechat_patched", False):
+        return
+
+    def build_command(*args, **kwargs):
+        return _strip_reconnect_at_eof(original(*args, **kwargs))
+
+    build_command._voicechat_patched = True
+    # check_stream looks the name up in ffmpeg, MediaStream in its own module.
+    ffmpeg.build_command = build_command
+    media_stream.build_command = build_command
 
 
 def is_youtube(source):
@@ -187,6 +397,12 @@ def _cookie_file_has(path, domains=YT_COOKIE_DOMAINS):
     except OSError:
         return False
     return any(domain in text for domain in domains)
+
+
+def _registered_domain(host):
+    """``cdn.www.example.co`` -> ``example.co`` for cookie lookups."""
+    parts = [part for part in (host or "").lower().split(".") if part]
+    return ".".join(parts[-2:]) if len(parts) >= 2 else (host or "")
 
 
 def _detect_js_runtime():
@@ -245,6 +461,9 @@ class Track:
         self.height = None
         self.fps = None
         self.is_live = False
+        self.has_audio = True
+        self.codecs = None
+        self.protocol = None
         self.resolved_at = 0.0
 
     @property
@@ -272,6 +491,7 @@ class Player:
         self.generation = 0
         self.pending_ends = set()
         self.end_task = None
+        self.watchdog = None
         self.loop = False
         self.volume = 100
         self.offset = 0.0
@@ -314,7 +534,14 @@ class VoiceChatMod(loader.Module):
         "name": "VoiceChat",
         "cfg_video_quality": (
             "Максимальна якість відео: 4k, 1440p, 1080p, 720p, 480p, 360p. "
-            "Береться найкраща доступна якість джерела, але не вище цієї"
+            "Береться найкраща якість джерела, але не вище цієї. Відео "
+            "кодується на сервері в реальному часі: вище 1080p потрібен "
+            "дуже потужний процесор, інакше картинка зависатиме"
+        ),
+        "cfg_max_fps": "Макс. кадрів за секунду (30 або 60; 60 — удвічі більше навантаження)",
+        "cfg_video_mode": (
+            "Як показувати відео: screen — як демонстрацію екрана (велике "
+            "вікно), camera — як відео з камери"
         ),
         "cfg_audio_quality": (
             "Якість звуку: high (48 кГц стерео — максимум для дзвінків), "
@@ -417,15 +644,28 @@ class VoiceChatMod(loader.Module):
         "on": "так",
         "off": "ні",
         "audio_only": "лише звук",
+        "no_audio": "без звуку",
     }
 
     def __init__(self):
         self.config = loader.ModuleConfig(
             loader.ConfigValue(
                 "video_quality",
-                "4k",
+                "1080p",
                 lambda: self.strings("cfg_video_quality"),
                 validator=loader.validators.Choice(list(VIDEO_CAPS)),
+            ),
+            loader.ConfigValue(
+                "max_fps",
+                30,
+                lambda: self.strings("cfg_max_fps"),
+                validator=loader.validators.Integer(minimum=10, maximum=MAX_FPS),
+            ),
+            loader.ConfigValue(
+                "video_mode",
+                "screen",
+                lambda: self.strings("cfg_video_mode"),
+                validator=loader.validators.Choice(["screen", "camera"]),
             ),
             loader.ConfigValue(
                 "audio_quality",
@@ -699,23 +939,31 @@ class VoiceChatMod(loader.Module):
             return self.lookup("VideoDownloader") or None
         return None
 
-    def _yt_context(self):
-        """Cookies file, JS runtime and browser cookies for YouTube requests."""
+    def _yt_context(self, url="https://www.youtube.com/"):
+        """Cookies file, JS runtime and browser cookies for ``url``'s site."""
         vdl = self._vdl()
+        youtube = is_youtube(url)
+        domains = (
+            YT_COOKIE_DOMAINS
+            if youtube
+            else (_registered_domain(urlsplit(url).hostname or ""),)
+        )
         candidates = []
         configured = str(self.config["cookies_file"] or "").strip()
         if configured:
             candidates.append(os.path.expanduser(configured))
         if vdl is not None:
             with contextlib.suppress(Exception):
-                candidates.append(vdl._cookies_for("https://www.youtube.com/"))
+                candidates.append(vdl._cookies_for(url))
         candidates.extend(YT_COOKIE_FILES)
-        cookies = next((path for path in candidates if _cookie_file_has(path)), None)
+        cookies = next(
+            (path for path in candidates if _cookie_file_has(path, domains)), None
+        )
 
         runtime = getattr(vdl, "_js_runtime", None) or _detect_js_runtime()
 
         browser = None
-        if vdl is not None:
+        if vdl is not None and youtube:
             with contextlib.suppress(Exception):
                 browser = _parse_browser_cookies(vdl._yt_browser_cookies_value())
         if browser and browser[1] and not os.path.isdir(browser[1]):
@@ -765,10 +1013,9 @@ class VoiceChatMod(loader.Module):
         import yt_dlp
 
         base = self._ydl_options(track.audio_only)
-        if is_youtube(track.source):
-            attempts = self._youtube_attempts(base, context or {})
-        else:
-            attempts = [base]
+        if not is_youtube(track.source):
+            return self._extract_any_sync(track, base, context or {})
+        attempts = self._youtube_attempts(base, context or {})
         error = None
         for options in attempts:
             try:
@@ -790,92 +1037,262 @@ class VoiceChatMod(loader.Module):
             error = ValueError("nothing found")
         raise error or ValueError("nothing found")
 
+    def _extract_any_sync(self, track, base, context):
+        """Any site: yt-dlp first, then the page and its embedded players."""
+        import yt_dlp
+
+        options = dict(base)
+        if context.get("cookies"):
+            options["cookiefile"] = self._cookie_copy(context["cookies"])
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(track.source, download=False)
+            if info and info.get("entries"):
+                entries = [entry for entry in info["entries"] if entry]
+                info = entries[0] if entries else None
+            if info:
+                return info
+            error = ValueError("nothing found")
+        except Exception as ydl_error:
+            error = ydl_error
+        if not URL_RE.match(track.source):
+            raise error
+        found = self._scrape_sync(track.source, options)
+        if found is None:
+            raise error
+        return found
+
+    def _fetch_page(self, url, referer=None):
+        """``(final_url, html)`` or ``(final_url, None)`` for a media response."""
+        headers = {"User-Agent": BROWSER_UA, "Accept": "*/*"}
+        if referer:
+            headers["Referer"] = referer
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=15) as response:
+            final = response.geturl()
+            kind = (response.headers.get("Content-Type") or "").lower()
+            if kind.startswith(MEDIA_TYPES):
+                return final, None
+            charset = response.headers.get_content_charset() or "utf-8"
+            return final, response.read(PAGE_LIMIT).decode(charset, "replace")
+
+    def _ydl_embedded(self, url, referer, base):
+        import yt_dlp
+
+        options = {
+            **base,
+            "http_headers": {"User-Agent": BROWSER_UA, "Referer": referer},
+        }
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception:
+            return None
+        if info and info.get("entries"):
+            entries = [entry for entry in info["entries"] if entry]
+            info = entries[0] if entries else None
+        if not info:
+            return None
+        info.setdefault("http_headers", {})
+        info["http_headers"].setdefault("Referer", referer)
+        return info
+
+    def _scrape_sync(self, url, base, referer=None, depth=0, seen=None):
+        """Look for a playable stream in a page and its embedded players."""
+        seen = seen if seen is not None else set()
+        if url in seen:
+            return None
+        seen.add(url)
+        try:
+            final, page = self._fetch_page(url, referer)
+        except Exception as error:
+            logger.debug("VoiceChat could not fetch %s: %s", url, error)
+            return None
+        if page is None:
+            return {
+                "url": final,
+                "http_headers": page_headers(referer or final),
+                "webpage_url": referer or final,
+                "_scraped": True,
+            }
+        title = page_title(page)
+        media = find_media(page, final)
+        if media:
+            return {
+                "url": media[0],
+                "title": title,
+                "http_headers": page_headers(final),
+                "webpage_url": final,
+                "_scraped": True,
+            }
+        if depth >= SCRAPE_DEPTH:
+            return None
+        for frame in find_frames(page, final)[:SCRAPE_FRAMES]:
+            if frame in seen:
+                continue
+            info = self._ydl_embedded(frame, final, base)
+            if info is None:
+                info = self._scrape_sync(frame, base, final, depth + 1, seen)
+            if info is not None:
+                # The linked page names the film/episode; the player page
+                # inside the iframe is usually titled "player" or similar.
+                if title:
+                    info["title"] = title
+                return info
+        return None
+
+    @staticmethod
+    def _format_url(fmt):
+        # DASH formats point at fragments; ffmpeg wants the manifest.
+        if "dash" in str(fmt.get("protocol") or "") and fmt.get("manifest_url"):
+            return fmt["manifest_url"]
+        return fmt["url"]
+
     def _apply_info(self, track, info):
         formats = info.get("requested_formats") or [info]
-        video = next(
-            (f for f in formats if (f.get("vcodec") or "none") != "none"), None
-        )
+
+        def known(fmt, key):
+            return fmt.get(key) not in (None, "none")
+
+        video = next((f for f in formats if known(f, "vcodec")), None)
         audio = next(
-            (
-                f
-                for f in formats
-                if (f.get("acodec") or "none") != "none" and f is not video
-            ),
-            None,
+            (f for f in formats if known(f, "acodec") and f is not video), None
         )
-        if audio is None and video is not None and video.get("acodec") not in (
-            None,
-            "none",
-        ):
+        if audio is None and video is not None and known(video, "acodec"):
             audio = video
-        if audio is None and video is None:
-            audio = formats[0]
-        track.video_url = None if track.audio_only or not video else video["url"]
-        track.audio_url = (audio or video)["url"]
-        track.headers = (
-            (video or audio).get("http_headers") or info.get("http_headers") or None
+        main = video or audio or formats[0]
+        if video is None and audio is None:
+            # Codecs unknown (direct links, scraped streams): ffprobe decides.
+            url = self._format_url(main)
+            track.video_url = None if track.audio_only else url
+            track.audio_url = url
+        else:
+            track.video_url = (
+                None if track.audio_only or not video else self._format_url(video)
+            )
+            track.audio_url = self._format_url(audio or video)
+        track.has_audio = True
+        track.headers = main.get("http_headers") or info.get("http_headers") or None
+        track.width = (video or main).get("width") or info.get("width")
+        track.height = (video or main).get("height") or info.get("height")
+        track.fps = (video or main).get("fps") or info.get("fps")
+        codecs = [
+            codec_name(video.get("vcodec")) if video and not track.audio_only else None,
+            codec_name((audio or {}).get("acodec")),
+        ]
+        track.codecs = " + ".join(c for c in codecs if c) or None
+        protocol = str(main.get("protocol") or "")
+        track.protocol = (
+            "HLS" if "m3u8" in protocol or ".m3u8" in track.audio_url.lower()
+            else "DASH" if "dash" in protocol or ".mpd" in track.audio_url.lower()
+            else None
         )
-        track.width = (video or {}).get("width") or info.get("width")
-        track.height = (video or {}).get("height") or info.get("height")
-        track.fps = (video or {}).get("fps") or info.get("fps")
         track.duration = info.get("duration") or track.duration
         track.is_live = bool(info.get("is_live"))
         track.title = info.get("title") or track.title
         track.webpage = info.get("webpage_url") or track.webpage
         track.resolved_at = time.monotonic()
 
-    async def _probe_file(self, track):
-        process = await asyncio.create_subprocess_exec(
-            "ffprobe",
-            "-v",
-            "error",
+    async def _ffprobe(self, url, headers=None):
+        args = ["ffprobe", "-v", "error"]
+        if not os.path.exists(url):
+            args += http_args(headers) + hls_args(url)
+        args += [
             "-show_entries",
-            "stream=codec_type,width,height,avg_frame_rate:format=duration",
+            "stream=codec_type,codec_name,width,height,avg_frame_rate"
+            ":stream_disposition=attached_pic"
+            ":format=duration,format_name",
             "-of",
             "json",
-            track.path,
+            url,
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await asyncio.wait_for(process.communicate(), 30)
-        data = json.loads(stdout.decode() or "{}")
-        video = next(
-            (
-                s
-                for s in data.get("streams", [])
-                if s.get("codec_type") == "video" and s.get("width")
-            ),
-            None,
-        )
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), 30)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            return None
+        with contextlib.suppress(ValueError):
+            return json.loads(stdout.decode() or "{}")
+        return None
+
+    async def _probe_track(self, track):
+        """Read the real codecs, frame size and stream layout with ffprobe."""
+        target = track.video_url or track.audio_url
+        data = await self._ffprobe(target, None if track.path else track.headers)
+        streams = (data or {}).get("streams") or []
+        if not streams:
+            if track.path:
+                raise ValueError("ffprobe could not read the file")
+            return  # Trust yt-dlp; ffmpeg reports a real problem on play.
+        videos = [
+            s for s in streams
+            if s.get("codec_type") == "video"
+            and s.get("width")
+            and not (s.get("disposition") or {}).get("attached_pic")
+        ]
+        audios = [s for s in streams if s.get("codec_type") == "audio"]
+        if track.video_url and track.audio_url != track.video_url:
+            # Separate audio stream (yt-dlp merged formats): keep its codec.
+            audios = audios or [{"codec_name": None}]
+        video = max(videos, key=lambda s: s["width"] * s.get("height", 0), default=None)
+        if not video and not audios:
+            raise ValueError("no audio or video stream found")
         if video and not track.audio_only:
-            track.video_url = track.path
+            track.video_url = track.video_url or target
             track.width = video.get("width")
             track.height = video.get("height")
             rate = str(video.get("avg_frame_rate") or "0/1")
             num, _, den = rate.partition("/")
             with contextlib.suppress(ValueError, ZeroDivisionError):
-                track.fps = float(num) / float(den or 1)
-        track.audio_url = track.path
-        with contextlib.suppress(TypeError, ValueError):
-            track.duration = track.duration or float(
-                data.get("format", {}).get("duration")
-            )
-        track.resolved_at = time.monotonic()
+                track.fps = float(num) / float(den or 1) or track.fps
+        else:
+            track.video_url = None
+        track.has_audio = bool(audios)
+        names = [
+            codec_name(video.get("codec_name")) if track.video_url else None,
+            codec_name(audios[0].get("codec_name")) if audios else None,
+        ]
+        if any(names):
+            track.codecs = " + ".join(n for n in names if n)
+        fmt = (data.get("format") or {})
+        if not track.protocol:
+            name = str(fmt.get("format_name") or "")
+            track.protocol = "HLS" if "hls" in name else "DASH" if "dash" in name else None
+        try:
+            duration = float(fmt.get("duration"))
+        except (TypeError, ValueError):
+            duration = None
+        if duration:
+            track.duration = track.duration or duration
+        elif not track.path and not track.duration:
+            track.is_live = True
 
     async def _resolve(self, track):
         if track.resolved:
             return
         if track.path:
-            await self._probe_file(track)
+            track.video_url = None if track.audio_only else track.path
+            track.audio_url = track.path
+            await self._probe_track(track)
+            track.resolved_at = time.monotonic()
             return
-        context = self._yt_context() if is_youtube(track.source) else None
+        youtube = is_youtube(track.source)
+        context = self._yt_context(track.source) if URL_RE.match(track.source) or youtube else None
         try:
             info = await asyncio.to_thread(self._extract_sync, track, context)
         except Exception as error:
-            if is_auth_error(error):
+            if youtube and is_auth_error(error):
                 raise YouTubeAuthError(context or {}) from error
             raise
         self._apply_info(track, info)
+        if not youtube:
+            await self._probe_track(track)
 
     def _playlist_sync(self, url, audio_only, requester, context=None):
         import yt_dlp
@@ -995,35 +1412,70 @@ class VoiceChatMod(loader.Module):
 
     # --------------------------------------------------------------- playing
 
-    def _stream(self, track, offset=0):
+    def _ffmpeg_parameters(self, track, offset=0):
+        args = []
+        if offset and not track.is_live:
+            args += ["-ss", str(int(offset))]
+        if not track.path:
+            args += http_args(track.headers)
+            args += hls_args(track.video_url, track.audio_url)
+        return shlex.join(args) if args else None
+
+    def _fps(self, track):
+        try:
+            cap = int(self.config["max_fps"])
+        except (KeyError, TypeError, ValueError):
+            cap = MAX_FPS
+        return clamp_fps(track.fps, cap)
+
+    async def _stream(self, track, offset=0):
+        """The stream for ``track``; video goes out as a screen share if set."""
+        media = self._media_stream(track, offset)
+        if not track.has_video or self.config["video_mode"] != "screen":
+            return media
+        from pytgcalls.types.raw import Stream
+
+        # Probe now and hand py-tgcalls a raw Stream with the picture in the
+        # ``screen`` slot: it then joins the call's presentation (the large
+        # screen-share tile) instead of sending it as the camera.
+        await media.check_stream()
+        if media.camera is None:
+            return Stream(microphone=media.microphone)
+        return Stream(microphone=media.microphone, screen=media.camera)
+
+    def _media_stream(self, track, offset=0):
         from pytgcalls.types import MediaStream
         from pytgcalls.types.raw import AudioParameters, VideoParameters
 
+        patch_pytgcalls()
         rate, channels = AUDIO_MODES.get(
             self.config["audio_quality"], AUDIO_MODES["high"]
         )
         width, height = fit_frame(
             track.width, track.height, self.config["video_quality"]
         )
-        ffmpeg_parameters = None
-        if offset and not track.is_live:
-            ffmpeg_parameters = f"-ss {int(offset)}"
         has_video = track.has_video
         return MediaStream(
             track.video_url if has_video else track.audio_url,
             audio_parameters=AudioParameters(rate, channels),
             video_parameters=VideoParameters(
-                width, height, clamp_fps(track.fps), True
+                width, height, self._fps(track), True
             ),
-            audio_path=track.audio_url,
-            audio_flags=MediaStream.Flags.REQUIRED,
+            audio_path=track.audio_url if track.has_audio else None,
+            audio_flags=(
+                MediaStream.Flags.REQUIRED
+                if track.has_audio
+                else MediaStream.Flags.IGNORE
+            ),
             video_flags=(
                 MediaStream.Flags.AUTO_DETECT
                 if has_video
                 else MediaStream.Flags.IGNORE
             ),
-            headers=None if track.path else track.headers,
-            ffmpeg_parameters=ffmpeg_parameters,
+            # Headers travel in ffmpeg_parameters: py-tgcalls passes one
+            # -headers per header and ffmpeg would keep only the last one.
+            headers=None,
+            ffmpeg_parameters=self._ffmpeg_parameters(track, offset),
         )
 
     def _quality_label(self, track):
@@ -1031,11 +1483,18 @@ class VoiceChatMod(loader.Module):
             rate, channels = AUDIO_MODES.get(
                 self.config["audio_quality"], AUDIO_MODES["high"]
             )
-            return f"{self.strings('audio_only')}, {rate // 1000} kHz"
-        width, height = fit_frame(
-            track.width, track.height, self.config["video_quality"]
-        )
-        return f"{width}×{height}@{clamp_fps(track.fps)}"
+            label = f"{self.strings('audio_only')}, {rate // 1000} kHz"
+        else:
+            width, height = fit_frame(
+                track.width, track.height, self.config["video_quality"]
+            )
+            label = f"{width}×{height}@{self._fps(track)}"
+            if not track.has_audio:
+                label += f", {self.strings('no_audio')}"
+        details = [part for part in (track.codecs, track.protocol) if part]
+        if details:
+            label += " · " + " · ".join(details)
+        return utils.escape_html(label)
 
     def _title_html(self, track):
         title = utils.escape_html(str(track.title)[:200])
@@ -1053,14 +1512,16 @@ class VoiceChatMod(loader.Module):
     async def _start(self, player, track, offset=0):
         """Resolve ``track`` and put it on air.  Caller holds ``player.lock``."""
         await self._resolve(track)
-        stream = self._stream(track, offset)
+        stream = await self._stream(track, offset)
         from pytgcalls.types import GroupCallConfig
 
         self._cancel_end_task(player)
         player.generation += 1
         previous, previous_ends = player.current, player.pending_ends
         player.current = track
-        player.pending_ends = {"audio"} | ({"video"} if track.has_video else set())
+        player.pending_ends = ({"audio"} if track.has_audio else set()) | (
+            {"video"} if track.has_video else set()
+        )
         player.switched_at = time.monotonic()
         try:
             await self._calls.play(
@@ -1071,6 +1532,7 @@ class VoiceChatMod(loader.Module):
             raise
         player.switched_at = time.monotonic()
         player.mark_started(offset)
+        self._arm_watchdog(player, track)
         if previous is not None and previous is not track:
             self._drop_track_file(previous, player)
         player.failed_in_row = 0
@@ -1161,10 +1623,31 @@ class VoiceChatMod(loader.Module):
     # --------------------------------------------------------- stream events
 
     def _cancel_end_task(self, player):
-        task = player.end_task
-        player.end_task = None
-        if task is not None and not task.done() and task is not asyncio.current_task():
-            task.cancel()
+        for name in ("end_task", "watchdog"):
+            task = getattr(player, name)
+            setattr(player, name, None)
+            if (
+                task is not None
+                and not task.done()
+                and task is not asyncio.current_task()
+            ):
+                task.cancel()
+
+    def _arm_watchdog(self, player, track):
+        if track.is_live or not track.duration:
+            return
+        player.watchdog = asyncio.ensure_future(
+            self._watchdog(player, player.generation, float(track.duration))
+        )
+
+    async def _watchdog(self, player, generation, duration):
+        while player.generation == generation and player.current is not None:
+            left = duration + WATCHDOG_SLACK - player.position
+            if left <= 0 and not player.paused:
+                logger.info("VoiceChat: no end event, advancing by duration")
+                await self._finish(player, generation)
+                return
+            await asyncio.sleep(min(max(left, 1.0), 30.0))
 
     async def _on_stream_end(self, _, update):
         player = self._players.get(update.chat_id)

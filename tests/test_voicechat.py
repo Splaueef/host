@@ -300,6 +300,117 @@ class YouTubeTest(unittest.TestCase):
         self.assertIn("/c.txt", text)
 
 
+PAGE = """<html><head><title>Film &amp; serial</title>
+<meta property="og:image" content="https://cdn.example/poster.jpg"></head>
+<body><iframe src="https://ads.example/banner"></iframe>
+<iframe data-src="/player/embed?id=42"></iframe></body></html>"""
+
+PLAYER = """<html><head><title>player</title></head><body><script>
+new Playerjs({file:"https:\\/\\/cdn.example\\/hls\\/720\\/index.m3u8",
+ poster:"/p.jpg", alt:"https://cdn.example/low/360.mp4"});</script></body></html>"""
+
+
+class AnySiteTest(unittest.TestCase):
+    def test_find_media_prefers_hls_and_unescapes_json(self):
+        media = voicechat.find_media(PLAYER, "https://player.example/embed")
+        self.assertEqual(media[0], "https://cdn.example/hls/720/index.m3u8")
+        self.assertIn("https://cdn.example/low/360.mp4", media)
+        self.assertNotIn("https://player.example/p.jpg", media)
+
+    def test_find_media_reads_tags_and_meta(self):
+        page = (
+            '<meta content="/v/clip.mp4" property="og:video">'
+            '<video><source src="a.webm"></video>'
+        )
+        media = voicechat.find_media(page, "https://site.example/watch/1")
+        self.assertIn("https://site.example/v/clip.mp4", media)
+        self.assertIn("https://site.example/watch/a.webm", media)
+
+    def test_find_frames_and_title(self):
+        frames = voicechat.find_frames(PAGE, "https://site.example/film/1")
+        self.assertEqual(
+            frames,
+            ["https://ads.example/banner", "https://site.example/player/embed?id=42"],
+        )
+        self.assertEqual(voicechat.page_title(PAGE), "Film & serial")
+
+    def test_scrape_follows_iframe_with_referer(self):
+        mod = voicechat.VoiceChatMod()
+        pages = {
+            "https://site.example/film/1": PAGE,
+            "https://site.example/player/embed?id=42": PLAYER,
+        }
+        calls = []
+
+        def fetch(url, referer=None):
+            calls.append((url, referer))
+            if url not in pages:
+                raise OSError("blocked")
+            return url, pages[url]
+
+        mod._fetch_page = fetch
+        mod._ydl_embedded = lambda url, referer, base: None
+        info = mod._scrape_sync("https://site.example/film/1", {})
+        self.assertEqual(info["url"], "https://cdn.example/hls/720/index.m3u8")
+        self.assertEqual(info["title"], "Film & serial")
+        self.assertEqual(
+            info["http_headers"]["Referer"], "https://site.example/player/embed?id=42"
+        )
+        self.assertIn(
+            ("https://site.example/player/embed?id=42", "https://site.example/film/1"),
+            calls,
+        )
+
+    def test_apply_info_unknown_codecs_keeps_url_for_probe(self):
+        mod = voicechat.VoiceChatMod()
+        track = voicechat.Track("https://site.example/film/1")
+        mod._apply_info(
+            track,
+            {"url": "https://cdn.example/a.m3u8", "title": "F", "_scraped": True},
+        )
+        self.assertEqual(track.video_url, "https://cdn.example/a.m3u8")
+        self.assertEqual(track.audio_url, "https://cdn.example/a.m3u8")
+        self.assertEqual(track.protocol, "HLS")
+
+    def test_http_args_survive_ffmpeg_single_headers_option(self):
+        args = voicechat.http_args(
+            {"User-Agent": "UA", "Referer": "https://r/", "Origin": "https://r",
+             "Accept": "*/*"}
+        )
+        self.assertEqual(
+            args,
+            ["-user_agent", "UA", "-referer", "https://r/", "-headers",
+             "Origin: https://r"],
+        )
+        self.assertEqual(args.count("-headers"), 1)
+
+    def test_hls_args_only_for_playlists_and_known_options(self):
+        with mock.patch.object(
+            voicechat, "_hls_demuxer_options", lambda: {"allowed_extensions"}
+        ):
+            self.assertEqual(
+                voicechat.hls_args("https://a/x.m3u8?t=1"),
+                ["-allowed_extensions", "ALL"],
+            )
+            self.assertEqual(voicechat.hls_args("https://a/x.mp4"), [])
+
+    def test_reconnect_at_eof_is_stripped(self):
+        command = ["ffmpeg", "-reconnect", "1", "-reconnect_at_eof", "1",
+                   "-reconnect_streamed", "1", "-i", "u", "pipe:1"]
+        self.assertEqual(
+            voicechat._strip_reconnect_at_eof(command),
+            ["ffmpeg", "-reconnect", "1", "-reconnect_streamed", "1", "-i", "u",
+             "pipe:1"],
+        )
+
+    def test_codec_names_and_fps_cap(self):
+        self.assertEqual(voicechat.codec_name("avc1.64002a"), "h264")
+        self.assertEqual(voicechat.codec_name("hvc1"), "h265")
+        self.assertIsNone(voicechat.codec_name("none"))
+        self.assertEqual(voicechat.clamp_fps(60, 30), 30)
+        self.assertEqual(voicechat.clamp_fps(None, 24), 24)
+
+
 class SetupTest(unittest.TestCase):
     def _plan(self, have_telethon, have_hikkatl, have_pytgcalls=False):
         specs = {"hikkatl": have_hikkatl, "pytgcalls": have_pytgcalls}
@@ -358,10 +469,10 @@ class PlaybackTest(unittest.IsolatedAsyncioTestCase):
             track.resolved_at = time.monotonic()
 
         self.mod._resolve = resolve
-        self.mod._stream = lambda track, offset=0: {
-            "source": track.source,
-            "offset": offset,
-        }
+        async def stream(track, offset=0):
+            return {"source": track.source, "offset": offset}
+
+        self.mod._stream = stream
 
     def _last_answer(self):
         return vc_utils.answer.await_args.args[1]
@@ -453,6 +564,17 @@ class PlaybackTest(unittest.IsolatedAsyncioTestCase):
             [source for _, source, _ in self.calls.played],
             ["https://a", "https://a"],
         )
+
+    async def test_watchdog_advances_when_end_event_never_comes(self):
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcadd(_Message("https://b"))
+        player = self._player()
+        player.current.duration = 1
+        with mock.patch.object(voicechat, "WATCHDOG_SLACK", 0):
+            player.started_at -= 5
+            self.mod._arm_watchdog(player, player.current)
+            await asyncio.sleep(0.05)
+        self.assertEqual(self.calls.played[-1][1], "https://b")
 
     async def test_seek_restarts_with_offset(self):
         await self.mod.vcplay(_Message("https://a"))
