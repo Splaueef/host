@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 3.6.0
+# meta version: 3.6.2
 # meta description: 🧭 Центр команд, автооновлення та синхронізація статистики Hikka.
 # scope: inline
 # scope: hikka_only
@@ -456,6 +456,9 @@ class ModuleHubMod(loader.Module):
         "vcloop",
         "vcclear",
         "vcsetup",
+        "vcaudiotrack",
+        "vcbrowser",
+        "vcstats",
     }
 
     MUTATING = {
@@ -488,6 +491,7 @@ class ModuleHubMod(loader.Module):
         "vcstop",
         "vcclear",
         "vcsetup",
+        "vcremove",
         "vdlpm",
         "vdlban",
         "vdlunban",

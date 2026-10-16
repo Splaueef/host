@@ -21,4 +21,4 @@ jobs:
       - name: Pyflakes
         run: python -m pyflakes *.py hikka_hub/*.py
       - name: Pytest
-        run: python -m pytest -q
+        run: python -P -m pytest -q
