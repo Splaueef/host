@@ -105,6 +105,13 @@ class _Calls:
         self.leave_call = mock.AsyncMock()
         self.change_volume_call = mock.AsyncMock()
         self.played = []
+        self.active = {CHAT}
+        self.played_time = 0
+        self.time = mock.AsyncMock(side_effect=lambda chat_id: self.played_time)
+
+    @property
+    async def calls(self):
+        return {chat_id: object() for chat_id in self.active}
 
     async def _play(self, chat_id, stream, config=None):
         if stream["source"] in self.fail_sources:
@@ -1536,6 +1543,121 @@ class AutoQualityTest(unittest.IsolatedAsyncioTestCase):
     def test_stats_without_psutil(self):
         with mock.patch.dict(sys.modules, {"psutil": None}):
             self.assertIsNone(self.mod._load())
+
+
+class ReconnectTest(unittest.IsolatedAsyncioTestCase):
+    """Self-healing when the call connection silently dies (from #109)."""
+
+    _player = PlaybackTest._player
+    _last_answer = PlaybackTest._last_answer
+
+    def setUp(self):
+        PlaybackTest.setUp(self)
+        patcher = mock.patch.object(voicechat, "RECONNECT_DELAYS", (0, 0, 0))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def _settle(self):
+        player = self._player() if CHAT in self.mod._players else None
+        while player is not None and player.rejoin_task is not None and not player.rejoin_task.done():
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+    def _age(self, seconds):
+        player = self._player()
+        player.switched_at -= seconds
+        player.started_at -= seconds
+        player.progress_at -= seconds
+
+    async def test_lost_connection_rejoins_at_same_position(self):
+        await self.mod.vcplay(_Message("https://a"))
+        self._age(42)
+        state = types.SimpleNamespace(state=types.SimpleNamespace(name="FAILED"))
+        self.mod._on_connection_changed(CHAT, state)
+        await self._settle()
+        self.calls.leave_call.assert_awaited_with(CHAT)
+        self.assertEqual(self.calls.played[-1], (CHAT, "https://a", 42))
+        self.assertEqual(self._player().reconnects, 1)
+        texts = [c.args[1] for c in self.mod._client.send_message.await_args_list]
+        self.assertTrue(any("відновлено" in t for t in texts))
+
+    async def test_connection_events_while_joining_are_ignored(self):
+        await self.mod.vcplay(_Message("https://a"))
+        state = types.SimpleNamespace(state=types.SimpleNamespace(name="CLOSED"))
+        self.mod._on_connection_changed(CHAT, state)
+        connected = types.SimpleNamespace(state=types.SimpleNamespace(name="CONNECTED"))
+        self._age(30)
+        self.mod._on_connection_changed(CHAT, connected)
+        self.assertIsNone(self._player().rejoin_task)
+
+    async def test_hook_keeps_original_handler(self):
+        calls = types.SimpleNamespace(_handle_connection_changed=mock.AsyncMock())
+        self.mod._hook_connection(calls)
+        self.mod._on_connection_changed = mock.Mock()
+        await calls._handle_connection_changed(CHAT, "state")
+        self.mod._on_connection_changed.assert_called_once_with(CHAT, "state")
+
+    async def test_health_check_rejoins_dropped_call(self):
+        await self.mod.vcplay(_Message("https://a"))
+        self._age(30)
+        self.calls.active = set()
+        await self.mod._check_player(self._player())
+        await self._settle()
+        self.assertEqual(len(self.calls.played), 2)
+
+    async def test_frozen_stream_rejoins_only_after_progress_was_seen(self):
+        await self.mod.vcplay(_Message("https://a"))
+        player = self._player()
+        self._age(30)
+        await self.mod._check_player(player)
+        self._age(30)
+        await self.mod._check_player(player)
+        self.assertIsNone(player.rejoin_task)
+        self.calls.played_time = 5
+        await self.mod._check_player(player)
+        self._age(30)
+        await self.mod._check_player(player)
+        await self._settle()
+        self.assertEqual(len(self.calls.played), 2)
+
+    async def test_paused_track_is_not_stalled_and_stays_paused(self):
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcpause(_Message())
+        player = self._player()
+        player.progress_seen = True
+        self._age(60)
+        await self.mod._check_player(player)
+        self.assertIsNone(player.rejoin_task)
+        self.calls.active = set()
+        await self.mod._check_player(player)
+        await self._settle()
+        self.assertEqual(len(self.calls.played), 2)
+        self.assertTrue(player.paused)
+        self.assertEqual(self.calls.pause.await_count, 2)
+
+    async def test_gives_up_after_repeated_failures(self):
+        await self.mod.vcplay(_Message("https://a"))
+        self._age(30)
+        self.calls.fail_sources = {"https://a"}
+        self.calls.active = set()
+        player = self._player()
+        await self.mod._check_player(player)
+        while player.rejoin_task is not None and not player.rejoin_task.done():
+            await asyncio.sleep(0)
+        self.assertNotIn(CHAT, self.mod._players)
+        texts = [c.args[1] for c in self.mod._client.send_message.await_args_list]
+        self.assertTrue(any("не вдалося" in t for t in texts))
+
+    async def test_stop_cancels_pending_rejoin(self):
+        await self.mod.vcplay(_Message("https://a"))
+        self._age(30)
+        with mock.patch.object(voicechat, "RECONNECT_DELAYS", (10,)):
+            self.mod._schedule_rejoin(self._player(), "test")
+            task = self._player().rejoin_task
+            await self.mod.vcstop(_Message())
+            await asyncio.sleep(0)
+        self.assertTrue(task.cancelled())
+        self.assertEqual(len(self.calls.played), 1)
 
 
 if __name__ == "__main__":
