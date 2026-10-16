@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 1.0.0
+# meta version: 1.1.0
 # meta description: 🎙 Відтворення відео й музики з YouTube та інших сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -62,6 +62,14 @@ RESOLVE_TTL = 4 * 60 * 60
 END_GRACE = 4.0
 STALE_END = 1.5
 MAX_FAILED_IN_ROW = 3
+# Self-healing: how often the call is checked, how long the stream may stand
+# still before it counts as frozen, and the pauses between rejoin attempts.
+WATCHDOG_INTERVAL = 5.0
+STALL_TIMEOUT = 20.0
+LOST_GRACE = 5.0
+HEALTHY_AFTER = 60.0
+RECONNECT_DELAYS = (1, 3, 5, 10, 20)
+LOST_STATES = {"FAILED", "TIMEOUT", "CLOSED"}
 
 
 def fmt_time(seconds):
@@ -183,6 +191,11 @@ class Player:
         self.paused_at = None
         self.switched_at = 0.0
         self.failed_in_row = 0
+        self.reconnects = 0
+        self.recover_task = None
+        self.last_played = None
+        self.progress_seen = False
+        self.progress_at = 0.0
 
     @property
     def paused(self):
@@ -275,6 +288,10 @@ class VoiceChatMod(loader.Module):
         "skipped": "⏭ <b>Пропущено.</b>",
         "queue_end": "⏹ <b>Черга закінчилась.</b>",
         "stopped": "⏹ <b>Відтворення зупинено, бот вийшов із дзвінка.</b>",
+        "reconnected": "🔄 <b>Зв'язок із дзвінком відновлено:</b> {title} з {pos}",
+        "reconnect_failed": (
+            "❌ <b>Зв'язок із дзвінком втрачено, перепідключитись не вдалося.</b>"
+        ),
         "cleared": "🧹 <b>Чергу очищено ({}).</b>",
         "seek_usage": (
             "❌ <b>Вкажіть час:</b> <code>{p}vcseek 1:30</code>, "
@@ -357,14 +374,19 @@ class VoiceChatMod(loader.Module):
         self._tg = None
         self._connect_lock = asyncio.Lock()
         self._players = {}
+        self._watchdog = None
 
     async def client_ready(self, client, db):
         self._client = client
         shutil.rmtree(WORK_DIR, ignore_errors=True)
 
     async def on_unload(self):
+        if self._watchdog is not None:
+            self._watchdog.cancel()
+            self._watchdog = None
         for player in list(self._players.values()):
             self._cancel_end_task(player)
+            self._cancel_recover(player)
             if self._calls is not None and player.current is not None:
                 with contextlib.suppress(Exception):
                     await self._calls.leave_call(player.chat_id)
@@ -442,6 +464,7 @@ class VoiceChatMod(loader.Module):
             calls.on_update(filters.chat_update(ChatUpdate.Status.LEFT_CALL))(
                 self._on_left_call
             )
+            self._hook_connection(calls)
             try:
                 await calls.start()
             except Exception:
@@ -449,7 +472,28 @@ class VoiceChatMod(loader.Module):
                 raise
             self._tg = tg
             self._calls = calls
+            if self._watchdog is None or self._watchdog.done():
+                self._watchdog = asyncio.ensure_future(self._watchdog_loop())
             return calls
+
+    def _hook_connection(self, calls):
+        """Hear about network drops that py-tgcalls otherwise swallows.
+
+        When an established call connection fails, py-tgcalls only clears
+        its caches: the dead connection stays registered, nothing is
+        reported, and further ``play`` calls feed media into the void.
+        """
+        original = getattr(calls, "_handle_connection_changed", None)
+        if original is None:
+            return
+
+        async def handler(chat_id, net_state):
+            try:
+                await original(chat_id, net_state)
+            finally:
+                self._on_connection_changed(chat_id, net_state)
+
+        calls._handle_connection_changed = handler
 
     async def _prime_chat(self, chat_id):
         """Teach the extra connection the channel's access hash."""
@@ -812,6 +856,9 @@ class VoiceChatMod(loader.Module):
             raise
         player.switched_at = time.monotonic()
         player.mark_started(offset)
+        player.last_played = None
+        player.progress_seen = False
+        player.progress_at = player.switched_at
         if previous is not None and previous is not track:
             self._drop_track_file(previous, player)
         player.failed_in_row = 0
@@ -879,6 +926,7 @@ class VoiceChatMod(loader.Module):
 
     async def _leave(self, player):
         self._cancel_end_task(player)
+        self._cancel_recover(player)
         player.generation += 1
         if self._calls is not None:
             with contextlib.suppress(Exception):
@@ -939,8 +987,148 @@ class VoiceChatMod(loader.Module):
         player = self._players.pop(update.chat_id, None)
         if player is not None:
             self._cancel_end_task(player)
+            self._cancel_recover(player)
             player.generation += 1
             self._drop_files(player, everything=True)
+
+    # ------------------------------------------------------------ self-heal
+
+    def _on_connection_changed(self, chat_id, net_state):
+        state = getattr(getattr(net_state, "state", None), "name", "")
+        if state not in LOST_STATES:
+            return
+        player = self._players.get(chat_id)
+        if player is None or player.current is None:
+            return
+        if time.monotonic() - player.switched_at < LOST_GRACE:
+            # Our own join / rejoin is still settling.
+            return
+        self._schedule_recover(player, f"connection {state.lower()}")
+
+    async def _watchdog_loop(self):
+        while True:
+            await asyncio.sleep(WATCHDOG_INTERVAL)
+            try:
+                await self._ensure_tg_connected()
+            except Exception:
+                logger.debug("VoiceChat could not reconnect Telethon", exc_info=True)
+            for player in list(self._players.values()):
+                try:
+                    await self._check_player(player)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug("VoiceChat watchdog failed", exc_info=True)
+
+    async def _ensure_tg_connected(self):
+        tg = self._tg
+        if tg is not None and not tg.is_connected():
+            logger.warning("VoiceChat: Telegram connection lost, reconnecting")
+            await tg.connect()
+
+    async def _check_player(self, player):
+        """Schedule a rejoin when the call vanished or the stream froze."""
+        if self._calls is None or player.current is None:
+            return
+        if player.lock.locked() or self._recovering(player):
+            return
+        now = time.monotonic()
+        if now - player.switched_at < STALL_TIMEOUT:
+            return
+        active = await self._calls.calls
+        if player.chat_id not in active:
+            self._schedule_recover(player, "call dropped")
+            return
+        if player.paused:
+            player.progress_at = now
+            return
+        try:
+            played = await self._calls.time(player.chat_id)
+        except Exception:
+            return
+        if played != player.last_played:
+            if player.last_played is not None:
+                player.progress_seen = True
+            player.last_played = played
+            player.progress_at = now
+            if player.progress_seen and now - player.switched_at >= HEALTHY_AFTER:
+                player.reconnects = 0
+        elif player.progress_seen and now - player.progress_at >= STALL_TIMEOUT:
+            self._schedule_recover(player, "stream stalled")
+
+    def _recovering(self, player):
+        task = player.recover_task
+        return task is not None and not task.done()
+
+    def _schedule_recover(self, player, reason):
+        if self._recovering(player) and player.recover_task is not asyncio.current_task():
+            return
+        player.recover_task = asyncio.ensure_future(self._recover(player, reason))
+
+    def _cancel_recover(self, player):
+        task = player.recover_task
+        player.recover_task = None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _recover(self, player, reason):
+        """Leave the broken call and rejoin it at the same position."""
+        delay = RECONNECT_DELAYS[min(player.reconnects, len(RECONNECT_DELAYS) - 1)]
+        await asyncio.sleep(delay)
+        async with player.lock:
+            if self._players.get(player.chat_id) is not player:
+                return
+            track = player.current
+            if track is None or self._calls is None:
+                return
+            if player.reconnects >= len(RECONNECT_DELAYS):
+                logger.warning(
+                    "VoiceChat gave up reconnecting to %s", player.chat_id
+                )
+                await self._leave(player)
+                with contextlib.suppress(Exception):
+                    await self._client.send_message(
+                        player.chat_id, self.strings("reconnect_failed")
+                    )
+                return
+            player.reconnects += 1
+            logger.warning(
+                "VoiceChat: %s in %s, rejoining (attempt %d)",
+                reason,
+                player.chat_id,
+                player.reconnects,
+            )
+            position = 0 if track.is_live else int(player.position)
+            paused = player.paused
+            self._cancel_end_task(player)
+            with contextlib.suppress(Exception):
+                await self._calls.leave_call(player.chat_id)
+            with contextlib.suppress(Exception):
+                await self._ensure_tg_connected()
+            if not track.path:
+                # Stream URLs may have expired while the call was down.
+                track.resolved_at = 0.0
+            try:
+                await self._prime_chat(player.chat_id)
+                await self._start(player, track, offset=position)
+            except Exception as error:
+                logger.warning("VoiceChat rejoin failed: %s", error)
+                self._schedule_recover(player, reason)
+                return
+            if paused:
+                with contextlib.suppress(Exception):
+                    await self._calls.pause(player.chat_id)
+                    player.mark_paused()
+        if self.config["announce"]:
+            with contextlib.suppress(Exception):
+                await self._client.send_message(
+                    player.chat_id,
+                    self.strings("reconnected").format(
+                        title=self._title_html(track),
+                        pos=fmt_time(position),
+                    ),
+                    link_preview=False,
+                )
 
     # ----------------------------------------------------------------- files
 
