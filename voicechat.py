@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 2.3.0
+# meta version: 2.4.0
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -20,6 +20,7 @@ import importlib.util
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import shlex
@@ -102,6 +103,11 @@ SAVE_EVERY = 60.0  # the playback position is saved at most this often
 PREBUFFER_MIN = 3  # seconds, when Telegram downloads twice as fast as needed
 LANCZOS_FROM = 1.5  # downscale ratio from which lanczos is worth its CPU
 WARM_UP_DELAY = 20.0
+# Radio: music posts read from a channel and played round and round.
+RADIO_SKIP = 10  # deleted / non-audio posts skipped in a row before giving up
+CHANNEL_LINK_RE = re.compile(
+    r"^(?:https?://)?(?:t|telegram)\.me/(?:c/(\d+)|([\w]{4,}))", re.IGNORECASE
+)
 
 # YouTube asks datacenter IPs to "confirm you're not a bot".  The same answer
 # VideoDownloader (vdlt.py) uses works here: a cookies.txt with a YouTube
@@ -162,6 +168,19 @@ def fmt_time(seconds):
     if hours:
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes}:{secs:02d}"
+
+
+def parse_channel(value):
+    """``-100…``, ``@name``, ``t.me/name`` or ``t.me/c/123/4`` -> peer for Telethon."""
+    value = str(value or "").strip()
+    if not value:
+        return None
+    link = CHANNEL_LINK_RE.match(value)
+    if link:
+        return int(f"-100{link.group(1)}") if link.group(1) else link.group(2)
+    if re.fullmatch(r"-?\d+", value):
+        return int(value)
+    return value.lstrip("@") or None
 
 
 def parse_seek(text, position, duration=None):
@@ -1207,6 +1226,7 @@ class Track:
         self.quality_drop = 0  # resolution steps below video_quality (auto)
         self.probed = False  # stream layout known: py-tgcalls' check skipped
         self.fresh = False  # bypass the resolve cache (expired stream URLs)
+        self.radio = False  # picked by the radio, not queued by someone
         self.resolved_at = 0.0
 
     @property
@@ -1252,6 +1272,15 @@ class Player:
         self.quality_drop = 0
         self.ticker = None
         self.last_panel_text = None
+        self.now_message = None  # id of the "now playing" text, edited in place
+        self.radio = False
+        self.radio_channel = None  # overrides the radio_channel config value
+        self.radio_order = []  # message ids of the current round
+        self.radio_pos = 0
+        self.radio_last = None  # message id of the last song the radio played
+        self.radio_next = None  # the next radio song, already prepared
+        self.radio_task = None
+        self.radio_error = None
 
     @property
     def paused(self):
@@ -1555,6 +1584,47 @@ class VoiceChatMod(loader.Module):
         "off": "ні",
         "audio_only": "лише звук",
         "no_audio": "без звуку",
+        "skipped_to": "⏭ <b>Далі:</b> {}",
+        "cfg_radio_channel": (
+            "Канал із музикою для режиму радіо: ID (напр. -1002562411082), "
+            "@username або посилання t.me. Акаунт має бачити цей канал"
+        ),
+        "cfg_radio_shuffle": "Радіо грає пісні каналу у випадковому порядку",
+        "cfg_radio_limit": "Скільки останніх пісень каналу бере радіо",
+        "radio_status": (
+            "📻 <b>Радіо:</b> {state}\n"
+            "Канал: {channel}\n"
+            "Порядок: {order}{count}\n\n"
+            "<code>{p}vcradio on [канал]</code> — грати музику з каналу по колу\n"
+            "<code>{p}vcradio off</code> — вимкнути\n"
+            "<code>{p}vcradio reload</code> — перечитати канал"
+        ),
+        "radio_count": "\nПісень у колі: {}",
+        "radio_shuffled": "випадковий",
+        "radio_in_order": "за порядком каналу",
+        "radio_no_channel": (
+            "❌ <b>Канал для радіо не вказано.</b> Задайте "
+            "<code>{p}config VoiceChat</code> → <code>radio_channel</code> "
+            "(напр. <code>-1002562411082</code>) або "
+            "<code>{p}vcradio on -100…</code>."
+        ),
+        "radio_loading": "📻 <b>Читаю канал…</b>",
+        "radio_bad": "❌ <b>Не вдалося прочитати канал радіо:</b> <code>{}</code>",
+        "radio_empty": "❌ <b>У каналі радіо немає музики.</b>",
+        "radio_on_later": (
+            "📻 <b>Радіо увімкнено</b> ({count} пісень) — заграє, коли "
+            "закінчиться черга."
+        ),
+        "radio_off": "📻 <b>Радіо вимкнено.</b> Поточна пісня дограє до кінця.",
+        "radio_reloaded": "📻 <b>Канал перечитано:</b> {count} пісень.",
+        "radio_stopped": "📻 <b>Радіо зупинено:</b> <code>{}</code>",
+        "radio_failed": "❌ <b>Радіо не змогло нічого увімкнути.</b>",
+        "radio_usage": (
+            "❌ <b>Дії:</b> <code>on [канал]</code>, <code>off</code>, "
+            "<code>reload</code>."
+        ),
+        "radio_next": "📻 Далі з радіо: {}",
+        "panel_radio": "\n📻 Радіо: грає музика з каналу",
     }
 
     def __init__(self):
@@ -1690,6 +1760,24 @@ class VoiceChatMod(loader.Module):
                 True,
                 lambda: self.strings("cfg_resume"),
                 validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "radio_channel",
+                "",
+                lambda: self.strings("cfg_radio_channel"),
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "radio_shuffle",
+                True,
+                lambda: self.strings("cfg_radio_shuffle"),
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "radio_limit",
+                1000,
+                lambda: self.strings("cfg_radio_limit"),
+                validator=loader.validators.Integer(minimum=10, maximum=10000),
             ),
         )
         self._client = None
@@ -1977,7 +2065,38 @@ class VoiceChatMod(loader.Module):
         player = self._players.get(chat_id)
         if player is None and create:
             player = self._players[chat_id] = Player(chat_id)
+            settings = self._settings(chat_id)
+            with contextlib.suppress(TypeError, ValueError):
+                player.volume = max(1, min(200, int(settings.get("volume") or 100)))
+            player.radio = bool(settings.get("radio"))
+            player.radio_channel = settings.get("radio_channel") or None
+            player.radio_last = settings.get("radio_last")
         return player
+
+    # A chat's player settings (volume, radio …) outlive the call: the player
+    # is created with them again next time, also after a restart.
+
+    def _settings(self, chat_id):
+        with contextlib.suppress(Exception):
+            saved = self.get("chat_settings", {}) or {}
+            return dict(saved.get(str(chat_id)) or {})
+        return {}
+
+    def _store_settings(self, chat_id, **values):
+        with contextlib.suppress(Exception):
+            saved = dict(self.get("chat_settings", {}) or {})
+            saved[str(chat_id)] = {**(saved.get(str(chat_id)) or {}), **values}
+            self.set("chat_settings", saved)
+
+    def _remember(self, player):
+        # ``radio`` itself is stored only by .vcradio / .vcstop: a radio that
+        # failed is off for this session, not for good.
+        self._store_settings(
+            player.chat_id,
+            volume=player.volume,
+            radio_channel=player.radio_channel,
+            radio_last=player.radio_last,
+        )
 
     # ------------------------------------------------------------- resolving
 
@@ -2580,7 +2699,11 @@ class VoiceChatMod(loader.Module):
             return await self._tracks_from_query(
                 link.group(0), audio_only, requester
             )
+        track = await self._media_track(reply, audio_only, requester, status)
+        return None if track is None else [track]
 
+    async def _media_track(self, reply, audio_only, requester=None, status=None):
+        """Track for an audio / video message; ``None`` when it is too big."""
         file = reply.file
         title = getattr(file, "title", None) or getattr(file, "name", None)
         performer = getattr(file, "performer", None)
@@ -2604,30 +2727,32 @@ class VoiceChatMod(loader.Module):
             track.stream_url = url
             track.tg_ref = (reply.chat_id, reply.id)
             track.webpage = None
-            return [track]
+            return track
 
         limit = int(self.config["max_file_mb"])
         if (file.size or 0) > limit * 1024 * 1024:
-            await utils.answer(status, self.strings("too_big").format(limit))
+            if status is not None:
+                await utils.answer(status, self.strings("too_big").format(limit))
             return None
-        await utils.answer(status, self.strings("downloading"))
-        folder = os.path.join(WORK_DIR, str(abs(_chat_id(message))))
+        if status is not None:
+            await utils.answer(status, self.strings("downloading"))
+        folder = os.path.join(WORK_DIR, str(abs(_chat_id(reply))))
         os.makedirs(folder, exist_ok=True)
         path = await self._client.download_media(
             reply,
             file=os.path.join(folder, f"{reply.id}{file.ext or ''}"),
-            progress_callback=self._progress_reporter(status),
+            progress_callback=(
+                self._progress_reporter(status) if status is not None else None
+            ),
         )
-        return [
-            Track(
-                path,
-                title=title,
-                audio_only=audio_only,
-                path=path,
-                duration=duration,
-                requester=requester,
-            )
-        ]
+        return Track(
+            path,
+            title=title,
+            audio_only=audio_only,
+            path=path,
+            duration=duration,
+            requester=requester,
+        )
 
     def _progress_reporter(self, status, every=3.0):
         """Telethon progress callback that edits ``status`` now and then."""
@@ -2931,23 +3056,57 @@ class VoiceChatMod(loader.Module):
         self._schedule_prefetch(player)
         self._save_state()
 
-    async def _announce(self, chat_id, track):
-        player = self._players.get(chat_id)
-        if player is not None and self._panel_enabled():
-            if await self._show_panel(player):
-                return
-        if not self.config["announce"]:
+    async def _show_now(self, player, status=None, note=None):
+        """Show what plays in the chat's one "now playing" message.
+
+        A panel or text the chat already has is edited in place, and
+        ``status`` (a command's own answer) only gets ``note``.  Without one,
+        ``status`` becomes it, or a new message is posted.
+        """
+        if player.current is None:
             return
-        with contextlib.suppress(Exception):
-            await self._client.send_message(
-                chat_id,
-                self._playing_text(track),
+        if await self._edit_now(player):
+            if status is not None and note:
+                await self._say(player.chat_id, status, note)
+            return
+        if self._panel_enabled() and await self._show_panel(player, status):
+            return
+        if status is None and not self.config["announce"]:
+            return
+        message = await self._say(
+            player.chat_id, status, note or self._playing_text(player.current)
+        )
+        message_id = getattr(message, "id", None)
+        player.now_message = message_id if isinstance(message_id, int) else None
+
+    async def _edit_now(self, player, text=None):
+        """Edit the existing panel / "now playing" text; False if there is none."""
+        if self._panel_enabled() and player.panel is not None and text is None:
+            return await self._refresh_panel(player)
+        if player.now_message is None:
+            return False
+        try:
+            await self._client.edit_message(
+                player.chat_id,
+                player.now_message,
+                text or self._playing_text(player.current),
                 link_preview=False,
             )
+        except Exception as error:
+            if "not modified" in str(error).lower():
+                return True
+            player.now_message = None
+            return False
+        return True
+
+    def _icon(self, track):
+        if track.radio:
+            return "📻"
+        return "🎬" if track.has_video else "🎵"
 
     def _playing_text(self, track):
         return self.strings("playing").format(
-            icon="🎬" if track.has_video else "🎵",
+            icon=self._icon(track),
             title=self._title_html(track),
             duration=self._duration_label(track),
             quality=self._quality_label(track),
@@ -2965,9 +3124,20 @@ class VoiceChatMod(loader.Module):
             elif player.queue:
                 track = player.queue.popleft()
             else:
+                track = await self._take_radio(player) if player.radio else None
+            if track is None:
                 finished = player.current
                 player.current = None
                 self._drop_track_file(finished, player)
+                if player.radio_error:
+                    with contextlib.suppress(Exception):
+                        await self._client.send_message(
+                            player.chat_id,
+                            self.strings("radio_stopped").format(
+                                utils.escape_html(player.radio_error[:300])
+                            ),
+                        )
+                    player.radio_error = None
                 if self.config["auto_leave"] or force_leave:
                     await self._leave(player)
                 return None
@@ -2988,9 +3158,14 @@ class VoiceChatMod(loader.Module):
                         )
                 if player.failed_in_row >= MAX_FAILED_IN_ROW:
                     player.queue.clear()
+                    if player.radio:
+                        # Only for now: the setting stays for the next session.
+                        player.radio = False
+                        player.radio_error = str(error) or type(error).__name__
+                        self._drop_radio_next(player)
                 continue
             if announce:
-                await self._announce(player.chat_id, track)
+                await self._show_now(player)
             return track
 
     async def _leave(self, player):
@@ -3283,6 +3458,9 @@ class VoiceChatMod(loader.Module):
         if everything:
             player.queue.clear()
             player.current = None
+            self._drop_radio_next(player)
+        elif player.radio_next is not None:
+            tracks.append(player.radio_next)
         for track in tracks:
             self._release(track)
 
@@ -3467,7 +3645,14 @@ class VoiceChatMod(loader.Module):
 
     def _schedule_prefetch(self, player):
         """Resolve and pre-buffer the next track while this one plays."""
-        if not self.config["prefetch_next"] or not player.queue:
+        if not self.config["prefetch_next"]:
+            return
+        if not player.queue:
+            task = player.radio_task
+            if player.radio and player.radio_next is None and (
+                task is None or task.done()
+            ):
+                player.radio_task = asyncio.ensure_future(self._prefetch_radio(player))
             return
         track = player.queue[0]
         if track.prefetch_task is not None or track.resolved:
@@ -3491,6 +3676,159 @@ class VoiceChatMod(loader.Module):
         except Exception as error:
             logger.info("VoiceChat prefetch of %s failed: %s", track.source, error)
 
+    # ----------------------------------------------------------------- radio
+
+    def _radio_channel(self, player):
+        return parse_channel(player.radio_channel or self.config["radio_channel"])
+
+    def _music_filter(self):
+        """``InputMessagesFilterMusic`` of the library Hikka's client is on."""
+        library = "telethon"
+        if any(
+            cls.__module__.startswith("hikkatl") for cls in type(self._client).__mro__
+        ):
+            library = "hikkatl"
+        with contextlib.suppress(Exception):
+            return importlib.import_module(f"{library}.tl.types").InputMessagesFilterMusic
+        return None
+
+    @staticmethod
+    def _is_song(message):
+        if message is None or getattr(message, "voice", None):
+            return False
+        file = getattr(message, "file", None)
+        return file is not None and bool(
+            getattr(message, "audio", None)
+            or (getattr(file, "mime_type", "") or "").startswith("audio/")
+        )
+
+    async def _radio_peer(self, channel):
+        """The channel as an input peer; a bare ``-100…`` ID the session has
+        not seen yet is looked up among the account's dialogs."""
+        try:
+            return await self._client.get_input_entity(channel)
+        except (ValueError, TypeError):
+            if not isinstance(channel, int):
+                raise
+        async for dialog in self._client.iter_dialogs():
+            if dialog.id == channel:
+                return dialog.input_entity
+        raise ValueError(f"channel {channel} not found among the account's chats")
+
+    async def _radio_songs(self, channel):
+        """Message ids of the channel's music, oldest first."""
+        channel = await self._radio_peer(channel)
+        music = self._music_filter()
+        ids = []
+        async for message in self._client.iter_messages(
+            channel, limit=int(self.config["radio_limit"]), filter=music
+        ):
+            if self._is_song(message):
+                ids.append(message.id)
+        return sorted(ids)
+
+    async def _radio_reload(self, player):
+        """Read the channel again and lay out the next round."""
+        channel = self._radio_channel(player)
+        if channel is None:
+            raise ValueError(self.strings("radio_no_channel").format(p=self.get_prefix()))
+        ids = await self._radio_songs(channel)
+        last = player.radio_last
+        if self.config["radio_shuffle"]:
+            random.shuffle(ids)
+            if last in ids and len(ids) > 1:
+                ids.remove(last)  # the song that just played goes last
+                ids.append(last)
+        elif last in ids:
+            index = ids.index(last)  # carry on after it
+            ids = ids[index + 1:] + ids[: index + 1]
+        player.radio_order = ids
+        player.radio_pos = 0
+        return ids
+
+    async def _radio_next(self, player):
+        """The next song of the round as a Track (``None``: no music)."""
+        channel = self._radio_channel(player)
+        if channel is None:
+            raise ValueError(self.strings("radio_no_channel").format(p=self.get_prefix()))
+        channel = await self._radio_peer(channel)
+        for _ in range(RADIO_SKIP):
+            if player.radio_pos >= len(player.radio_order):
+                if not await self._radio_reload(player):
+                    return None
+            message_id = player.radio_order[player.radio_pos]
+            player.radio_pos += 1
+            message = await self._client.get_messages(channel, ids=message_id)
+            if not self._is_song(message):
+                continue  # deleted or edited since the channel was read
+            track = await self._media_track(message, audio_only=True)
+            if track is not None:
+                track.radio = True
+                return track
+        return None
+
+    async def _take_radio(self, player):
+        """The radio's next song for ``_advance``; ``None`` turns it off."""
+        track, player.radio_next = player.radio_next, None
+        task, player.radio_task = player.radio_task, None
+        if track is None and task is not None and not task.done():
+            await asyncio.wait([task])  # it is looking the next song up
+            track, player.radio_next = player.radio_next, None
+        try:
+            if track is None:
+                track = await self._radio_next(player)
+            if track is None:
+                raise LookupError(self.strings("radio_empty"))
+        except Exception as error:
+            logger.warning("VoiceChat radio in %s failed: %s", player.chat_id, error)
+            player.radio = False
+            player.radio_error = re.sub(r"<[^>]+>", "", str(error)) or type(
+                error
+            ).__name__
+            return None
+        if track.tg_ref:
+            player.radio_last = track.tg_ref[1]
+            self._remember(player)
+        return track
+
+    async def _prefetch_radio(self, player):
+        try:
+            track = await self._radio_next(player)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.info("VoiceChat radio prefetch failed: %s", error)
+            return
+        if track is None:
+            return
+        if not player.radio or self._players.get(player.chat_id) is not player:
+            self._release(track)
+            return
+        player.radio_next = track
+        await self._prefetch_track(track)
+
+    def _drop_radio_next(self, player):
+        task, player.radio_task = player.radio_task, None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        track, player.radio_next = player.radio_next, None
+        if track is not None:
+            self._release(track)
+
+    async def _radio_begin(self, player, status=None):
+        """Start the radio in a chat where nothing plays; False on failure."""
+        async with player.lock:
+            if player.current is not None:
+                return True
+            track = await self._advance(player, announce=False)
+        if track is None:
+            self._players.pop(player.chat_id, None)
+            if status is not None:
+                await self._say(player.chat_id, status, self.strings("radio_failed"))
+            return False
+        await self._show_now(player, status)
+        return True
+
     # ------------------------------------------------------- panel & ticker
 
     def _panel_enabled(self):
@@ -3505,7 +3843,7 @@ class VoiceChatMod(loader.Module):
         else:
             bar = "🔴"
         text = self.strings("now").format(
-            icon="🎬" if track.has_video else "🎵",
+            icon=self._icon(track),
             title=self._title_html(track),
             bar=bar,
             pos=fmt_time(position),
@@ -3526,8 +3864,11 @@ class VoiceChatMod(loader.Module):
                 else self.strings("atrack_auto")
             )
             text += "\n" + self.strings("atrack_set").format(utils.escape_html(current))
-        if player.queue:
-            text += self.strings("panel_next").format(self._title_html(player.queue[0]))
+        if player.radio:
+            text += self.strings("panel_radio")
+        upcoming = player.queue[0] if player.queue else player.radio_next
+        if upcoming is not None:
+            text += self.strings("panel_next").format(self._title_html(upcoming))
         return text
 
     def _panel_markup(self, player):
@@ -3585,22 +3926,28 @@ class VoiceChatMod(loader.Module):
         return True
 
     async def _refresh_panel(self, player):
+        """Edit the panel in place; False when there is none or it failed."""
         if player.panel is None or player.current is None:
-            return
+            return False
         text = self._panel_text(player)
         if text == player.last_panel_text:
-            return
+            return True
         try:
             await player.panel.edit(text, reply_markup=self._panel_markup(player))
             player.last_panel_text = text
         except Exception as error:
             logger.debug("VoiceChat panel refresh failed: %s", error)
+            return False
+        return True
 
     async def _close_panel(self, player):
         panel, player.panel = player.panel, None
         if panel is not None:
             with contextlib.suppress(Exception):
                 await panel.edit(self.strings("stopped"), reply_markup=[])
+        if player.now_message is not None:
+            await self._edit_now(player, self.strings("stopped"))
+            player.now_message = None
 
     def _start_ticker(self, player):
         if player.ticker is None or player.ticker.done():
@@ -3677,6 +4024,7 @@ class VoiceChatMod(loader.Module):
                 volume = max(1, min(200, player.volume + step))
             await self._calls.change_volume_call(player.chat_id, int(volume))
             player.volume = int(volume)
+            self._remember(player)
             self._save_state()
             return self.strings("toast_volume").format(player.volume)
         if action == "loop":
@@ -3689,6 +4037,8 @@ class VoiceChatMod(loader.Module):
                 await self._advance(player, announce=False, force_leave=True)
             return self.strings("toast_skipped")
         if action == "stop":
+            player.radio = False
+            self._store_settings(player.chat_id, radio=False)
             async with player.lock:
                 await self._leave(player)
             return self.strings("toast_stopped")
@@ -3733,6 +4083,7 @@ class VoiceChatMod(loader.Module):
             "audio_only": track.audio_only,
             "duration": track.duration,
             "audio_index": track.audio_index,
+            "radio": track.radio,
         }
 
     def _save_state(self, periodic=False):
@@ -3751,6 +4102,7 @@ class VoiceChatMod(loader.Module):
                 "queue": [d for d in map(self._track_dict, player.queue) if d],
                 "loop": player.loop,
                 "volume": player.volume,
+                "message": player.now_message,
                 "saved": time.time(),
             }
         with contextlib.suppress(Exception):
@@ -3777,6 +4129,7 @@ class VoiceChatMod(loader.Module):
         track.audio_only = bool(data.get("audio_only"))
         track.duration = data.get("duration")
         track.audio_index = data.get("audio_index")
+        track.radio = bool(data.get("radio"))
         return track
 
     async def _restore_all(self):
@@ -3786,14 +4139,35 @@ class VoiceChatMod(loader.Module):
             saved = self.get("state", {}) or {}
         except Exception:
             return
-        if not self.config["resume_after_restart"] or not saved:
+        if not self.config["resume_after_restart"]:
             return
         for chat_key, data in saved.items():
             if time.time() - float(data.get("saved") or 0) > RESTORE_MAX_AGE:
                 continue
             with contextlib.suppress(Exception):
                 await self._restore_chat(int(chat_key), data)
+        # The radio was on, but nothing of it was left to resume: start anew.
+        with contextlib.suppress(Exception):
+            settings = self.get("chat_settings", {}) or {}
+            for chat_key, values in list(settings.items()):
+                chat_id = int(chat_key)
+                if (values or {}).get("radio") and chat_id not in self._players:
+                    with contextlib.suppress(Exception):
+                        await self._restore_radio(chat_id)
         self._save_state()
+
+    async def _restore_radio(self, chat_id):
+        if await self._prepare_chat(chat_id):
+            return
+        player = self._player(chat_id)
+        if not player.radio:
+            return
+        status = None
+        with contextlib.suppress(Exception):
+            status = await self._client.send_message(
+                chat_id, self.strings("restoring")
+            )
+        await self._radio_begin(player, status)
 
     async def _restore_chat(self, chat_id, data):
         tracks = []
@@ -3807,10 +4181,16 @@ class VoiceChatMod(loader.Module):
             return
         if await self._prepare_chat(chat_id):
             return
-        with contextlib.suppress(Exception):
-            await self._client.send_message(chat_id, self.strings("restoring"))
         player = self._player(chat_id)
-        player.volume = int(data.get("volume") or 100)
+        if isinstance(data.get("message"), int):
+            player.now_message = data["message"]
+        status = None
+        if not await self._edit_now(player, self.strings("restoring")):
+            with contextlib.suppress(Exception):
+                status = await self._client.send_message(
+                    chat_id, self.strings("restoring")
+                )
+        player.volume = int(data.get("volume") or player.volume)
         first, rest = tracks[0], tracks[1:]
         position = float(data.get("position") or 0) if data.get("current") else 0
         async with player.lock:
@@ -3822,7 +4202,7 @@ class VoiceChatMod(loader.Module):
                 logger.warning("VoiceChat could not resume %s: %s", chat_id, error)
                 await self._advance(player)
                 return
-        await self._announce(chat_id, first)
+        await self._show_now(player, status)
 
     # -------------------------------------------------------------- commands
 
@@ -3895,12 +4275,10 @@ class VoiceChatMod(loader.Module):
                     self._players.pop(chat_id, None)
                 await self._say(chat_id, status, self._error_text(first, error))
                 return
-            if self._panel_enabled() and await self._show_panel(player, status):
-                return
             text = self._playing_text(first)
             if rest:
                 text += "\n" + self.strings("queued_many").format(count=len(rest))
-            await self._say(chat_id, status, text)
+            await self._show_now(player, status, note=text)
 
     async def _say(self, chat_id, status, text):
         """Edit the status message, or post to the chat when there is none."""
@@ -3978,9 +4356,11 @@ class VoiceChatMod(loader.Module):
             track = await self._advance(player, announce=False, force_leave=True)
         if track is None:
             return await utils.answer(message, self.strings("queue_end"))
-        if self._panel_enabled() and await self._show_panel(player, message):
-            return
-        await utils.answer(message, self._playing_text(track), link_preview=False)
+        await self._show_now(
+            player,
+            message,
+            note=self.strings("skipped_to").format(self._title_html(track)),
+        )
 
     @loader.group_member
     @loader.command(ru_doc="Зупинити й вийти з дзвінка")
@@ -3989,7 +4369,10 @@ class VoiceChatMod(loader.Module):
         if not await self._allowed(message, "control"):
             return
         chat_id = _chat_id(message)
+        self._store_settings(chat_id, radio=False)  # a stop ends the radio too
         player = self._players.get(chat_id)
+        if player is not None:
+            player.radio = False
         if player is None or self._calls is None:
             if self._calls is not None:
                 with contextlib.suppress(Exception):
@@ -4113,6 +4496,10 @@ class VoiceChatMod(loader.Module):
             lines.append(f"{index}. {self._title_html(track)}{duration}")
         if len(player.queue) > 15:
             lines.append(self.strings("queue_more").format(len(player.queue) - 15))
+        if player.radio_next is not None:
+            lines.append(
+                self.strings("radio_next").format(self._title_html(player.radio_next))
+            )
         await utils.answer(message, "\n".join(lines), link_preview=False)
 
     def _queue_index(self, player, text):
@@ -4193,6 +4580,108 @@ class VoiceChatMod(loader.Module):
                     self._drop_track_file(track, player)
                 self._save_state()
         await utils.answer(message, self.strings("cleared").format(count))
+
+    @loader.group_member
+    @loader.command(ru_doc="[on [канал] | off | reload] — радіо з музикою каналу")
+    async def vcradio(self, message):
+        """[on [канал] | off | reload] — радіо: музика з каналу по колу"""
+        if not await self._allowed(message, "control"):
+            return
+        chat_id = _chat_id(message)
+        words = (utils.get_args_raw(message) or "").split(maxsplit=1)
+        action = words[0].lower() if words else ""
+        player = self._players.get(chat_id)
+
+        if not action:
+            settings = self._settings(chat_id)
+            radio = player.radio if player else bool(settings.get("radio"))
+            channel = (
+                player.radio_channel if player else settings.get("radio_channel")
+            ) or self.config["radio_channel"]
+            count = len(player.radio_order) if player else 0
+            return await utils.answer(
+                message,
+                self.strings("radio_status").format(
+                    state=self.strings("on" if radio else "off"),
+                    channel=(
+                        f"<code>{utils.escape_html(channel)}</code>"
+                        if channel
+                        else self.strings("unknown")
+                    ),
+                    order=self.strings(
+                        "radio_shuffled"
+                        if self.config["radio_shuffle"]
+                        else "radio_in_order"
+                    ),
+                    count=self.strings("radio_count").format(count) if count else "",
+                    p=self.get_prefix(),
+                ),
+            )
+
+        if action == "off":
+            self._store_settings(chat_id, radio=False)
+            if player is not None:
+                player.radio = False
+                self._drop_radio_next(player)
+                await self._refresh_panel(player)
+            return await utils.answer(message, self.strings("radio_off"))
+
+        if action not in ("on", "reload"):
+            return await utils.answer(message, self.strings("radio_usage"))
+        chat_id = await self._prepare(message)
+        if chat_id is None:
+            return
+        player = self._player(chat_id)
+        idle = player.current is None
+
+        previous_channel = player.radio_channel
+
+        def forget():
+            player.radio_channel = previous_channel
+            if idle and player.current is None and not player.queue:
+                self._players.pop(chat_id, None)
+
+        if action == "on" and len(words) > 1:
+            player.radio_channel = words[1].strip()
+        if self._radio_channel(player) is None:
+            forget()
+            return await utils.answer(
+                message, self.strings("radio_no_channel").format(p=self.get_prefix())
+            )
+        status = await utils.answer(message, self.strings("radio_loading"))
+        try:
+            songs = await self._radio_reload(player)
+        except Exception as error:
+            forget()
+            return await utils.answer(
+                status,
+                self.strings("radio_bad").format(
+                    utils.escape_html(str(error)[:300] or type(error).__name__)
+                ),
+            )
+        if not songs:
+            forget()
+            return await utils.answer(status, self.strings("radio_empty"))
+        self._drop_radio_next(player)  # it came from the old round
+        if action == "reload":
+            if idle:
+                forget()
+            else:
+                self._schedule_prefetch(player)
+            return await utils.answer(
+                status, self.strings("radio_reloaded").format(count=len(songs))
+            )
+
+        player.radio = True
+        self._remember(player)
+        self._store_settings(chat_id, radio=True)
+        if not idle:
+            self._schedule_prefetch(player)
+            await self._refresh_panel(player)
+            return await utils.answer(
+                status, self.strings("radio_on_later").format(count=len(songs))
+            )
+        await self._radio_begin(player, status)
 
     @loader.group_member
     @loader.command(ru_doc="Що зараз грає (панель керування)")

@@ -1662,3 +1662,219 @@ class ReconnectTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _song(message_id, chat_id=-1002562411082):
+    file = types.SimpleNamespace(
+        size=1000,
+        mime_type="audio/mpeg",
+        ext=".mp3",
+        title=f"Song {message_id}",
+        performer="Artist",
+        name=None,
+        duration=100,
+    )
+    return types.SimpleNamespace(
+        id=message_id, chat_id=chat_id, audio=True, voice=None, file=file
+    )
+
+
+class _RadioClient:
+    def __init__(self, songs):
+        self.songs = {song.id: song for song in songs}
+        self.send_message = mock.AsyncMock(
+            side_effect=lambda chat, text, **k: types.SimpleNamespace(id=900)
+        )
+        self.edit_message = mock.AsyncMock()
+        self.reads = 0
+
+    async def get_input_entity(self, peer):
+        return peer
+
+    async def iter_messages(self, channel, limit=None, filter=None):
+        self.reads += 1
+        for song in sorted(self.songs.values(), key=lambda s: -s.id)[:limit]:
+            yield song
+        yield types.SimpleNamespace(id=1, file=None, voice=None)  # a text post
+
+    async def get_messages(self, channel, ids=None):
+        return self.songs.get(ids)
+
+
+class MemoryAndMessagesTest(unittest.IsolatedAsyncioTestCase):
+    setUp = PlaybackTest.setUp
+    _player = PlaybackTest._player
+    _last_answer = PlaybackTest._last_answer
+    _end = PlaybackTest._end
+
+    def test_channel_formats(self):
+        self.assertEqual(voicechat.parse_channel("-1002562411082"), -1002562411082)
+        self.assertEqual(voicechat.parse_channel("@music_ua"), "music_ua")
+        self.assertEqual(voicechat.parse_channel("https://t.me/music_ua"), "music_ua")
+        self.assertEqual(
+            voicechat.parse_channel("t.me/c/2562411082/15"), -1002562411082
+        )
+        self.assertIsNone(voicechat.parse_channel(" "))
+
+    async def test_volume_is_remembered_for_the_next_session(self):
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcvol(_Message("150"))
+        await self.mod.vcstop(_Message())
+        self.assertNotIn(CHAT, self.mod._players)
+        self.calls.change_volume_call.reset_mock()
+
+        await self.mod.vcplay(_Message("https://b"))
+        self.assertEqual(self._player().volume, 150)
+        self.calls.change_volume_call.assert_awaited_with(CHAT, 150)
+
+    async def test_next_track_edits_the_now_playing_text(self):
+        self.mod._client.edit_message = mock.AsyncMock()
+        status = types.SimpleNamespace(id=55)
+        vc_utils.answer.side_effect = lambda message, *a, **k: status
+        self.addCleanup(
+            setattr, vc_utils.answer, "side_effect", lambda message, *a, **k: message
+        )
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcadd(_Message("https://b"))
+        self.assertEqual(self._player().now_message, 55)
+
+        await self._end("AUDIO", "VIDEO")
+        self.assertEqual(self.calls.played[-1][1], "https://b")
+        self.mod._client.send_message.assert_not_awaited()
+        chat, message_id, text = self.mod._client.edit_message.await_args.args
+        self.assertEqual((chat, message_id), (CHAT, 55))
+        self.assertIn("https://b", text)
+
+    async def test_text_falls_back_to_a_new_message_when_edit_fails(self):
+        self.mod._client.edit_message = mock.AsyncMock(side_effect=RuntimeError("gone"))
+        player = self.mod._player(CHAT)
+        player.now_message = 55
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcadd(_Message("https://b"))
+        await self._end("AUDIO", "VIDEO")
+        self.mod._client.send_message.assert_awaited()
+
+    async def test_next_track_edits_the_same_panel(self):
+        self.mod.inline = _Inline()
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcadd(_Message("https://b"))
+        panel = self._player().panel
+        await self._end("AUDIO", "VIDEO")
+        self.assertIs(self._player().panel, panel)
+        self.assertEqual(len(self.mod.inline.forms), 1)
+        self.assertIn("https://b", panel.text)
+        self.assertFalse(panel.deleted)
+
+        await self.mod.vcplay(_Message("https://c"))
+        await self.mod.vcadd(_Message("https://d"))
+        await self.mod.vcskip(_Message())
+        self.assertEqual(len(self.mod.inline.forms), 1)
+        self.assertIn("https://d", panel.text)
+        self.assertIn("Далі", self._last_answer())
+
+
+class RadioTest(unittest.IsolatedAsyncioTestCase):
+    _player = PlaybackTest._player
+    _last_answer = PlaybackTest._last_answer
+    _end = PlaybackTest._end
+
+    def setUp(self):
+        PlaybackTest.setUp(self)
+        self.client = _RadioClient([_song(10), _song(11), _song(12)])
+        self.mod._client = self.client
+        self.mod.config["radio_channel"] = "-1002562411082"
+        self.mod.config["radio_shuffle"] = False
+
+        async def register(client, message, size, mime=None, ext=""):
+            return f"http://127.0.0.1/tg/{message.id}"
+
+        self.mod._streamer.register = register
+        self.mod._streamer.unregister = mock.Mock()
+
+    def _sources(self):
+        return [source for _, source, _ in self.calls.played]
+
+    async def _settle(self):
+        player = self._player()
+        if player.radio_task is not None:
+            await asyncio.wait([player.radio_task])
+
+    async def test_radio_plays_the_channel_round_and_round(self):
+        await self.mod.vcradio(_Message("on"))
+        self.assertTrue(self._player().radio)
+        for _ in range(4):
+            await self._settle()
+            await self._end("AUDIO")
+        self.assertEqual(
+            self._sources(),
+            [f"http://127.0.0.1/tg/{n}" for n in (10, 11, 12, 10, 11)],
+        )
+        self.calls.leave_call.assert_not_awaited()
+        self.assertTrue(self._player().current.radio)
+        self.assertIn("📻", self.mod._panel_text(self._player()))
+        settings = self.mod.get("chat_settings")[str(CHAT)]
+        self.assertTrue(settings["radio"])
+        self.assertEqual(settings["radio_last"], 11)
+
+    async def test_queued_tracks_go_before_the_radio(self):
+        await self.mod.vcradio(_Message("on"))
+        await self.mod.vcadd(_Message("https://mine"))
+        await self._settle()
+        await self._end("AUDIO")
+        self.assertEqual(self._sources()[-1], "https://mine")
+        await self._end("AUDIO", "VIDEO")
+        self.assertEqual(self._sources()[-1], "http://127.0.0.1/tg/11")
+
+    async def test_radio_continues_after_the_last_played_song(self):
+        self.mod._store_settings(CHAT, radio_last=11)
+        await self.mod.vcradio(_Message("on"))
+        self.assertEqual(self._sources(), ["http://127.0.0.1/tg/12"])
+
+    async def test_shuffle_keeps_every_song_and_moves_the_last_one_back(self):
+        self.mod.config["radio_shuffle"] = True
+        player = self.mod._player(CHAT)
+        player.radio_last = 11
+        order = await self.mod._radio_reload(player)
+        self.assertEqual(sorted(order), [10, 11, 12])
+        self.assertEqual(order[-1], 11)
+
+    async def test_off_lets_the_song_finish_and_stop_forgets_the_radio(self):
+        await self.mod.vcradio(_Message("on"))
+        await self.mod.vcradio(_Message("off"))
+        self.assertIn("вимкнено", self._last_answer())
+        await self._end("AUDIO")
+        self.calls.leave_call.assert_awaited_with(CHAT)
+
+        await self.mod.vcradio(_Message("on"))
+        await self.mod.vcstop(_Message())
+        self.assertFalse(self.mod.get("chat_settings")[str(CHAT)]["radio"])
+
+    async def test_radio_needs_a_channel(self):
+        self.mod.config["radio_channel"] = ""
+        await self.mod.vcradio(_Message("on"))
+        self.assertIn("не вказано", self._last_answer())
+        self.calls.play.assert_not_awaited()
+        self.assertNotIn(CHAT, self.mod._players)
+
+    async def test_empty_channel_is_reported(self):
+        self.client.songs = {}
+        await self.mod.vcradio(_Message("on"))
+        self.assertIn("немає музики", self._last_answer())
+        self.assertNotIn(CHAT, self.mod._players)
+
+    async def test_channel_from_the_command_is_remembered(self):
+        self.mod.config["radio_channel"] = ""
+        await self.mod.vcradio(_Message("on @music_ua"))
+        self.assertEqual(self._sources(), ["http://127.0.0.1/tg/10"])
+        settings = self.mod.get("chat_settings")[str(CHAT)]
+        self.assertEqual(settings["radio_channel"], "@music_ua")
+        await self.mod.vcradio(_Message(""))
+        self.assertIn("@music_ua", self._last_answer())
+
+    async def test_radio_starts_again_after_a_restart(self):
+        self.mod._store_settings(CHAT, radio=True)
+        self.mod._prepare_chat = mock.AsyncMock(return_value=None)
+        with mock.patch.object(voicechat, "RESTORE_DELAY", 0):
+            await self.mod._restore_all()
+        self.assertEqual(self._sources(), ["http://127.0.0.1/tg/10"])
+        self.assertTrue(self._player().radio)

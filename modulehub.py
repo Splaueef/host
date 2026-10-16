@@ -459,6 +459,7 @@ class ModuleHubMod(loader.Module):
         "vcaudiotrack",
         "vcbrowser",
         "vcstats",
+        "vcradio",
     }
 
     MUTATING = {
