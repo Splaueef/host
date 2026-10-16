@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 1.5.0
+# meta version: 1.6.0
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -643,6 +644,169 @@ class BrowserSession:
         shutil.rmtree(self.root, ignore_errors=True)
 
 
+# ------------------------------------------------- Telegram file streaming
+#
+# Files from Telegram are not downloaded before playing.  A small HTTP server
+# on 127.0.0.1 hands ffmpeg the file straight from Telegram, chunk by chunk,
+# and honours Range requests: playback starts within seconds, MP4 files with
+# their index at the end work, and seeking only fetches the part it needs.
+TG_CHUNK = 512 * 1024  # Telegram wants offsets aligned to the request size.
+TG_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+
+def parse_range(header, size):
+    """``Range`` header -> ``(start, end)`` inclusive, or ``None`` if invalid."""
+    if not header:
+        return 0, size - 1
+    match = TG_RANGE_RE.match(header.strip())
+    if not match or size <= 0:
+        return None
+    first, last = match.groups()
+    if not first and not last:
+        return None
+    if not first:  # the last N bytes
+        start = max(0, size - int(last))
+        return start, size - 1
+    start = int(first)
+    end = min(int(last), size - 1) if last else size - 1
+    if start >= size or start > end:
+        return None
+    return start, end
+
+
+class TelegramStreamer:
+    """Serves Telegram documents to ffmpeg over local HTTP with Range."""
+
+    def __init__(self):
+        self._server = None
+        self._port = None
+        self._items = {}
+        self._lock = asyncio.Lock()
+
+    async def _ensure(self):
+        async with self._lock:
+            if self._server is None:
+                self._server = await asyncio.start_server(
+                    self._handle, "127.0.0.1", 0
+                )
+                self._port = self._server.sockets[0].getsockname()[1]
+
+    async def register(self, client, message, size, mime=None, ext=""):
+        await self._ensure()
+        token = secrets.token_urlsafe(16)
+        self._items[token] = {
+            "client": client,
+            "message": message,
+            "size": int(size),
+            "mime": mime or "application/octet-stream",
+        }
+        safe_ext = ext if re.fullmatch(r"\.\w{1,8}", ext or "") else ""
+        return f"http://127.0.0.1:{self._port}/{token}{safe_ext}"
+
+    def unregister(self, url):
+        token = (url or "").rsplit("/", 1)[-1].split(".", 1)[0]
+        self._items.pop(token, None)
+
+    async def close(self):
+        self._items.clear()
+        if self._server is not None:
+            self._server.close()
+            with contextlib.suppress(Exception):
+                await self._server.wait_closed()
+        self._server = None
+
+    async def _handle(self, reader, writer):
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 30)
+            lines = head.decode("latin-1").split("\r\n")
+            method, target, _ = (lines[0].split(" ", 2) + ["", ""])[:3]
+            headers = {}
+            for line in lines[1:]:
+                name, _, value = line.partition(":")
+                if name:
+                    headers[name.strip().lower()] = value.strip()
+            token = target.split("?", 1)[0].rsplit("/", 1)[-1].split(".", 1)[0]
+            item = self._items.get(token)
+            if method not in ("GET", "HEAD") or item is None:
+                writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                return
+            size = item["size"]
+            wanted = parse_range(headers.get("range"), size)
+            if wanted is None:
+                writer.write(
+                    f"HTTP/1.1 416 Range Not Satisfiable\r\n"
+                    f"Content-Range: bytes */{size}\r\nContent-Length: 0\r\n\r\n"
+                    .encode()
+                )
+                return
+            start, end = wanted
+            partial = "range" in headers
+            status = "206 Partial Content" if partial else "200 OK"
+            lines = [
+                f"HTTP/1.1 {status}",
+                f"Content-Type: {item['mime']}",
+                f"Content-Length: {end - start + 1}",
+                "Accept-Ranges: bytes",
+                "Connection: close",
+            ]
+            if partial:
+                lines.append(f"Content-Range: bytes {start}-{end}/{size}")
+            writer.write(("\r\n".join(lines) + "\r\n\r\n").encode())
+            if method == "GET":
+                await self._send(item, start, end, writer)
+            await writer.drain()
+        except (
+            ConnectionError,
+            asyncio.IncompleteReadError,
+            asyncio.LimitOverrunError,
+            asyncio.TimeoutError,
+        ):
+            pass  # ffmpeg drops connections when it seeks; that is normal.
+        except Exception:
+            logger.exception("VoiceChat stream request failed")
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
+    async def _send(self, item, start, end, writer):
+        aligned = start - start % TG_CHUNK
+        skip = start - aligned
+        remaining = end - start + 1
+        for attempt in range(2):
+            try:
+                async for chunk in item["client"].iter_download(
+                    item["message"],
+                    offset=aligned,
+                    request_size=TG_CHUNK,
+                    file_size=item["size"],
+                ):
+                    chunk = bytes(chunk)
+                    if skip:
+                        chunk, skip = chunk[skip:], 0
+                    chunk = chunk[:remaining]
+                    writer.write(chunk)
+                    await writer.drain()
+                    remaining -= len(chunk)
+                    aligned += TG_CHUNK
+                    if remaining <= 0:
+                        return
+                return
+            except ConnectionError:
+                raise
+            except Exception as error:
+                # File references expire after a while; fetch a fresh one.
+                if attempt or "FILE_REFERENCE" not in str(error).upper():
+                    raise
+                message = item["message"]
+                fresh = await item["client"].get_messages(
+                    message.chat_id, ids=message.id
+                )
+                if fresh is None:
+                    raise
+                item["message"] = fresh
+
+
 class YouTubeAuthError(Exception):
     """YouTube's bot check rejected every client and cookie combination."""
 
@@ -671,13 +835,14 @@ class Track:
         self.fps = None
         self.is_live = False
         self.has_audio = True
+        self.stream_url = None
         self.codecs = None
         self.protocol = None
         self.resolved_at = 0.0
 
     @property
     def resolved(self):
-        if self.path:
+        if self.path or self.stream_url:
             return self.resolved_at > 0
         return (
             self.resolved_at > 0
@@ -892,6 +1057,15 @@ class VoiceChatMod(loader.Module):
         "loop_off": "➡️ <b>Повтор вимкнено.</b>",
         "too_big": "❌ <b>Файл більший за {} МБ.</b>",
         "downloading": "📥 <b>Завантажую файл із Telegram…</b>",
+        "download_progress": (
+            "📥 <b>Завантажую з Telegram:</b> {percent}%\n"
+            "{bar} {done} / {total} МБ · {speed} МБ/с"
+        ),
+        "cfg_tg_stream": (
+            "Відтворювати файли з Telegram одразу, потоком (без очікування "
+            "повного завантаження на сервер)"
+        ),
+        "tg_stream_label": "потік із Telegram",
         "queue_empty": "📭 <b>Черга порожня.</b>",
         "queue_head": "🎶 <b>Черга ({}):</b>",
         "queue_more": "… і ще {}",
@@ -957,6 +1131,12 @@ class VoiceChatMod(loader.Module):
                 validator=loader.validators.Integer(minimum=1, maximum=200),
             ),
             loader.ConfigValue(
+                "tg_stream",
+                True,
+                lambda: self.strings("cfg_tg_stream"),
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
                 "max_file_mb",
                 2000,
                 lambda: self.strings("cfg_max_file_mb"),
@@ -987,6 +1167,7 @@ class VoiceChatMod(loader.Module):
         self._connect_lock = asyncio.Lock()
         self._players = {}
         self._browser = BrowserSession()
+        self._streamer = TelegramStreamer()
         self._browser_task = None
 
     async def client_ready(self, client, db):
@@ -1014,6 +1195,7 @@ class VoiceChatMod(loader.Module):
                 self._browser.record_error(error)
 
     async def on_unload(self):
+        await self._streamer.close()
         if self._browser_task is not None:
             self._browser_task.cancel()
             self._browser_task = None
@@ -1557,7 +1739,7 @@ class VoiceChatMod(loader.Module):
         data = await self._ffprobe(target, None if track.path else track.headers)
         streams = (data or {}).get("streams") or []
         if not streams:
-            if track.path:
+            if track.path or track.stream_url:
                 raise ValueError("ffprobe could not read the file")
             return  # Trust yt-dlp; ffmpeg reports a real problem on play.
         videos = [
@@ -1606,10 +1788,14 @@ class VoiceChatMod(loader.Module):
     async def _resolve(self, track):
         if track.resolved:
             return
-        if track.path:
-            track.video_url = None if track.audio_only else track.path
-            track.audio_url = track.path
+        local = track.path or track.stream_url
+        if local:
+            track.video_url = None if track.audio_only else local
+            track.audio_url = local
             await self._probe_track(track)
+            if track.stream_url:
+                track.protocol = self.strings("tg_stream_label")
+                track.is_live = False
             track.resolved_at = time.monotonic()
             return
         youtube = is_youtube(track.source)
@@ -1735,6 +1921,28 @@ class VoiceChatMod(loader.Module):
             )
 
         file = reply.file
+        title = getattr(file, "title", None) or getattr(file, "name", None)
+        performer = getattr(file, "performer", None)
+        if performer and title:
+            title = f"{performer} — {title}"
+        title = title or f"{file.mime_type or 'media'} #{reply.id}"
+        duration = getattr(file, "duration", None)
+
+        if self.config["tg_stream"] and file.size:
+            url = await self._streamer.register(
+                self._client, reply, file.size, file.mime_type, file.ext or ""
+            )
+            track = Track(
+                url,
+                title=title,
+                audio_only=audio_only,
+                duration=duration,
+                requester=requester,
+            )
+            track.stream_url = url
+            track.webpage = None
+            return [track]
+
         limit = int(self.config["max_file_mb"])
         if (file.size or 0) > limit * 1024 * 1024:
             await utils.answer(status, self.strings("too_big").format(limit))
@@ -1743,22 +1951,47 @@ class VoiceChatMod(loader.Module):
         folder = os.path.join(WORK_DIR, str(abs(_chat_id(message))))
         os.makedirs(folder, exist_ok=True)
         path = await self._client.download_media(
-            reply, file=os.path.join(folder, f"{reply.id}{file.ext or ''}")
+            reply,
+            file=os.path.join(folder, f"{reply.id}{file.ext or ''}"),
+            progress_callback=self._progress_reporter(status),
         )
-        title = getattr(file, "title", None) or getattr(file, "name", None)
-        performer = getattr(file, "performer", None)
-        if performer and title:
-            title = f"{performer} — {title}"
         return [
             Track(
                 path,
-                title=title or f"{file.mime_type or 'media'} #{reply.id}",
+                title=title,
                 audio_only=audio_only,
                 path=path,
-                duration=getattr(file, "duration", None),
+                duration=duration,
                 requester=requester,
             )
         ]
+
+    def _progress_reporter(self, status, every=3.0):
+        """Telethon progress callback that edits ``status`` now and then."""
+        started = time.monotonic()
+        last = [0.0]
+
+        async def report(done, total):
+            now = time.monotonic()
+            if now - last[0] < every or not total:
+                return
+            last[0] = now
+            percent = int(done * 100 / total)
+            filled = percent // 10
+            speed = done / max(now - started, 0.001) / 1024 / 1024
+            with contextlib.suppress(Exception):
+                await utils.answer(
+                    status,
+                    self.strings("download_progress").format(
+                        percent=percent,
+                        bar="▰" * filled + "▱" * (10 - filled),
+                        done=f"{done / 1048576:.1f}",
+                        total=f"{total / 1048576:.1f}",
+                        speed=f"{speed:.1f}",
+                    ),
+                )
+
+        return report
 
     # --------------------------------------------------------------- playing
 
@@ -2044,12 +2277,18 @@ class VoiceChatMod(loader.Module):
     # ----------------------------------------------------------------- files
 
     def _drop_track_file(self, track, player):
-        if track is None or not track.path:
+        if track is None or not (track.path or track.stream_url):
             return
         if track is player.current or any(t is track for t in player.queue):
             return
-        with contextlib.suppress(OSError):
-            os.remove(track.path)
+        self._release(track)
+
+    def _release(self, track):
+        if track.stream_url:
+            self._streamer.unregister(track.stream_url)
+        if track.path:
+            with contextlib.suppress(OSError):
+                os.remove(track.path)
 
     def _drop_files(self, player, everything=False):
         tracks = list(player.queue)
@@ -2059,9 +2298,7 @@ class VoiceChatMod(loader.Module):
             player.queue.clear()
             player.current = None
         for track in tracks:
-            if track.path:
-                with contextlib.suppress(OSError):
-                    os.remove(track.path)
+            self._release(track)
 
     # -------------------------------------------------------------- commands
 

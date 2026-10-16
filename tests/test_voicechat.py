@@ -532,6 +532,133 @@ class BrowserTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("приватне вікно", text)
 
 
+class _TgClient:
+    """Serves bytes like Telegram: offsets must be request-size aligned."""
+
+    def __init__(self, data, expire_first=False):
+        self.data = data
+        self.expire_first = expire_first
+        self.downloads = 0
+        self.refetched = False
+        self.download_media = mock.AsyncMock()
+
+    async def iter_download(self, message, offset=0, request_size=0, file_size=None):
+        assert offset % request_size == 0, offset
+        self.downloads += 1
+        if self.expire_first and not self.refetched:
+            raise RuntimeError("FILE_REFERENCE_EXPIRED")
+        while offset < len(self.data):
+            yield self.data[offset:offset + request_size]
+            offset += request_size
+
+    async def get_messages(self, chat_id, ids=None):
+        self.refetched = True
+        return types.SimpleNamespace(chat_id=chat_id, id=ids)
+
+
+class TelegramStreamTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.data = bytes(range(256)) * 9000  # ~2.2 MB, several chunks
+        self.streamer = voicechat.TelegramStreamer()
+        self.addAsyncCleanup(self.streamer.close)
+
+    async def _get(self, url, range_header=None):
+        import urllib.error
+        import urllib.request
+
+        def fetch():
+            request = urllib.request.Request(url)
+            if range_header:
+                request.add_header("Range", range_header)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            try:
+                with opener.open(request, timeout=10) as response:
+                    return response.status, dict(response.headers), response.read()
+            except urllib.error.HTTPError as error:
+                return error.code, dict(error.headers), b""
+
+        return await asyncio.to_thread(fetch)
+
+    def test_parse_range(self):
+        self.assertEqual(voicechat.parse_range(None, 100), (0, 99))
+        self.assertEqual(voicechat.parse_range("bytes=10-19", 100), (10, 19))
+        self.assertEqual(voicechat.parse_range("bytes=90-", 100), (90, 99))
+        self.assertEqual(voicechat.parse_range("bytes=-5", 100), (95, 99))
+        self.assertEqual(voicechat.parse_range("bytes=50-500", 100), (50, 99))
+        self.assertIsNone(voicechat.parse_range("bytes=100-", 100))
+        self.assertIsNone(voicechat.parse_range("items=1-2", 100))
+
+    async def test_serves_whole_file_and_unaligned_ranges(self):
+        client = _TgClient(self.data)
+        message = types.SimpleNamespace(chat_id=-1, id=5)
+        url = await self.streamer.register(
+            client, message, len(self.data), "video/mp4", ".mp4"
+        )
+        self.assertTrue(url.endswith(".mp4"))
+        status, headers, body = await self._get(url)
+        self.assertEqual((status, body), (200, self.data))
+        self.assertEqual(headers["Accept-Ranges"], "bytes")
+        start = voicechat.TG_CHUNK + 12345
+        status, headers, body = await self._get(url, f"bytes={start}-{start + 99}")
+        self.assertEqual(status, 206)
+        self.assertEqual(body, self.data[start:start + 100])
+        self.assertEqual(
+            headers["Content-Range"], f"bytes {start}-{start + 99}/{len(self.data)}"
+        )
+        status, _, body = await self._get(url, "bytes=-10")
+        self.assertEqual(body, self.data[-10:])
+        status, _, _ = await self._get(url, f"bytes={len(self.data)}-")
+        self.assertEqual(status, 416)
+
+    async def test_unregistered_token_is_gone(self):
+        client = _TgClient(self.data)
+        url = await self.streamer.register(
+            client, types.SimpleNamespace(chat_id=-1, id=5), len(self.data)
+        )
+        self.streamer.unregister(url)
+        status, _, _ = await self._get(url)
+        self.assertEqual(status, 404)
+
+    async def test_expired_file_reference_is_refreshed(self):
+        client = _TgClient(self.data, expire_first=True)
+        url = await self.streamer.register(
+            client, types.SimpleNamespace(chat_id=-1, id=5), len(self.data)
+        )
+        status, _, body = await self._get(url, "bytes=0-9")
+        self.assertEqual((status, body), (206, self.data[:10]))
+        self.assertTrue(client.refetched)
+
+    async def test_replied_media_streams_without_download(self):
+        mod = voicechat.VoiceChatMod()
+        mod._client = _TgClient(self.data)
+        mod._streamer = self.streamer
+        reply = types.SimpleNamespace(
+            id=9,
+            chat_id=-1,
+            file=types.SimpleNamespace(
+                size=len(self.data), mime_type="video/mp4", ext=".mp4",
+                title=None, name="film.mp4", performer=None, duration=20,
+            ),
+            video=True,
+        )
+        message = _Message("", reply=reply)
+        tracks = await mod._tracks_from_message(message, message, "", False)
+        self.assertEqual(len(tracks), 1)
+        self.assertTrue(tracks[0].stream_url.startswith("http://127.0.0.1:"))
+        self.assertEqual(tracks[0].title, "film.mp4")
+        mod._client.download_media.assert_not_awaited()
+
+    async def test_download_mode_reports_progress(self):
+        mod = voicechat.VoiceChatMod()
+        status = object()
+        vc_utils.answer.reset_mock()
+        report = mod._progress_reporter(status, every=0)
+        await report(50 * 1048576, 200 * 1048576)
+        text = vc_utils.answer.await_args.args[1]
+        self.assertIn("25%", text)
+        self.assertIn("50.0 / 200.0", text)
+
+
 class SetupTest(unittest.TestCase):
     def _plan(self, have_telethon, have_hikkatl, have_pytgcalls=False):
         specs = {"hikkatl": have_hikkatl, "pytgcalls": have_pytgcalls}
