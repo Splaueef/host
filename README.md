@@ -474,7 +474,15 @@ SessionGuard повідомляє про це у «Збережених пові
 
 Команди з посиланням працюють і у відповідь на повідомлення з посиланням або
 медіафайлом. Коли черга закінчується, бот виходить із дзвінка (`auto_leave`).
-Для відео з обмеженнями YouTube вкажіть `cookies_file`.
+
+**YouTube і «Sign in to confirm you're not a bot».** YouTube часто вимагає
+вхід від серверних IP. VoiceChat робить те саме, що VideoDownloader: бере
+cookies.txt із сесією YouTube (`cookies_file` у `.config VoiceChat`, інакше
+cookies VideoDownloader, інакше `/home/rkbot/URKbot/cookies.txt` чи його копію
+в `/data/...`), підключає Deno/Node для JS-перевірок YouTube і по черзі пробує
+кілька клієнтів YouTube (`web_safari`, `tv_simply`, `android_vr`, `mweb`…).
+Якщо завантажено VideoDownloader, береться і його fallback на cookies Firefox.
+Коли жодна комбінація не пройшла, модуль пише, що треба оновити cookies.
 
 **Як це влаштовано.** Якщо Hikka працює на звичайному Telethon 1.40+ (як
 форк Splaueef/hikka з Telethon 1.44), модуль передає бібліотеці

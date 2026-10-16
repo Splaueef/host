@@ -181,6 +181,125 @@ class HelpersTest(unittest.TestCase):
         self.assertTrue(track.has_video and track.resolved)
 
 
+class _DownloadError(Exception):
+    pass
+
+
+class YouTubeTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = voicechat.VoiceChatMod()
+        self.mod.config["video_quality"] = "1080p"
+        self.mod.config["cookies_file"] = ""
+        self.mod.lookup = lambda name: None
+        self.seen = []
+
+    def _yt_dlp(self, works_with=None, fatal=False):
+        seen = self.seen
+
+        class YoutubeDL:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=False):
+                seen.append(self.options)
+                if fatal:
+                    raise _DownloadError("ERROR: Private video")
+                clients = (
+                    self.options.get("extractor_args", {})
+                    .get("youtube", {})
+                    .get("player_client")
+                )
+                if works_with is not None and clients == works_with:
+                    return {"title": "ok", "url": "u", "acodec": "opus"}
+                raise _DownloadError(
+                    "ERROR: [youtube+GetPOT] x: Sign in to confirm you're not a bot"
+                )
+
+        return mock.patch.dict(
+            sys.modules, {"yt_dlp": types.SimpleNamespace(YoutubeDL=YoutubeDL)}
+        )
+
+    def test_youtube_detection(self):
+        self.assertTrue(voicechat.is_youtube("https://youtube.com/watch?v=x&si=y"))
+        self.assertTrue(voicechat.is_youtube("https://m.youtube.com/watch?v=x"))
+        self.assertTrue(voicechat.is_youtube("https://youtu.be/x"))
+        self.assertTrue(voicechat.is_youtube("despacito"))
+        self.assertFalse(voicechat.is_youtube("https://soundcloud.com/a/b"))
+        self.assertFalse(voicechat.is_youtube("https://notyoutube.com/x"))
+
+    def test_falls_through_player_clients_until_one_works(self):
+        track = voicechat.Track("https://youtube.com/watch?v=x")
+        context = {"cookies": None, "runtime": "deno:/usr/local/bin/deno"}
+        with self._yt_dlp(works_with=["android_vr"]):
+            info = self.mod._extract_sync(track, context)
+        self.assertEqual(info["title"], "ok")
+        self.assertGreater(len(self.seen), 1)
+        self.assertEqual(
+            self.seen[0]["js_runtimes"], {"deno": {"path": "/usr/local/bin/deno"}}
+        )
+        self.assertNotIn("extractor_args", self.seen[0])
+
+    def test_fatal_error_stops_retrying(self):
+        track = voicechat.Track("https://youtube.com/watch?v=x")
+        with self._yt_dlp(fatal=True), self.assertRaises(_DownloadError):
+            self.mod._extract_sync(track, {})
+        self.assertEqual(len(self.seen), 1)
+
+    def test_cookie_file_is_found_and_used(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            empty = pathlib.Path(folder, "empty.txt")
+            empty.write_text("# Netscape HTTP Cookie File\n")
+            good = pathlib.Path(folder, "cookies.txt")
+            good.write_text(".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tv\n")
+            with mock.patch.object(
+                voicechat, "YT_COOKIE_FILES", (str(empty), str(good))
+            ):
+                context = self.mod._yt_context()
+            self.assertEqual(context["cookies"], str(good))
+            track = voicechat.Track("https://youtu.be/x")
+            with self._yt_dlp(works_with=["web_safari"]):
+                self.mod._extract_sync(track, context)
+            self.assertTrue(all(o["cookiefile"] == str(good) for o in self.seen))
+
+    def test_videodownloader_settings_are_reused(self):
+        vdl = types.SimpleNamespace(
+            _js_runtime="node:/opt/node",
+            _cookies_for=lambda url: None,
+            _yt_browser_cookies_value=lambda: "firefox",
+        )
+        self.mod.lookup = lambda name: vdl if name == "VideoDownloader" else None
+        with mock.patch.object(voicechat, "YT_COOKIE_FILES", ()):
+            context = self.mod._yt_context()
+        self.assertEqual(context["runtime"], "node:/opt/node")
+        self.assertEqual(context["browser"], ("firefox", None, None, None))
+        attempts = self.mod._youtube_attempts({}, context)
+        self.assertEqual(
+            len(attempts), 2 * len(voicechat.YT_CLIENT_PROFILES)
+        )
+        self.assertEqual(attempts[-1]["cookiesfrombrowser"][0], "firefox")
+
+    def test_auth_error_has_readable_message(self):
+        text = self.mod._error_text(
+            voicechat.Track("https://youtu.be/x"),
+            voicechat.YouTubeAuthError({"cookies": None}),
+        )
+        self.assertIn("cookies.txt", text)
+        self.assertNotIn("GetPOT", text)
+        text = self.mod._error_text(
+            voicechat.Track("https://youtu.be/x"),
+            voicechat.YouTubeAuthError({"cookies": "/c.txt"}),
+        )
+        self.assertIn("/c.txt", text)
+
+
 class SetupTest(unittest.TestCase):
     def _plan(self, have_telethon, have_hikkatl, have_pytgcalls=False):
         specs = {"hikkatl": have_hikkatl, "pytgcalls": have_pytgcalls}

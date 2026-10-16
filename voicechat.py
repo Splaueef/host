@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 1.1.0
+# meta version: 1.2.0
 # meta description: 🎙 Відтворення відео й музики з YouTube та інших сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -63,6 +63,51 @@ END_GRACE = 4.0
 STALE_END = 1.5
 MAX_FAILED_IN_ROW = 3
 
+# YouTube asks datacenter IPs to "confirm you're not a bot".  The same answer
+# VideoDownloader (vdlt.py) uses works here: a cookies.txt with a YouTube
+# session, a JS runtime for the player challenges and several player clients.
+YT_COOKIE_FILES = (
+    "/home/rkbot/URKbot/cookies.txt",
+    "/data/home/rkbot/URKbot/cookies.txt",
+    "/home/rkbot/URKbot/cookies-youtube-com.txt",
+    "/data/home/rkbot/URKbot/cookies-youtube-com.txt",
+)
+YT_COOKIE_DOMAINS = ("youtube.com", "youtu.be", "googlevideo.com")
+YT_HOST_RE = re.compile(
+    r"^(?:https?://)?(?:[\w-]+\.)*(?:youtube\.com|youtu\.be|"
+    r"youtube-nocookie\.com)(?:[/:?#]|$)",
+    re.IGNORECASE,
+)
+JS_RUNTIMES = (
+    ("deno", ("/usr/local/bin/deno", "/usr/bin/deno")),
+    ("node", ("/usr/bin/node", "/usr/local/bin/node")),
+    ("node", ("/usr/bin/nodejs", "/usr/local/bin/nodejs")),
+)
+# (player clients, allow formats without a PO token); ``None`` = yt-dlp default.
+YT_CLIENT_PROFILES = (
+    (None, False),
+    (["web_safari"], False),
+    (["tv_simply", "default", "-tv"], False),
+    (["android_vr"], False),
+    (["mweb"], False),
+    (["default", "ios", "web_embedded", "-tv"], True),
+)
+YT_FATAL_MARKERS = (
+    "private video",
+    "video unavailable",
+    "has been removed",
+    "members-only",
+    "join this channel",
+    "not available in your country",
+)
+YT_AUTH_MARKERS = (
+    "sign in to confirm",
+    "not a bot",
+    "cookies-from-browser",
+    "getpot",
+    "po token",
+)
+
 
 def fmt_time(seconds):
     seconds = max(0, int(seconds or 0))
@@ -122,12 +167,63 @@ def _chat_id(message):
     return getattr(message, "chat_id", None) or 0
 
 
+def is_youtube(source):
+    """YouTube links and plain search queries (resolved via ytsearch)."""
+    source = (source or "").strip()
+    return bool(YT_HOST_RE.match(source)) or not URL_RE.match(source)
+
+
+def is_auth_error(error):
+    text = str(error).lower()
+    return any(marker in text for marker in YT_AUTH_MARKERS)
+
+
+def _cookie_file_has(path, domains=YT_COOKIE_DOMAINS):
+    try:
+        if not path or not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            return False
+        with open(path, encoding="utf-8", errors="ignore") as handle:
+            text = handle.read()
+    except OSError:
+        return False
+    return any(domain in text for domain in domains)
+
+
+def _detect_js_runtime():
+    for name, paths in JS_RUNTIMES:
+        for path in paths:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return f"{name}:{path}"
+        found = shutil.which(os.path.basename(paths[0]))
+        if found:
+            return f"{name}:{found}"
+    return None
+
+
+def _parse_browser_cookies(value):
+    """``firefox:/path/profile`` -> yt-dlp ``cookiesfrombrowser`` tuple."""
+    parts = [part.strip() or None for part in (value or "").strip().split(":", 3)]
+    if not parts or not parts[0]:
+        return None
+    while len(parts) < 4:
+        parts.append(None)
+    return tuple(parts[:4])
+
+
 def _version_tuple(version):
     parts = []
     for part in str(version).split("."):
         digits = re.match(r"\d+", part)
         parts.append(int(digits.group()) if digits else 0)
     return tuple(parts[:3])
+
+
+class YouTubeAuthError(Exception):
+    """YouTube's bot check rejected every client and cookie combination."""
+
+    def __init__(self, context):
+        super().__init__("YouTube bot check")
+        self.context = context
 
 
 class Track:
@@ -228,7 +324,22 @@ class VoiceChatMod(loader.Module):
         "cfg_announce": "Писати в чат, що зараз грає",
         "cfg_playlist_limit": "Скільки відео брати з плейлиста",
         "cfg_max_file_mb": "Макс. розмір файлу з Telegram для відтворення (МБ)",
-        "cfg_cookies": "Шлях до cookies.txt для yt-dlp (необов'язково)",
+        "cfg_cookies": (
+            "Шлях до cookies.txt з сесією YouTube. Порожньо — взяти cookies "
+            "VideoDownloader або /home/rkbot/URKbot/cookies.txt"
+        ),
+        "yt_auth": (
+            "❌ <b>YouTube просить підтвердити, що це не бот, а робочих "
+            "cookies не знайдено.</b>\n"
+            "Покладіть cookies.txt із входом у YouTube у "
+            "<code>/home/rkbot/URKbot/cookies.txt</code> (його ж використовує "
+            "VideoDownloader, див. <code>{p}vdlcookies</code>) або вкажіть шлях "
+            "у <code>{p}config VoiceChat</code> → <code>cookies_file</code>."
+        ),
+        "yt_auth_cookies": (
+            "❌ <b>YouTube не прийняв cookies</b> (<code>{file}</code>). "
+            "Схоже, сесія застаріла — оновіть cookies.txt."
+        ),
         "only_groups": "❌ <b>Групові дзвінки є лише в групах і каналах.</b>",
         "no_source": (
             "❌ <b>Дайте посилання, пошуковий запит або відповідайте "
@@ -580,22 +691,104 @@ class VoiceChatMod(loader.Module):
                 "hdr:sdr",
                 "vcodec:vp9",
             ]
-        cookies = str(self.config["cookies_file"] or "").strip()
-        if cookies and os.path.isfile(cookies):
-            options["cookiefile"] = cookies
         return options
 
-    def _extract_sync(self, track):
+    def _vdl(self):
+        """VideoDownloader instance, if loaded: its cookie setup is reused."""
+        with contextlib.suppress(Exception):
+            return self.lookup("VideoDownloader") or None
+        return None
+
+    def _yt_context(self):
+        """Cookies file, JS runtime and browser cookies for YouTube requests."""
+        vdl = self._vdl()
+        candidates = []
+        configured = str(self.config["cookies_file"] or "").strip()
+        if configured:
+            candidates.append(os.path.expanduser(configured))
+        if vdl is not None:
+            with contextlib.suppress(Exception):
+                candidates.append(vdl._cookies_for("https://www.youtube.com/"))
+        candidates.extend(YT_COOKIE_FILES)
+        cookies = next((path for path in candidates if _cookie_file_has(path)), None)
+
+        runtime = getattr(vdl, "_js_runtime", None) or _detect_js_runtime()
+
+        browser = None
+        if vdl is not None:
+            with contextlib.suppress(Exception):
+                browser = _parse_browser_cookies(vdl._yt_browser_cookies_value())
+        if browser and browser[1] and not os.path.isdir(browser[1]):
+            browser = None
+        return {"cookies": cookies, "runtime": runtime, "browser": browser}
+
+    @staticmethod
+    def _cookie_copy(path):
+        """yt-dlp writes rotated cookies back; use a copy if that is denied."""
+        if os.access(path, os.W_OK):
+            return path
+        os.makedirs(WORK_DIR, exist_ok=True)
+        copy = os.path.join(WORK_DIR, "cookies.txt")
+        shutil.copyfile(path, copy)
+        return copy
+
+    def _youtube_attempts(self, base, context):
+        """Option sets to try in order until YouTube hands out the formats."""
+        extra = {}
+        runtime = context.get("runtime")
+        if runtime:
+            name, _, path = runtime.partition(":")
+            extra["js_runtimes"] = {name: {"path": path} if path else {}}
+            extra["remote_components"] = {"ejs:github"}
+        cookie_sets = []
+        if context.get("cookies"):
+            cookie_sets.append({"cookiefile": self._cookie_copy(context["cookies"])})
+        else:
+            cookie_sets.append({})
+        if context.get("browser"):
+            cookie_sets.append({"cookiesfrombrowser": context["browser"]})
+        attempts = []
+        for cookie_opts in cookie_sets:
+            for clients, missing_pot in YT_CLIENT_PROFILES:
+                options = {**base, **extra, **cookie_opts}
+                youtube_args = {}
+                if clients:
+                    youtube_args["player_client"] = clients
+                if missing_pot:
+                    youtube_args["formats"] = ["missing_pot"]
+                if youtube_args:
+                    options["extractor_args"] = {"youtube": youtube_args}
+                attempts.append(options)
+        return attempts
+
+    def _extract_sync(self, track, context=None):
         import yt_dlp
 
-        with yt_dlp.YoutubeDL(self._ydl_options(track.audio_only)) as ydl:
-            info = ydl.extract_info(track.source, download=False)
-        if info.get("entries"):
-            entries = [entry for entry in info["entries"] if entry]
-            if not entries:
-                raise ValueError("nothing found")
-            info = entries[0]
-        return info
+        base = self._ydl_options(track.audio_only)
+        if is_youtube(track.source):
+            attempts = self._youtube_attempts(base, context or {})
+        else:
+            attempts = [base]
+        error = None
+        for options in attempts:
+            try:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    info = ydl.extract_info(track.source, download=False)
+            except Exception as attempt_error:
+                # Keep the bot-check error: it explains the failure best.
+                if error is None or not is_auth_error(error):
+                    error = attempt_error
+                text = str(attempt_error).lower()
+                if any(marker in text for marker in YT_FATAL_MARKERS):
+                    break
+                continue
+            if info and info.get("entries"):
+                entries = [entry for entry in info["entries"] if entry]
+                info = entries[0] if entries else None
+            if info:
+                return info
+            error = ValueError("nothing found")
+        raise error or ValueError("nothing found")
 
     def _apply_info(self, track, info):
         formats = info.get("requested_formats") or [info]
@@ -675,10 +868,16 @@ class VoiceChatMod(loader.Module):
         if track.path:
             await self._probe_file(track)
             return
-        info = await asyncio.to_thread(self._extract_sync, track)
+        context = self._yt_context() if is_youtube(track.source) else None
+        try:
+            info = await asyncio.to_thread(self._extract_sync, track, context)
+        except Exception as error:
+            if is_auth_error(error):
+                raise YouTubeAuthError(context or {}) from error
+            raise
         self._apply_info(track, info)
 
-    def _playlist_sync(self, url, audio_only, requester):
+    def _playlist_sync(self, url, audio_only, requester, context=None):
         import yt_dlp
 
         options = {
@@ -688,6 +887,8 @@ class VoiceChatMod(loader.Module):
             "playlistend": int(self.config["playlist_limit"]),
             "skip_download": True,
         }
+        if context and context.get("cookies"):
+            options["cookiefile"] = self._cookie_copy(context["cookies"])
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
         tracks = []
@@ -720,7 +921,11 @@ class VoiceChatMod(loader.Module):
     async def _tracks_from_query(self, query, audio_only, requester):
         if URL_RE.match(query) and self._is_playlist(query):
             tracks = await asyncio.to_thread(
-                self._playlist_sync, query, audio_only, requester
+                self._playlist_sync,
+                query,
+                audio_only,
+                requester,
+                self._yt_context() if is_youtube(query) else None,
             )
             if tracks:
                 return tracks
@@ -941,6 +1146,13 @@ class VoiceChatMod(loader.Module):
         self._players.pop(player.chat_id, None)
 
     def _error_text(self, track, error):
+        if isinstance(error, YouTubeAuthError):
+            cookies = error.context.get("cookies")
+            if cookies:
+                return self.strings("yt_auth_cookies").format(
+                    file=utils.escape_html(cookies)
+                )
+            return self.strings("yt_auth").format(p=self.get_prefix())
         return self.strings("play_failed").format(
             title=self._title_html(track),
             error=utils.escape_html(str(error)[:300] or type(error).__name__),
