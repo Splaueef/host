@@ -1241,5 +1241,198 @@ class FeaturesTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls.played[-1][1], "https://youtu.be/2")
 
 
+class OptimizationTest(unittest.IsolatedAsyncioTestCase):
+    setUp = PlaybackTest.setUp
+    _player = PlaybackTest._player
+
+    def test_clean_command_matches_pytgcalls_rules(self):
+        with mock.patch.dict(
+            voicechat._SUPPORTED_OPTIONS,
+            {"ffmpeg": {"-i", "-ss", "-v", "-f", "-headers"}},
+        ):
+            command = ["ffmpeg", "-ss", "5", "-bogus", "x", "-i", "u", "-v",
+                       "-1", "-f", "s16le", "", "pipe:1"]
+            self.assertEqual(
+                voicechat.clean_command(command),
+                ["ffmpeg", "-ss", "5", "-i", "u", "-v", "-1", "-f", "s16le",
+                 "pipe:1"],
+            )
+            self.assertEqual(
+                voicechat.clean_command(["ffmpeg", "-ss", "1", "-i", "u"],
+                                        blacklist=["-ss"]),
+                ["ffmpeg", "-i", "u"],
+            )
+
+    def test_supported_options_are_read_once(self):
+        voicechat._SUPPORTED_OPTIONS.pop("fakeprog", None)
+        result = types.SimpleNamespace(stdout="  -foo  <int>\n  -bar, -baz x\n")
+        with mock.patch.object(voicechat.subprocess, "run", return_value=result) as run:
+            self.assertIn("-baz", voicechat.supported_options("fakeprog"))
+            voicechat.supported_options("fakeprog")
+        run.assert_called_once()
+        voicechat._SUPPORTED_OPTIONS.pop("fakeprog", None)
+
+    async def test_repeated_link_is_resolved_from_cache(self):
+        mod = voicechat.VoiceChatMod()
+        mod.lookup = lambda name: None
+        calls = []
+
+        def extract(track, context):
+            calls.append(track.source)
+            return {"title": "T", "url": "u", "acodec": "opus", "vcodec": "none"}
+
+        mod._extract_sync = extract
+        mod._yt_context = lambda url: {}
+        await mod._resolve(voicechat.Track("https://youtu.be/x"))
+        await mod._resolve(voicechat.Track("https://youtu.be/x"))
+        self.assertEqual(len(calls), 1)
+        again = voicechat.Track("https://youtu.be/x")
+        again.fresh = True  # e.g. recovering from an expired stream URL
+        await mod._resolve(again)
+        self.assertEqual(len(calls), 2)
+
+    def test_cached_info_keeps_only_what_playback_uses(self):
+        info = {
+            "title": "T", "duration": 9, "formats": [{"url": "f"}] * 500,
+            "thumbnails": [{}] * 50, "description": "x" * 5000,
+            "requested_formats": [
+                {"url": "v", "vcodec": "vp9", "acodec": "none", "width": 1,
+                 "height": 1, "fragments": [{}] * 100},
+                {"url": "a", "vcodec": "none", "acodec": "opus"},
+            ],
+        }
+        slim = voicechat.slim_info(info)
+        self.assertNotIn("formats", slim)
+        self.assertNotIn("fragments", slim["requested_formats"][0])
+        track = voicechat.Track("https://youtu.be/x")
+        self.mod._apply_info(track, slim)
+        self.assertEqual((track.video_url, track.audio_url), ("v", "a"))
+
+    def test_working_youtube_client_is_tried_first_next_time(self):
+        mod = voicechat.VoiceChatMod()
+        mod.config["cookies_file"] = ""
+        seen = []
+
+        class YoutubeDL:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=False):
+                clients = (self.options.get("extractor_args", {})
+                           .get("youtube", {}).get("player_client"))
+                seen.append(clients)
+                if clients == ["android_vr"]:
+                    return {"title": "ok", "url": "u"}
+                raise RuntimeError("Sign in to confirm you're not a bot")
+
+        with mock.patch.dict(
+            sys.modules, {"yt_dlp": types.SimpleNamespace(YoutubeDL=YoutubeDL)}
+        ):
+            mod._extract_sync(voicechat.Track("https://youtu.be/a"), {})
+            first_round = len(seen)
+            seen.clear()
+            mod._extract_sync(voicechat.Track("https://youtu.be/b"), {})
+        self.assertGreater(first_round, 1)
+        self.assertEqual(seen, [["android_vr"]])
+
+    def test_lanczos_only_for_big_downscales(self):
+        track = voicechat.Track("https://x/v.mp4")
+        track.video_url = track.audio_url = "https://x/v.mp4"
+        track.width, track.height = 3840, 2160
+        self.mod.config["video_quality"] = "1080p"
+        self.assertIn("lanczos", self.mod._ffmpeg_parameters(track))
+        track.width, track.height = 1920, 1080
+        self.assertNotIn("lanczos", self.mod._ffmpeg_parameters(track) or "")
+
+    def test_periodic_saves_are_throttled(self):
+        writes = []
+        self.mod.set = lambda key, value: writes.append(value)
+        self.mod._save_state()
+        self.mod._save_state(periodic=True)
+        self.mod._save_state(periodic=True)
+        self.assertEqual(len(writes), 1)
+        self.mod._saved_at -= voicechat.SAVE_EVERY
+        self.mod._save_state(periodic=True)
+        self.assertEqual(len(writes), 2)
+
+
+class RawStreamTest(unittest.TestCase):
+    """The stream is built without py-tgcalls' probing, and stays correct."""
+
+    def _stubs(self):
+        def build_command(name, params, path, parameters, before, headers, live):
+            return ["ffmpeg", *(shlex.split(params) if params else []),
+                    "-reconnect", "1", "-reconnect_at_eof", "1", "-i", path,
+                    "-f", "x", "pipe:1"]
+
+        class Raw:
+            def __init__(self, *args, **kwargs):
+                self.args, self.kwargs = args, kwargs
+
+        raw = types.SimpleNamespace(
+            AudioParameters=Raw, VideoParameters=Raw, AudioStream=Raw,
+            VideoStream=Raw, Stream=Raw,
+        )
+        modules = {
+            "ntgcalls": types.SimpleNamespace(MediaSource=types.SimpleNamespace(SHELL="shell")),
+            "pytgcalls": types.ModuleType("pytgcalls"),
+            "pytgcalls.ffmpeg": types.SimpleNamespace(build_command=build_command),
+            "pytgcalls.list_to_cmd": types.SimpleNamespace(list_to_cmd=shlex.join),
+            "pytgcalls.types": types.ModuleType("pytgcalls.types"),
+            "pytgcalls.types.raw": raw,
+        }
+        return mock.patch.dict(sys.modules, modules)
+
+    def test_raw_stream_has_no_reconnect_at_eof_and_uses_screen(self):
+        mod = voicechat.VoiceChatMod()
+        track = voicechat.Track("https://x/a.m3u8")
+        track.video_url = track.audio_url = "https://x/a.m3u8"
+        track.width, track.height, track.fps = 1280, 720, 25
+        with self._stubs(), mock.patch.object(voicechat, "patch_pytgcalls"), \
+                mock.patch.object(voicechat, "clean_command", lambda c: c), \
+                mock.patch.object(voicechat, "_hls_demuxer_options", lambda: set()):
+            stream = mod._raw_stream(track, offset=5)
+        screen = stream.kwargs["screen"]
+        microphone = stream.kwargs["microphone"]
+        for device in (screen, microphone):
+            command = device.args[1]
+            self.assertNotIn("-reconnect_at_eof", command)
+            self.assertIn("-ss 5", command)
+        self.assertEqual(screen.args[2].args[:2], (1280, 720))
+
+    def test_unknown_frame_size_falls_back_to_full_check(self):
+        mod = voicechat.VoiceChatMod()
+        track = voicechat.Track("https://x/a.mp4")
+        track.video_url = track.audio_url = "https://x/a.mp4"
+        self.assertIsNone(mod._raw_stream(track))
+
+
+class FastPrebufferTest(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp = TelegramStreamTest.asyncSetUp
+
+    async def test_fast_download_starts_before_the_full_buffer(self):
+        data = bytes(range(256)) * 40000  # ~10 MB, 20 chunks
+        client = _TgClient(data)
+        url = await self.streamer.register(
+            client, types.SimpleNamespace(chat_id=-1, id=5), len(data)
+        )
+        cache = self.streamer.cache(url)
+        await cache.set_window(4)  # stop the workers after four chunks
+        with mock.patch.object(
+            type(cache), "speed", new_callable=mock.PropertyMock, return_value=10**9
+        ):
+            await self.streamer.prebuffer(
+                url, 0, len(data), rate=1000, enough=2 * voicechat.TG_CHUNK,
+                timeout=5,
+            )
+        self.assertLess(cache.buffered_from(0), cache.chunks)
+
+
 if __name__ == "__main__":
     unittest.main()

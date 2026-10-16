@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 2.0.0
+# meta version: 2.1.0
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -82,6 +82,12 @@ VOLUME_STEP = 10
 RESTORE_DELAY = 15.0
 RESTORE_MAX_AGE = 12 * 60 * 60
 SEARCH_RESULTS = 5
+INFO_CACHE_TTL = 30 * 60  # reuse a resolved link for this long
+INFO_CACHE_SIZE = 64
+SAVE_EVERY = 60.0  # the playback position is saved at most this often
+PREBUFFER_MIN = 3  # seconds, when Telegram downloads twice as fast as needed
+LANCZOS_FROM = 1.5  # downscale ratio from which lanczos is worth its CPU
+WARM_UP_DELAY = 20.0
 
 # YouTube asks datacenter IPs to "confirm you're not a bot".  The same answer
 # VideoDownloader (vdlt.py) uses works here: a cookies.txt with a YouTube
@@ -377,9 +383,55 @@ def _strip_reconnect_at_eof(command):
     return result
 
 
+_SUPPORTED_OPTIONS = {}
+
+
+def supported_options(program):
+    """Options ``program`` accepts, from ``-h full`` (read once, then cached).
+
+    py-tgcalls dumps the whole ffmpeg help again for every command it builds;
+    the answer never changes while the process lives.
+    """
+    if program not in _SUPPORTED_OPTIONS:
+        try:
+            result = subprocess.run(
+                [program, "-h", "full"], capture_output=True, text=True, timeout=20
+            )
+            text = result.stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        names = {"-i"}
+        for group in re.findall(r"(?m)^ *(--?\w[\w-]*(?:, *--?\w[\w-]*)*)", text):
+            names.update(name.strip() for name in group.split(","))
+        _SUPPORTED_OPTIONS[program] = names
+    return _SUPPORTED_OPTIONS[program]
+
+
+def clean_command(command, program=None, blacklist=None):
+    """py-tgcalls' ``cleanup_commands`` without a subprocess per call."""
+    supported = supported_options(program or command[0])
+    if supported is None:
+        return list(command)
+    result = []
+    skip_value = False
+    for part in command:
+        if not part:
+            continue
+        is_flag = part[0] == "-" and not part[1:].replace(".", "", 1).isdigit()
+        if is_flag:
+            skip_value = part not in supported or bool(
+                blacklist and part in blacklist
+            )
+        if not skip_value:
+            result.append(part)
+        elif not is_flag:
+            skip_value = False
+    return result
+
+
 def patch_pytgcalls():
-    """Install the ``-reconnect_at_eof`` fix into py-tgcalls (idempotent)."""
-    from pytgcalls import ffmpeg
+    """Install the ffmpeg fixes into py-tgcalls (idempotent)."""
+    from pytgcalls import ffmpeg, ytdlp
     from pytgcalls.types.stream import media_stream
 
     original = ffmpeg.build_command
@@ -389,10 +441,36 @@ def patch_pytgcalls():
     def build_command(*args, **kwargs):
         return _strip_reconnect_at_eof(original(*args, **kwargs))
 
+    async def cleanup_commands(commands, process_name=None, blacklist=None):
+        return await asyncio.to_thread(
+            clean_command, commands, process_name, blacklist
+        )
+
     build_command._voicechat_patched = True
-    # check_stream looks the name up in ffmpeg, MediaStream in its own module.
-    ffmpeg.build_command = build_command
-    media_stream.build_command = build_command
+    # check_stream looks the names up in ffmpeg, MediaStream in its own module.
+    for module in (ffmpeg, media_stream):
+        module.build_command = build_command
+    for module in (ffmpeg, media_stream, ytdlp):
+        module.cleanup_commands = cleanup_commands
+
+
+INFO_KEYS = (
+    "url", "manifest_url", "protocol", "vcodec", "acodec", "width", "height",
+    "fps", "http_headers", "title", "duration", "is_live", "webpage_url",
+    "_scraped",
+)
+
+
+def slim_info(info):
+    """Only what playback needs: yt-dlp's full answer lists every format
+    (hundreds of KB for a YouTube video) and would sit in the cache."""
+    slim = {key: info[key] for key in INFO_KEYS if key in info}
+    if info.get("requested_formats"):
+        slim["requested_formats"] = [
+            {key: fmt[key] for key in INFO_KEYS if key in fmt}
+            for fmt in info["requested_formats"]
+        ]
+    return slim
 
 
 def is_youtube(source):
@@ -926,16 +1004,31 @@ class TelegramStreamer:
         if item and item["cache"] is not None:
             asyncio.ensure_future(item["cache"].close())
 
-    async def prebuffer(self, url, start_byte, length, report=None, timeout=60):
-        """Wait until ``length`` bytes from ``start_byte`` are downloaded."""
+    async def prebuffer(
+        self, url, start_byte, length, report=None, timeout=60, rate=None,
+        enough=None,
+    ):
+        """Wait until ``length`` bytes from ``start_byte`` are downloaded.
+
+        With ``rate`` (bytes per second of playback) and ``enough`` (bytes),
+        stop as soon as ``enough`` is buffered and the download runs at least
+        twice as fast as playback: the rest arrives in time anyway.
+        """
         cache = self.cache(url)
         if cache is None:
             return
         first = min(cache.chunks - 1, max(0, int(start_byte)) // TG_CHUNK)
         need = min(cache.chunks - first, max(1, -(-int(length) // TG_CHUNK)))
+        early = -(-int(enough) // TG_CHUNK) if enough else need
         deadline = time.monotonic() + timeout
         await cache.wait_for(first)
         while cache.buffered_from(first) < need and time.monotonic() < deadline:
+            if (
+                rate
+                and cache.buffered_from(first) >= early
+                and cache.speed >= 2 * rate
+            ):
+                break
             if cache.error is not None:
                 raise IOError(f"Telegram download failed: {cache.error}")
             if report is not None:
@@ -1097,6 +1190,8 @@ class Track:
         self.audio_index = None  # chosen audio track, None = ffmpeg's pick
         self.prefetch_task = None
         self.recoveries = 0
+        self.probed = False  # stream layout known: py-tgcalls' check skipped
+        self.fresh = False  # bypass the resolve cache (expired stream URLs)
         self.resolved_at = 0.0
 
     @property
@@ -1544,14 +1639,36 @@ class VoiceChatMod(loader.Module):
         self._players = {}
         self._browser = BrowserSession()
         self._streamer = TelegramStreamer()
+        self._info_cache = collections.OrderedDict()
+        self._yt_first = {}
+        self._saved_at = 0.0
         self._browser_task = None
         self._restore_task = None
+        self._warm_task = None
 
     async def client_ready(self, client, db):
         self._client = client
         shutil.rmtree(WORK_DIR, ignore_errors=True)
         self._browser_task = asyncio.ensure_future(self._browser_loop())
         self._restore_task = asyncio.ensure_future(self._restore_all())
+        self._warm_task = asyncio.ensure_future(self._warm_up())
+
+    async def _warm_up(self):
+        """Import the heavy libraries and read ffmpeg's options in the
+        background, so the first command does not wait for them."""
+        await asyncio.sleep(WARM_UP_DELAY)
+
+        def work():
+            for name in ("yt_dlp", "pytgcalls"):
+                with contextlib.suppress(Exception):
+                    importlib.import_module(name)
+            if shutil.which("ffmpeg"):
+                supported_options("ffmpeg")
+                supported_options("ffprobe")
+                _hls_demuxer_options()
+
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(work)
 
     def _browser_enabled(self):
         return bool(self.config["browser_session"]) and self._browser.available()
@@ -1573,8 +1690,9 @@ class VoiceChatMod(loader.Module):
                 self._browser.record_error(error)
 
     async def on_unload(self):
-        if self._restore_task is not None:
-            self._restore_task.cancel()
+        for task in (self._restore_task, self._warm_task):
+            if task is not None:
+                task.cancel()
         for player in list(self._players.values()):
             self._stop_ticker(player)
         await self._streamer.close()
@@ -1911,8 +2029,15 @@ class VoiceChatMod(loader.Module):
         if not is_youtube(track.source):
             return self._extract_any_sync(track, base, context or {})
         attempts = self._youtube_attempts(base, context or {})
+        # Start with the combination that worked last time for this setup.
+        setup = (bool((context or {}).get("cookies")), bool((context or {}).get("browser")))
+        first = self._yt_first.get(setup, 0)
+        order = list(range(len(attempts)))
+        if 0 < first < len(order):
+            order.insert(0, order.pop(first))
         error = None
-        for options in attempts:
+        for position in order:
+            options = attempts[position]
             try:
                 with yt_dlp.YoutubeDL(options) as ydl:
                     info = ydl.extract_info(track.source, download=False)
@@ -1928,6 +2053,7 @@ class VoiceChatMod(loader.Module):
                 entries = [entry for entry in info["entries"] if entry]
                 info = entries[0] if entries else None
             if info:
+                self._yt_first[setup] = position
                 return info
             error = ValueError("nothing found")
         raise error or ValueError("nothing found")
@@ -2086,6 +2212,10 @@ class VoiceChatMod(loader.Module):
         track.is_live = bool(info.get("is_live"))
         track.title = info.get("title") or track.title
         track.webpage = info.get("webpage_url") or track.webpage
+        # yt-dlp's own format data is enough when it names both codecs.
+        track.probed = bool(video or audio) and (
+            not track.video_url or bool(track.width and track.height)
+        )
         track.resolved_at = time.monotonic()
 
     async def _ffprobe(self, url, headers=None):
@@ -2139,6 +2269,7 @@ class VoiceChatMod(loader.Module):
         video = max(videos, key=lambda s: s["width"] * s.get("height", 0), default=None)
         if not video and not audios:
             raise ValueError("no audio or video stream found")
+        track.probed = True
         if video and not track.audio_only:
             track.video_url = track.video_url or target
             track.width = video.get("width")
@@ -2227,17 +2358,31 @@ class VoiceChatMod(loader.Module):
             track.resolved_at = time.monotonic()
             return
         youtube = is_youtube(track.source)
-        context = self._yt_context(track.source) if URL_RE.match(track.source) or youtube else None
-        try:
-            info = await asyncio.to_thread(self._extract_sync, track, context)
-        except Exception as error:
-            if not (youtube and is_auth_error(error)):
-                raise
-            info = await self._retry_with_fresh_browser(track)
-            if info is None:
-                raise YouTubeAuthError(context or {}) from error
+        key = (track.source, track.audio_only, self.config["video_quality"])
+        cached = None if track.fresh else self._info_cache.get(key)
+        if cached is not None and time.monotonic() - cached[0] < INFO_CACHE_TTL:
+            info = cached[1]
+        else:
+            context = (
+                self._yt_context(track.source)
+                if URL_RE.match(track.source) or youtube
+                else None
+            )
+            try:
+                info = await asyncio.to_thread(self._extract_sync, track, context)
+            except Exception as error:
+                if not (youtube and is_auth_error(error)):
+                    raise
+                info = await self._retry_with_fresh_browser(track)
+                if info is None:
+                    raise YouTubeAuthError(context or {}) from error
+            info = slim_info(info)
+            self._info_cache[key] = (time.monotonic(), info)
+            while len(self._info_cache) > INFO_CACHE_SIZE:
+                self._info_cache.popitem(last=False)
+        track.fresh = False
         self._apply_info(track, info)
-        if not youtube:
+        if not youtube and not track.probed:
             await self._probe_track(track)
 
     async def _retry_with_fresh_browser(self, track):
@@ -2432,9 +2577,15 @@ class VoiceChatMod(loader.Module):
         if not track.path:
             args += http_args(track.headers)
             args += hls_args(track.video_url, track.audio_url)
-        if track.has_video:
-            # Output option (after -i): sharper scaling than the default.
-            args += ["-atmid", "-sws_flags", "lanczos+accurate_rnd"]
+        if track.has_video and track.width and track.height:
+            out_w, _ = fit_frame(
+                track.width, track.height, self.config["video_quality"]
+            )
+            ratio = track.width / max(1, out_w)
+            if ratio >= LANCZOS_FROM:
+                # Output option (after -i): a big downscale is worth lanczos;
+                # small ones look the same with the lighter default.
+                args += ["-atmid", "-sws_flags", "lanczos"]
         audio = []
         if track.audio_index is not None and len(track.audio_streams) > 1:
             audio += ["-map", f"0:a:{int(track.audio_index)}"]
@@ -2453,8 +2604,68 @@ class VoiceChatMod(loader.Module):
             cap = MAX_FPS
         return clamp_fps(track.fps, cap)
 
+    def _raw_stream(self, track, offset=0):
+        """Build py-tgcalls' stream from what is already known about ``track``.
+
+        ``MediaStream.check_stream`` would run two ffprobes over the network
+        and two ffmpeg help dumps on every start, seek and track switch; the
+        probe that resolving did already answered all of it.  Returns None
+        when something is unknown and the full check is needed.
+        """
+        if track.has_video and not (track.width and track.height):
+            return None
+        if not (track.has_audio or track.has_video):
+            return None
+        from ntgcalls import MediaSource
+        from pytgcalls.ffmpeg import build_command
+        from pytgcalls.list_to_cmd import list_to_cmd
+        from pytgcalls.types.raw import (
+            AudioParameters,
+            AudioStream,
+            Stream,
+            VideoParameters,
+            VideoStream,
+        )
+
+        patch_pytgcalls()
+        params = self._ffmpeg_parameters(track, offset)
+
+        def shell(path, parameters):
+            # Strip here too: ``build_command`` may be py-tgcalls' original.
+            command = _strip_reconnect_at_eof(
+                build_command(
+                    "ffmpeg", params, path, parameters, [], None, track.is_live
+                )
+            )
+            return list_to_cmd(clean_command(command))
+
+        microphone = camera = None
+        if track.has_audio:
+            rate, channels = AUDIO_MODES.get(
+                self.config["audio_quality"], AUDIO_MODES["high"]
+            )
+            audio = AudioParameters(rate, channels)
+            microphone = AudioStream(
+                MediaSource.SHELL, shell(track.audio_url, audio), audio
+            )
+        if track.has_video:
+            width, height = fit_frame(
+                track.width, track.height, self.config["video_quality"]
+            )
+            video = VideoParameters(width, height, self._fps(track), True)
+            camera = VideoStream(
+                MediaSource.SHELL, shell(track.video_url, video), video
+            )
+        if camera is not None and self.config["video_mode"] == "screen":
+            return Stream(microphone=microphone, screen=camera)
+        return Stream(microphone=microphone, camera=camera)
+
     async def _stream(self, track, offset=0):
         """The stream for ``track``; video goes out as a screen share if set."""
+        if track.probed:
+            raw = self._raw_stream(track, offset)
+            if raw is not None:
+                return raw
         media = self._media_stream(track, offset)
         if not track.has_video or self.config["video_mode"] != "screen":
             return media
@@ -2562,7 +2773,12 @@ class VoiceChatMod(loader.Module):
                 )
 
         await self._streamer.prebuffer(
-            track.stream_url, start, rate * seconds, report
+            track.stream_url,
+            start,
+            rate * seconds,
+            report,
+            rate=rate,
+            enough=rate * min(seconds, PREBUFFER_MIN),
         )
 
     async def _start(self, player, track, offset=0, status=None):
@@ -2775,6 +2991,7 @@ class VoiceChatMod(loader.Module):
         )
         if not (track.path or track.stream_url):
             track.resolved_at = 0.0  # stream URLs may have expired
+            track.fresh = True
         try:
             await self._start(player, track, offset=max(0, position - 2))
         except Exception as error:
@@ -3001,7 +3218,7 @@ class VoiceChatMod(loader.Module):
         while player.current is not None and self._players.get(player.chat_id) is player:
             await asyncio.sleep(PANEL_REFRESH)
             await self._refresh_panel(player)
-            self._save_state()
+            self._save_state(periodic=True)
 
     async def _panel_action(self, call, chat_id, action):
         user = getattr(getattr(call, "from_user", None), "id", None)
@@ -3118,7 +3335,12 @@ class VoiceChatMod(loader.Module):
             "audio_index": track.audio_index,
         }
 
-    def _save_state(self):
+    def _save_state(self, periodic=False):
+        """Persist the queues; ``periodic`` saves are limited to SAVE_EVERY."""
+        now = time.monotonic()
+        if periodic and now - self._saved_at < SAVE_EVERY:
+            return
+        self._saved_at = now
         data = {}
         for chat_id, player in self._players.items():
             if player.current is None and not player.queue:
