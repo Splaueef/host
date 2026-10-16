@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 2.1.0
+# meta version: 2.2.0
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -75,7 +75,12 @@ MAX_FAILED_IN_ROW = 3
 # dropped connection: the track restarts where it stopped (a few times).
 EARLY_END = 15.0
 MAX_RECOVERIES = 3
-LOUDNORM = "loudnorm=I=-16:TP=-1.5:LRA=11"
+# Automatic quality: when the CPU stays this busy while video plays, the
+# picture steps down one resolution (encoding cost follows the pixel count).
+OVERLOAD_PERCENT = 90.0
+OVERLOAD_SAMPLES = 2  # ticks in a row (PANEL_REFRESH apart)
+RELAX_PERCENT = 55.0  # below this a new track may step back up
+QUALITY_STEPS = ("4k", "1440p", "1080p", "720p", "480p", "360p")
 PANEL_REFRESH = 15.0
 SEEK_STEP = 10
 VOLUME_STEP = 10
@@ -1190,6 +1195,7 @@ class Track:
         self.audio_index = None  # chosen audio track, None = ffmpeg's pick
         self.prefetch_task = None
         self.recoveries = 0
+        self.quality_drop = 0  # resolution steps below video_quality (auto)
         self.probed = False  # stream layout known: py-tgcalls' check skipped
         self.fresh = False  # bypass the resolve cache (expired stream URLs)
         self.resolved_at = 0.0
@@ -1228,6 +1234,8 @@ class Player:
         self.switched_at = 0.0
         self.failed_in_row = 0
         self.panel = None
+        self.overload_hits = 0
+        self.quality_drop = 0
         self.ticker = None
         self.last_panel_text = None
 
@@ -1398,7 +1406,35 @@ class VoiceChatMod(loader.Module):
             "Бажані мови звукової доріжки по черзі (коди ISO або частина "
             "назви доріжки), напр. uk, ukr, ru, en"
         ),
-        "cfg_normalize": "Вирівнювати гучність (loudnorm), щоб треки звучали однаково",
+        "cfg_auto_quality": (
+            "Автоматично знижувати роздільність, якщо процесор не встигає "
+            "(і повертати, коли звільниться)"
+        ),
+        "cfg_decode_threads": (
+            "Потоків на декодування відео (0 — половина ядер; менше потоків "
+            "лишає більше процесора для кодування в дзвінок)"
+        ),
+        "quality_down": "📉 Процесор не встигає — знижую якість до {}",
+        "stats": (
+            "📊 <b>Навантаження</b>\n\n"
+            "Процесор сервера: <b>{system}%</b> ({cores} ядер), load {load}\n"
+            "Hikka (з кодуванням відео в дзвінок): <b>{hikka}%</b>\n"
+            "ffmpeg (декодування): <b>{ffmpeg}%</b> · процесів: {processes}\n"
+            "Пам'ять: {memory}\n"
+            "{players}\n\n{verdict}"
+        ),
+        "stats_player": "🎬 {title}\n   {quality}{level}",
+        "stats_level": " · авто-якість: −{} крок(и)",
+        "stats_ok": "🟢 Запас є — відео має йти плавно.",
+        "stats_busy": (
+            "🟡 Процесор майже зайнятий — можливі підлагування. Допоможе "
+            "<code>{p}config VoiceChat</code> → <code>video_quality</code> = 720p."
+        ),
+        "stats_over": (
+            "🔴 Процесор перевантажений — звук і відео смикатимуться. "
+            "Знизьте <code>video_quality</code> або <code>max_fps</code>."
+        ),
+        "stats_unavailable": "📊 <b>Немає psutil</b> — навантаження не виміряти.",
         "cfg_panel": "Панель керування з кнопками замість текстових повідомлень",
         "cfg_prefetch": "Заздалегідь готувати наступний трек у черзі",
         "cfg_access": (
@@ -1596,10 +1632,16 @@ class VoiceChatMod(loader.Module):
                 validator=loader.validators.Series(loader.validators.String()),
             ),
             loader.ConfigValue(
-                "normalize_audio",
+                "auto_quality",
                 True,
-                lambda: self.strings("cfg_normalize"),
+                lambda: self.strings("cfg_auto_quality"),
                 validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "decode_threads",
+                0,
+                lambda: self.strings("cfg_decode_threads"),
+                validator=loader.validators.Integer(minimum=0, maximum=16),
             ),
             loader.ConfigValue(
                 "panel",
@@ -1640,6 +1682,9 @@ class VoiceChatMod(loader.Module):
         self._browser = BrowserSession()
         self._streamer = TelegramStreamer()
         self._info_cache = collections.OrderedDict()
+        self._process = None
+        self._children = {}
+        self._last_system = None
         self._yt_first = {}
         self._saved_at = 0.0
         self._browser_task = None
@@ -2579,23 +2624,42 @@ class VoiceChatMod(loader.Module):
             args += hls_args(track.video_url, track.audio_url)
         if track.has_video and track.width and track.height:
             out_w, _ = fit_frame(
-                track.width, track.height, self.config["video_quality"]
+                track.width, track.height, self._video_cap(track)
             )
             ratio = track.width / max(1, out_w)
             if ratio >= LANCZOS_FROM:
                 # Output option (after -i): a big downscale is worth lanczos;
                 # small ones look the same with the lighter default.
                 args += ["-atmid", "-sws_flags", "lanczos"]
+        if track.has_video:
+            # Video decoder threads only ("--video" section, before -i): the
+            # rest of the cores stay free for encoding into the call.
+            args += ["--video", "-threads", str(self._decode_threads())]
         audio = []
         if track.audio_index is not None and len(track.audio_streams) > 1:
             audio += ["-map", f"0:a:{int(track.audio_index)}"]
-        if track.has_audio and self.config["normalize_audio"]:
-            audio += ["-af", LOUDNORM]
         if audio:
             # py-tgcalls: "--audio" starts options for the sound ffmpeg only,
             # "-atmid" puts them after its input.
             args += ["--audio", "-atmid", *audio]
         return shlex.join(args) if args else None
+
+    def _video_cap(self, track):
+        """The configured quality cap, lowered by automatic quality steps."""
+        cap = self.config["video_quality"]
+        if cap not in QUALITY_STEPS:
+            cap = "1080p"
+        index = min(
+            len(QUALITY_STEPS) - 1,
+            QUALITY_STEPS.index(cap) + max(0, int(track.quality_drop)),
+        )
+        return QUALITY_STEPS[index]
+
+    def _decode_threads(self):
+        configured = int(self.config["decode_threads"] or 0)
+        if configured > 0:
+            return configured
+        return max(1, min(4, (os.cpu_count() or 2) // 2))
 
     def _fps(self, track):
         try:
@@ -2650,7 +2714,7 @@ class VoiceChatMod(loader.Module):
             )
         if track.has_video:
             width, height = fit_frame(
-                track.width, track.height, self.config["video_quality"]
+                track.width, track.height, self._video_cap(track)
             )
             video = VideoParameters(width, height, self._fps(track), True)
             camera = VideoStream(
@@ -2688,7 +2752,7 @@ class VoiceChatMod(loader.Module):
             self.config["audio_quality"], AUDIO_MODES["high"]
         )
         width, height = fit_frame(
-            track.width, track.height, self.config["video_quality"]
+            track.width, track.height, self._video_cap(track)
         )
         has_video = track.has_video
         return MediaStream(
@@ -2722,7 +2786,7 @@ class VoiceChatMod(loader.Module):
             label = f"{self.strings('audio_only')}, {rate // 1000} kHz"
         else:
             width, height = fit_frame(
-                track.width, track.height, self.config["video_quality"]
+                track.width, track.height, self._video_cap(track)
             )
             label = f"{width}×{height}@{self._fps(track)}"
             if not track.has_audio:
@@ -2783,6 +2847,8 @@ class VoiceChatMod(loader.Module):
 
     async def _start(self, player, track, offset=0, status=None):
         """Resolve ``track`` and put it on air.  Caller holds ``player.lock``."""
+        if track is not player.current:
+            self._relax_quality(player, track)
         await self._resolve(track)
         cache = self._streamer.cache(track.stream_url) if track.stream_url else None
         if cache is not None:
@@ -3035,6 +3101,153 @@ class VoiceChatMod(loader.Module):
         for track in tracks:
             self._release(track)
 
+    # ------------------------------------------------------------------ load
+
+    def _load(self):
+        """CPU use in percent since the previous call; None without psutil."""
+        try:
+            import psutil
+        except ImportError:
+            return None
+        me = self._process
+        if me is None:
+            me = self._process = psutil.Process()
+        children = []
+        with contextlib.suppress(Exception):
+            children = [
+                child for child in me.children(recursive=True)
+                if "ffmpeg" in (child.name() or "")
+            ]
+        known = self._children
+        ffmpeg = 0.0
+        alive = {}
+        for child in children:
+            proc = known.get(child.pid, child)
+            with contextlib.suppress(Exception):
+                ffmpeg += proc.cpu_percent(None)
+            alive[child.pid] = proc
+        self._children = alive
+        cores = psutil.cpu_count() or 1
+        hikka = 0.0
+        with contextlib.suppress(Exception):
+            hikka = me.cpu_percent(None)
+        load = (0.0, 0.0, 0.0)
+        with contextlib.suppress(Exception):
+            load = os.getloadavg()
+        memory = None
+        with contextlib.suppress(Exception):
+            memory = psutil.virtual_memory()
+        return {
+            "system": psutil.cpu_percent(None),
+            "cores": cores,
+            "hikka": hikka / cores,
+            "ffmpeg": ffmpeg / cores,
+            "processes": len(children),
+            "load": load,
+            "memory": memory,
+        }
+
+    async def _watch_load(self, player):
+        """Step the picture down when the CPU cannot keep up."""
+        if not self.config["auto_quality"]:
+            return
+        track = player.current
+        if track is None or not track.has_video or player.paused:
+            player.overload_hits = 0
+            return
+        sample = await asyncio.to_thread(self._load)
+        if sample is None:
+            return
+        self._last_system = sample["system"]
+        if sample["system"] < OVERLOAD_PERCENT:
+            player.overload_hits = 0
+            return
+        player.overload_hits += 1
+        cap = self._video_cap(track)
+        if player.overload_hits < OVERLOAD_SAMPLES or cap == QUALITY_STEPS[-1]:
+            return
+        player.overload_hits = 0
+        player.quality_drop += 1
+        track.quality_drop = player.quality_drop
+        logger.info(
+            "VoiceChat: CPU at %.0f%%, lowering video to %s",
+            sample["system"], self._video_cap(track),
+        )
+        async with player.lock:
+            if player.current is track:
+                await self._start(player, track, offset=player.position)
+        with contextlib.suppress(Exception):
+            await self._client.send_message(
+                player.chat_id,
+                self.strings("quality_down").format(self._video_cap(track)),
+            )
+
+    def _relax_quality(self, player, track):
+        """A new track may go one step back up once the CPU has room."""
+        if (
+            player.quality_drop > 0
+            and self._last_system is not None
+            and self._last_system < RELAX_PERCENT
+        ):
+            player.quality_drop -= 1
+        track.quality_drop = player.quality_drop
+
+    @loader.group_member
+    @loader.command(ru_doc="Навантаження сервера й чи встигає відео")
+    async def vcstats(self, message):
+        """Навантаження процесора (Hikka, ffmpeg), пам'ять і поради щодо якості"""
+        if not await self._allowed(message, "view"):
+            return
+        await asyncio.to_thread(self._load)  # prime the counters
+        await asyncio.sleep(1.5)
+        sample = await asyncio.to_thread(self._load)
+        if sample is None:
+            return await utils.answer(message, self.strings("stats_unavailable"))
+        self._last_system = sample["system"]
+        lines = []
+        for player in self._players.values():
+            if player.current is None:
+                continue
+            track = player.current
+            lines.append(
+                self.strings("stats_player").format(
+                    title=self._title_html(track),
+                    quality=self._quality_label(track),
+                    level=(
+                        self.strings("stats_level").format(track.quality_drop)
+                        if track.quality_drop
+                        else ""
+                    ),
+                )
+            )
+        memory = sample["memory"]
+        memory_text = (
+            f"{memory.used / 1073741824:.1f} / {memory.total / 1073741824:.1f} ГБ"
+            if memory is not None
+            else "—"
+        )
+        if sample["system"] >= OVERLOAD_PERCENT:
+            verdict = self.strings("stats_over")
+        elif sample["system"] >= 70:
+            verdict = self.strings("stats_busy").format(p=self.get_prefix())
+        else:
+            verdict = self.strings("stats_ok")
+        await utils.answer(
+            message,
+            self.strings("stats").format(
+                system=round(sample["system"]),
+                cores=sample["cores"],
+                load=" ".join(f"{x:.2f}" for x in sample["load"]),
+                hikka=round(sample["hikka"]),
+                ffmpeg=round(sample["ffmpeg"]),
+                processes=sample["processes"],
+                memory=memory_text,
+                players="\n".join(lines),
+                verdict=verdict,
+            ),
+            link_preview=False,
+        )
+
     # ---------------------------------------------------------------- access
 
     def _owner_id(self):
@@ -3217,6 +3430,8 @@ class VoiceChatMod(loader.Module):
         """Keep the panel's progress bar and the saved position current."""
         while player.current is not None and self._players.get(player.chat_id) is player:
             await asyncio.sleep(PANEL_REFRESH)
+            with contextlib.suppress(Exception):
+                await self._watch_load(player)
             await self._refresh_panel(player)
             self._save_state(periodic=True)
 

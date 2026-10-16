@@ -980,6 +980,12 @@ class PlaybackTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://a", self._last_answer())
 
 
+def video_threads(params):
+    parts = shlex.split(params)
+    section = parts[parts.index("--video"):]
+    return section[section.index("-threads") + 1]
+
+
 class _Panel:
     def __init__(self, text, markup):
         self.text, self.markup = text, markup
@@ -1086,8 +1092,8 @@ class FeaturesTest(unittest.IsolatedAsyncioTestCase):
         await upcoming.prefetch_task
         self.assertTrue(upcoming.resolved)
 
-    # -- audio tracks and loudness
-    def test_audio_track_and_loudnorm_go_to_the_sound_ffmpeg_only(self):
+    # -- audio tracks, decoder threads, no audio filters
+    def test_audio_track_and_threads_go_to_the_right_ffmpeg(self):
         track = voicechat.Track("https://x/film.mkv")
         track.video_url = track.audio_url = "https://x/film.mkv"
         track.audio_streams = [
@@ -1095,14 +1101,25 @@ class FeaturesTest(unittest.IsolatedAsyncioTestCase):
             {"lang": "ukr", "title": "Дубляж", "codec": "aac", "channels": 6},
         ]
         track.audio_index = 1
+        self.mod.config["decode_threads"] = 3
         params = shlex.split(self.mod._ffmpeg_parameters(track))
         audio = params[params.index("--audio"):]
+        video = params[params.index("--video"):params.index("--audio")]
         self.assertIn("0:a:1", audio)
-        self.assertIn(voicechat.LOUDNORM, audio)
+        self.assertEqual(video, ["--video", "-threads", "3"])
         self.assertNotIn("0:a:1", params[: params.index("--audio")])
-        self.mod.config["normalize_audio"] = False
-        params = shlex.split(self.mod._ffmpeg_parameters(track))
-        self.assertNotIn(voicechat.LOUDNORM, params)
+        # No loudness filter any more: the sound goes through untouched.
+        self.assertNotIn("-af", params)
+        self.mod.config["decode_threads"] = 0
+        threads = int(video_threads(self.mod._ffmpeg_parameters(track)))
+        self.assertTrue(1 <= threads <= 4)
+        track.audio_streams, track.audio_index = [], None
+        self.assertNotIn("--audio", self.mod._ffmpeg_parameters(track))
+
+    def test_audio_only_track_gets_no_video_options(self):
+        track = voicechat.Track("https://x/song.mp3")
+        track.audio_url = "https://x/song.mp3"
+        self.assertIsNone(self.mod._ffmpeg_parameters(track))
 
     def test_preferred_language_is_picked(self):
         streams = [
@@ -1432,6 +1449,93 @@ class FastPrebufferTest(unittest.IsolatedAsyncioTestCase):
                 timeout=5,
             )
         self.assertLess(cache.buffered_from(0), cache.chunks)
+
+
+class _Proc:
+    def __init__(self, pid, name, cpu):
+        self.pid, self._name, self._cpu = pid, name, cpu
+
+    def name(self):
+        return self._name
+
+    def cpu_percent(self, interval=None):
+        return self._cpu
+
+    def children(self, recursive=False):
+        return self.kids
+
+
+def _psutil(system, hikka=50.0, ffmpeg=(20.0, 10.0)):
+    me = _Proc(1, "python", hikka)
+    me.kids = [_Proc(10 + i, "ffmpeg", c) for i, c in enumerate(ffmpeg)]
+    me.kids.append(_Proc(99, "sh", 5.0))
+    return types.SimpleNamespace(
+        Process=lambda: me,
+        cpu_count=lambda: 2,
+        cpu_percent=lambda interval=None: system,
+        virtual_memory=lambda: types.SimpleNamespace(used=2 * 2**30, total=4 * 2**30),
+    )
+
+
+class AutoQualityTest(unittest.IsolatedAsyncioTestCase):
+    setUp = PlaybackTest.setUp
+    _player = PlaybackTest._player
+    _last_answer = PlaybackTest._last_answer
+
+    async def _play_video(self):
+        await self.mod.vcplay(_Message("https://a"))
+        track = self._player().current
+        track.width, track.height = 1920, 1080
+        return track
+
+    async def test_overload_steps_resolution_down_and_keeps_position(self):
+        track = await self._play_video()
+        self.mod.config["video_quality"] = "1080p"
+        player = self._player()
+        player.started_at -= 40
+        with mock.patch.dict(sys.modules, {"psutil": _psutil(97)}):
+            await self.mod._watch_load(player)
+            self.assertEqual(track.quality_drop, 0)  # one busy sample is not enough
+            await self.mod._watch_load(player)
+        self.assertEqual(track.quality_drop, 1)
+        self.assertEqual(self.mod._video_cap(track), "720p")
+        self.assertIn("1280×720", self.mod._quality_label(track))
+        self.assertAlmostEqual(self.calls.played[-1][2], 40, delta=1)
+        texts = [c.args[1] for c in self.mod._client.send_message.await_args_list]
+        self.assertTrue(any("720p" in t for t in texts))
+
+    async def test_calm_cpu_changes_nothing_and_next_track_steps_back_up(self):
+        track = await self._play_video()
+        player = self._player()
+        with mock.patch.dict(sys.modules, {"psutil": _psutil(40)}):
+            await self.mod._watch_load(player)
+        self.assertEqual(track.quality_drop, 0)
+        player.quality_drop = 2
+        await self.mod.vcadd(_Message("https://b"))
+        await self.mod.vcskip(_Message())
+        self.assertEqual(self._player().current.quality_drop, 1)
+
+    async def test_auto_quality_can_be_switched_off(self):
+        track = await self._play_video()
+        self.mod.config["auto_quality"] = False
+        with mock.patch.dict(sys.modules, {"psutil": _psutil(100)}):
+            for _ in range(3):
+                await self.mod._watch_load(self._player())
+        self.assertEqual(track.quality_drop, 0)
+
+    async def test_stats_report(self):
+        await self._play_video()
+        with mock.patch.dict(sys.modules, {"psutil": _psutil(95)}), \
+                mock.patch.object(voicechat.asyncio, "sleep", side_effect=_no_sleep):
+            await self.mod.vcstats(_Message())
+        text = self._last_answer()
+        self.assertIn("95%", text)
+        self.assertIn("ffmpeg (декодування): <b>15%</b> · процесів: 2", text)
+        self.assertIn("перевантажений", text)
+
+    def test_stats_without_psutil(self):
+        with mock.patch.dict(sys.modules, {"psutil": None}):
+            self.assertIsNone(self.mod._load())
 
 
 if __name__ == "__main__":
