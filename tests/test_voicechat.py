@@ -1991,3 +1991,114 @@ class DeadPanelTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1:00", self.mod._client.edit_message.await_args.args[2])
         await self.mod._show_now(player)
         self.assertEqual(len(self.mod.inline.forms), 1)  # no new inline panels
+
+
+class _RichPanel(_Panel):
+    inline_message_id = "AAAAinline"
+
+
+class _RichInline(_Inline):
+    """Hikka's inline manager with a bot token and generate_markup()."""
+
+    _token = "123:abc"
+
+    def __init__(self):
+        super().__init__()
+        self.custom_map = {}
+
+    async def form(self, text, message=None, reply_markup=None, **kwargs):
+        panel = _RichPanel(text, reply_markup)
+        self.forms.append(panel)
+        return panel
+
+    def generate_markup(self, markup):
+        for row in markup:
+            for button in row:
+                if "_callback_data" not in button:
+                    button["_callback_data"] = f"cb{len(self.custom_map)}"
+                    self.custom_map[button["_callback_data"]] = button
+        return markup
+
+
+class RichPanelTest(unittest.IsolatedAsyncioTestCase):
+    setUp = PlaybackTest.setUp
+    _player = PlaybackTest._player
+
+    def _api(self, answer=None):
+        self.sent = []
+
+        async def call(method, payload):
+            self.sent.append((method, payload))
+            return answer or {"ok": True, "result": True}
+
+        self.mod._bot_api = call
+
+    @staticmethod
+    def _buttons(payload):
+        return [
+            button
+            for block in payload["rich_message"]["blocks"]
+            if block["type"] == "buttons"
+            for button in block["buttons"]
+        ]
+
+    async def test_panel_is_shown_and_kept_as_rich_text(self):
+        self.mod.inline = _RichInline()
+        self._api()
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcadd(_Message("https://b"))
+        method, payload = self.sent[0]
+        self.assertEqual(method, "editMessageText")
+        self.assertEqual(payload["inline_message_id"], "AAAAinline")
+        self.assertEqual(payload["reply_markup"], {"inline_keyboard": []})
+        blocks = payload["rich_message"]["blocks"]
+        self.assertEqual(blocks[0]["type"], "heading")
+        self.assertEqual(blocks[0]["text"][1]["url"], "https://a")
+        self.assertEqual(blocks[2]["type"], "table")
+        self.assertEqual(blocks[-1]["type"], "footer")
+        styles = {b["text"]: b.get("style") for b in self._buttons(payload)}
+        self.assertEqual(styles["⏸"], "primary")
+        self.assertEqual(styles["⏹"], "danger")
+
+        # The "next" line and the progress come with later edits; the
+        # buttons keep their callback data, nothing is registered twice.
+        _, payload = self.sent[-1]
+        quote = [b for b in payload["rich_message"]["blocks"] if b["type"] == "blockquote"]
+        self.assertEqual(quote[0]["blocks"][0]["text"][1]["text"], "https://b")
+        registered = len(self.mod.inline.custom_map)
+        player = self._player()
+        player.started_at -= 30
+        await self.mod._update_panel(player)
+        _, payload = self.sent[-1]
+        self.assertIn("0:30", payload["rich_message"]["blocks"][1]["text"][1]["text"])
+        self.assertEqual(len(self.mod.inline.custom_map), registered)
+        self.assertEqual(self.mod.inline.forms[0].edits, [])  # never the HTML edit
+
+        # A rich button runs the same panel action.
+        self.mod._client.tg_id = 1
+        pause = next(b for b in self._buttons(payload) if b["text"] == "⏸")
+        button = self.mod.inline.custom_map[pause["callback_data"]]
+        await button["callback"](_Call(1), *button["args"])
+        self.assertTrue(player.paused)
+        _, payload = self.sent[-1]
+        self.assertIn("▶️", [b["text"] for b in self._buttons(payload)])
+
+    async def test_refused_rich_text_falls_back_to_the_html_panel(self):
+        self.mod.inline = _RichInline()
+        self._api({"ok": False, "description": "Bad Request: rich messages are not supported"})
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcadd(_Message("https://b"))
+        panel = self._player().panel
+        self.assertTrue(self.mod._rich_broken)
+        self.assertIs(panel, self.mod.inline.forms[0])
+        self.assertIn("https://b", panel.text)  # edited the usual way
+        self.assertEqual(len(self.sent), 1)
+
+    async def test_html_style_keeps_the_classic_panel(self):
+        self.mod.inline = _RichInline()
+        self.mod.config["panel_style"] = "html"
+        self._api()
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcadd(_Message("https://b"))
+        self.assertEqual(self.sent, [])
+        self.assertIn("https://b", self._player().panel.text)

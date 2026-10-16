@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 2.4.2
+# meta version: 2.5.0
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -100,6 +100,10 @@ PANEL_REFRESH = 15.0
 # edits in a row, the panel becomes a text message the account edits itself.
 PANEL_TIMEOUT = 20.0
 PANEL_FAILURES = 3
+# Rich panel: Bot API rich messages (editMessageText with ``rich_message``),
+# the same format MiniGames uses.  Buttons live inside the message.
+BOT_API = "https://api.telegram.org/bot{token}/{method}"
+RICH_STYLES = {"toggle": "primary", "skip": "success", "stop": "danger"}
 SEEK_STEP = 10
 VOLUME_STEP = 10
 RESTORE_DELAY = 15.0
@@ -1283,6 +1287,7 @@ class Player:
         self.now_message = None  # id of the "now playing" text, edited in place
         self.panel_failures = 0
         self.last_now_text = None
+        self.rich_data = {}  # panel action -> callback_data of its rich button
         self.radio = False
         self.radio_channel = None  # overrides the radio_channel config value
         self.radio_order = []  # message ids of the current round
@@ -1489,6 +1494,22 @@ class VoiceChatMod(loader.Module):
         ),
         "stats_unavailable": "📊 <b>Немає psutil</b> — навантаження не виміряти.",
         "cfg_panel": "Панель керування з кнопками замість текстових повідомлень",
+        "cfg_panel_style": (
+            "Вигляд панелі: rich — Telegram Rich Text (заголовок, таблиця, "
+            "кольорові кнопки в самому повідомленні), html — звичайний текст "
+            "із кнопками під ним"
+        ),
+        "rich_state": "Стан",
+        "rich_volume": "Гучність",
+        "rich_loop": "Повтор",
+        "rich_quality": "Якість",
+        "rich_queue": "У черзі",
+        "rich_atrack": "Доріжка",
+        "rich_download": "Завантажено",
+        "rich_radio": "📻 Радіо",
+        "rich_radio_on": "грає музика з каналу",
+        "rich_next": "Далі: ",
+        "rich_footer": "🎙 VoiceChat · оновлюється кожні {} с",
         "cfg_prefetch": "Заздалегідь готувати наступний трек у черзі",
         "cfg_access": (
             "Хто керує: owner — лише власник і довірені; queue — усі в групі "
@@ -1756,6 +1777,12 @@ class VoiceChatMod(loader.Module):
                 validator=loader.validators.Boolean(),
             ),
             loader.ConfigValue(
+                "panel_style",
+                "rich",
+                lambda: self.strings("cfg_panel_style"),
+                validator=loader.validators.Choice(["rich", "html"]),
+            ),
+            loader.ConfigValue(
                 "prefetch_next",
                 True,
                 lambda: self.strings("cfg_prefetch"),
@@ -1817,6 +1844,7 @@ class VoiceChatMod(loader.Module):
         self._health_task = None
         self._inline_broken = False
         self._inline_hint_sent = False
+        self._rich_broken = False
 
     async def client_ready(self, client, db):
         self._client = client
@@ -3902,6 +3930,183 @@ class VoiceChatMod(loader.Module):
             text += self.strings("panel_next").format(self._title_html(upcoming))
         return text
 
+    # ------------------------------------------------------------ rich panel
+
+    def _bot_token(self):
+        inline = getattr(self, "inline", None)
+        return getattr(inline, "_token", None) or getattr(
+            getattr(inline, "bot", None), "token", None
+        )
+
+    def _rich_wanted(self, player):
+        return (
+            self.config["panel_style"] == "rich"
+            and not self._rich_broken
+            and player.panel is not None
+            and bool(getattr(player.panel, "inline_message_id", None))
+            and bool(self._bot_token())
+            and callable(getattr(self.inline, "generate_markup", None))
+        )
+
+    async def _bot_api(self, method, payload):
+        """Call the Bot API directly (Hikka's aiogram may not know the method)."""
+        import aiohttp
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as session:
+            async with session.post(
+                BOT_API.format(token=self._bot_token(), method=method), json=payload
+            ) as response:
+                return await response.json(content_type=None)
+
+    def _rich_callbacks(self, player, markup):
+        """callback_data for each panel button, registered with Hikka once."""
+        fresh = []
+        for row in markup:
+            for button in row:
+                action = button["args"][1]
+                button["disable_security"] = True  # _panel_action checks access
+                if action in player.rich_data:
+                    button["_callback_data"] = player.rich_data[action]
+                else:
+                    fresh.append(button)
+        if fresh:
+            self.inline.generate_markup([fresh])
+            for button in fresh:
+                player.rich_data[button["args"][1]] = button["_callback_data"]
+
+    def _panel_rich(self, player, markup):
+        """The panel as a Bot API ``InputRichMessage``."""
+        track = player.current
+        position = player.position
+
+        def cell(text, header=False):
+            result = {"align": "left", "valign": "middle", "text": text}
+            if header:
+                result["is_header"] = True
+            return result
+
+        title = str(track.title)[:200]
+        if track.webpage:
+            title = {"type": "url", "text": title, "url": track.webpage}
+        if track.duration and not track.is_live:
+            filled = int(min(1.0, position / float(track.duration)) * 12)
+            bar = "▰" * filled + "▱" * (12 - filled)
+        else:
+            bar = "🔴"
+        rows = [
+            (
+                self.strings("rich_state"),
+                self.strings("state_paused" if player.paused else "state_playing"),
+            ),
+            (self.strings("rich_volume"), f"{player.volume}%"),
+            (self.strings("rich_loop"), self.strings("on" if player.loop else "off")),
+            (self.strings("rich_quality"), html.unescape(self._quality_label(track))),
+            (self.strings("rich_queue"), str(len(player.queue))),
+        ]
+        if len(track.audio_streams) > 1:
+            current = (
+                self._audio_track_label(
+                    track.audio_streams[track.audio_index], track.audio_index
+                )
+                if track.audio_index is not None
+                else self.strings("atrack_auto")
+            )
+            rows.append((self.strings("rich_atrack"), current))
+        cache = self._streamer.cache(track.stream_url) if track.stream_url else None
+        if cache is not None and not cache.complete:
+            rows.append(
+                (
+                    self.strings("rich_download"),
+                    f"{int(cache.progress * 100)}% · "
+                    f"{cache.speed / 1048576:.1f} МБ/с",
+                )
+            )
+        if player.radio:
+            rows.append((self.strings("rich_radio"), self.strings("rich_radio_on")))
+        blocks = [
+            {"type": "heading", "text": [f"{self._icon(track)} ", title], "size": 3},
+            {
+                "type": "paragraph",
+                "text": [
+                    f"{bar}  ",
+                    {
+                        "type": "bold",
+                        "text": f"{fmt_time(position)} / {self._duration_label(track)}",
+                    },
+                ],
+            },
+            {
+                "type": "table",
+                "cells": [[cell(name, header=True), cell(value)] for name, value in rows],
+                "is_bordered": True,
+                "is_compact": True,
+            },
+        ]
+        upcoming = player.queue[0] if player.queue else player.radio_next
+        if upcoming is not None:
+            blocks.append(
+                {
+                    "type": "blockquote",
+                    "blocks": [
+                        {
+                            "type": "paragraph",
+                            "text": [
+                                self.strings("rich_next"),
+                                {"type": "bold", "text": str(upcoming.title)[:200]},
+                            ],
+                        }
+                    ],
+                }
+            )
+        for row in markup:
+            buttons = []
+            for button in row:
+                action = button["args"][1]
+                rich = {"text": button["text"], "callback_data": button["_callback_data"]}
+                style = RICH_STYLES.get(action)
+                if action == "loop" and player.loop:
+                    style = "success"
+                if style:
+                    rich["style"] = style
+                buttons.append(rich)
+            blocks.append({"type": "buttons", "buttons": buttons, "align": "center"})
+        blocks.append(
+            {
+                "type": "footer",
+                "text": self.strings("rich_footer").format(int(PANEL_REFRESH)),
+            }
+        )
+        return {"blocks": blocks, "skip_entity_detection": True}
+
+    async def _edit_rich(self, player):
+        """Show the panel as a rich message: True / False like Hikka's edit(),
+        ``None`` when Telegram refuses rich messages (the HTML panel takes over)."""
+        markup = self._panel_markup(player)
+        try:
+            self._rich_callbacks(player, markup)
+            payload = {
+                "inline_message_id": str(player.panel.inline_message_id),
+                "rich_message": self._panel_rich(player, markup),
+                "reply_markup": {"inline_keyboard": []},
+            }
+            data = await self._bot_api("editMessageText", payload)
+        except Exception as error:
+            logger.debug("VoiceChat rich panel edit failed: %s", error)
+            return False
+        if isinstance(data, dict) and data.get("ok"):
+            return True
+        description = str((data or {}).get("description") if isinstance(data, dict) else data)
+        if "not modified" in description.lower():
+            return True
+        logger.warning(
+            "VoiceChat: Telegram refused the rich panel (%s), using the HTML one",
+            description,
+        )
+        self._rich_broken = True
+        return None
+
     def _panel_markup(self, player):
         chat_id = player.chat_id
 
@@ -3960,6 +4165,9 @@ class VoiceChatMod(loader.Module):
         player.panel = panel
         player.last_panel_text = text
         player.panel_failures = 0
+        if self._rich_wanted(player):
+            player.last_panel_text = None
+            await self._refresh_panel(player)  # turn it into the rich panel
         if old is not None and old is not panel:
             with contextlib.suppress(Exception):
                 await old.delete()
@@ -4025,13 +4233,15 @@ class VoiceChatMod(loader.Module):
         text = self._panel_text(player)
         if text == player.last_panel_text:
             return True
-        try:
-            result = await player.panel.edit(
-                text, reply_markup=self._panel_markup(player)
-            )
-        except Exception as error:
-            logger.debug("VoiceChat panel refresh failed: %s", error)
-            result = False
+        result = await self._edit_rich(player) if self._rich_wanted(player) else None
+        if result is None:  # HTML panel
+            try:
+                result = await player.panel.edit(
+                    text, reply_markup=self._panel_markup(player)
+                )
+            except Exception as error:
+                logger.debug("VoiceChat panel refresh failed: %s", error)
+                result = False
         if result is False:  # Hikka returns False instead of raising
             player.panel_failures += 1
             if player.panel_failures >= PANEL_FAILURES:
