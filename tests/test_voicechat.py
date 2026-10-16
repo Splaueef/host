@@ -181,6 +181,43 @@ class HelpersTest(unittest.TestCase):
         self.assertTrue(track.has_video and track.resolved)
 
 
+class SetupTest(unittest.TestCase):
+    def _plan(self, have_telethon, have_hikkatl, have_pytgcalls=False):
+        specs = {"hikkatl": have_hikkatl, "pytgcalls": have_pytgcalls}
+        with mock.patch.object(
+            voicechat.importlib.util,
+            "find_spec",
+            side_effect=lambda name: object() if specs.get(name) else None,
+        ), mock.patch.object(
+            voicechat.VoiceChatMod,
+            "_telethon_version",
+            staticmethod(lambda: have_telethon),
+        ):
+            return voicechat.VoiceChatMod()._setup_plan()
+
+    def test_fork_on_new_telethon_installs_only_missing(self):
+        packages, restart, warning = self._plan((1, 44, 0), have_hikkatl=False)
+        self.assertEqual(packages, ["py-tgcalls", "yt-dlp"])
+        self.assertFalse(restart)
+        self.assertIsNone(warning)
+
+    def test_hikka_telethon_too_old_is_never_replaced(self):
+        packages, _, warning = self._plan((1, 30, 0), have_hikkatl=False)
+        self.assertNotIn(voicechat.TELETHON_REQUIREMENT, packages)
+        self.assertIn("py-tgcalls", packages)
+        self.assertIn("оновіть Hikka", warning)
+
+    def test_hikkatl_build_gets_its_own_telethon(self):
+        packages, _, warning = self._plan(None, have_hikkatl=True)
+        self.assertIn(voicechat.TELETHON_REQUIREMENT, packages)
+        self.assertIsNone(warning)
+
+    def test_pip_command_installs_listed_packages(self):
+        command = voicechat.VoiceChatMod._pip_command(["yt-dlp"])
+        self.assertEqual(command[1:5], ["-m", "pip", "install", "--upgrade"])
+        self.assertEqual(command[-1], "yt-dlp")
+
+
 class PlaybackTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         vc_utils.answer.reset_mock()

@@ -1,15 +1,15 @@
 # meta developer: @Huang_Baike
-# meta version: 1.0.0
+# meta version: 1.1.0
 # meta description: 🎙 Відтворення відео й музики з YouTube та інших сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
 """Stream YouTube (and anything yt-dlp understands) into Telegram group calls.
 
-Hikka talks to Telegram through ``hikkatl``, a Telethon fork frozen at an old
-API layer that knows nothing about current group-call requests.  py-tgcalls
-therefore gets its own lightweight upstream Telethon connection that reuses
-the account's authorisation key: no second login, no extra session file, and
-the call is joined by the same account that runs the userbot.
+Builds running on upstream Telethon (1.40+) hand their own client straight to
+py-tgcalls.  Original Hikka talks to Telegram through ``hikkatl``, a Telethon
+fork frozen at an old API layer without the current group-call requests; there
+py-tgcalls gets its own lightweight upstream Telethon connection that reuses
+the account's authorisation key: no second login and no extra session file.
 """
 
 import asyncio
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Upstream Telethon with a layer that has the group/conference call requests
 # py-tgcalls 3.x imports at module level.
 MIN_TELETHON = (1, 40, 0)
-PIP_PACKAGES = ("py-tgcalls", "yt-dlp", "telethon>=1.40")
+TELETHON_REQUIREMENT = "telethon>=1.40"
 
 WORK_DIR = os.path.abspath(".voicechat_cache")
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -246,14 +246,15 @@ class VoiceChatMod(loader.Module):
         ),
         "deps_ffmpeg": "❌ <b>Не знайдено ffmpeg / ffprobe у системі.</b>",
         "deps_unsafe": (
-            "❌ <b>Ця збірка Hikka сама працює на пакеті telethon, тому "
-            "автоматично оновлювати його небезпечно.</b> Встановіть "
-            "Telethon {}+ вручну в окреме середовище або оновіть Hikka."
+            "⚠️ <b>Hikka сама працює на Telethon {have}, а дзвінкам потрібен "
+            "{need}+.</b> Його модуль не чіпає, щоб не зламати Hikka — "
+            "оновіть Hikka."
         ),
-        "setup_running": "⏳ <b>Встановлюю залежності…</b>",
-        "setup_done": (
-            "✅ <b>Залежності встановлено.</b> Якщо оновився Telethon, "
-            "перезапустіть Hikka: <code>{}restart</code>."
+        "setup_running": "⏳ <b>Встановлюю:</b> <code>{}</code>",
+        "setup_done": "✅ <b>Встановлено:</b> <code>{}</code>",
+        "setup_restart": (
+            "\nОновився Telethon — перезапустіть Hikka: "
+            "<code>{}restart</code>."
         ),
         "setup_failed": "❌ <b>pip завершився з помилкою:</b>\n<code>{}</code>",
         "unauthorized": (
@@ -373,6 +374,8 @@ class VoiceChatMod(loader.Module):
         if self._tg is not None:
             with contextlib.suppress(Exception):
                 await self._tg.disconnect()
+        elif self._calls is not None:
+            self._drop_call_handlers()
         self._tg = None
         self._calls = None
         shutil.rmtree(WORK_DIR, ignore_errors=True)
@@ -398,6 +401,11 @@ class VoiceChatMod(loader.Module):
         import telethon
 
         if _version_tuple(telethon.__version__) < MIN_TELETHON:
+            if importlib.util.find_spec("hikkatl") is None:
+                return self.strings("deps_unsafe").format(
+                    have=utils.escape_html(telethon.__version__),
+                    need=".".join(map(str, MIN_TELETHON)),
+                )
             return self.strings("deps_old_telethon").format(
                 need=".".join(map(str, MIN_TELETHON)),
                 have=utils.escape_html(telethon.__version__),
@@ -414,30 +422,14 @@ class VoiceChatMod(loader.Module):
             if self._calls is not None:
                 return self._calls
 
-            from pytgcalls import PyTgCalls, filters
+            from pytgcalls import filters
             from pytgcalls.types import ChatUpdate
-            from telethon import TelegramClient
-            from telethon.crypto import AuthKey
-            from telethon.sessions import StringSession
 
-            source = self._client.session
-            session = StringSession()
-            session.set_dc(source.dc_id, source.server_address, source.port)
-            session.auth_key = AuthKey(source.auth_key.key)
-
-            tg = TelegramClient(
-                session,
-                self._client.api_id,
-                self._client.api_hash,
-                receive_updates=True,
-                catch_up=False,
-            )
-            await tg.connect()
-            if not await tg.is_user_authorized():
-                await tg.disconnect()
-                raise PermissionError("unauthorized")
-
-            calls = PyTgCalls(tg)
+            if self._shares_client():
+                calls = self._calls_on_hikka_client()
+                tg = None
+            else:
+                calls, tg = await self._calls_on_own_connection()
             calls.on_update(filters.stream_end())(self._on_stream_end)
             calls.on_update(filters.chat_update(ChatUpdate.Status.LEFT_CALL))(
                 self._on_left_call
@@ -445,11 +437,73 @@ class VoiceChatMod(loader.Module):
             try:
                 await calls.start()
             except Exception:
-                await tg.disconnect()
+                if tg is not None:
+                    await tg.disconnect()
+                else:
+                    self._drop_call_handlers()
                 raise
             self._tg = tg
             self._calls = calls
             return calls
+
+    def _shares_client(self):
+        """Whether Hikka's own client is upstream Telethon usable for calls."""
+        try:
+            import telethon
+        except ImportError:
+            return False
+        return isinstance(self._client, telethon.TelegramClient) and (
+            _version_tuple(telethon.__version__) >= MIN_TELETHON
+        )
+
+    def _calls_on_hikka_client(self):
+        from pytgcalls import PyTgCalls
+        from pytgcalls.mtproto.bridged_client import BridgedClient
+
+        # py-tgcalls picks the MTProto backend from the client's top-level
+        # module name, which for Hikka's subclass is ``hikka``, not
+        # ``telethon``.  Vouch for this one client while it is wrapped.
+        client = self._client
+        original = BridgedClient.package_name
+        BridgedClient.package_name = staticmethod(
+            lambda obj: "telethon" if obj is client else original(obj)
+        )
+        try:
+            return PyTgCalls(client)
+        finally:
+            BridgedClient.package_name = staticmethod(original)
+
+    def _drop_call_handlers(self):
+        """Detach py-tgcalls' update handlers from Hikka's client."""
+        with contextlib.suppress(Exception):
+            for callback, _ in list(self._client.list_event_handlers()):
+                if getattr(callback, "__module__", "").startswith("pytgcalls"):
+                    self._client.remove_event_handler(callback)
+
+    async def _calls_on_own_connection(self):
+        from pytgcalls import PyTgCalls
+        from telethon import TelegramClient
+        from telethon.crypto import AuthKey
+        from telethon.sessions import StringSession
+
+        source = self._client.session
+        session = StringSession()
+        session.set_dc(source.dc_id, source.server_address, source.port)
+        session.auth_key = AuthKey(source.auth_key.key)
+
+        tg = TelegramClient(
+            session,
+            self._client.api_id,
+            self._client.api_hash,
+            receive_updates=True,
+            catch_up=False,
+        )
+        await tg.connect()
+        if not await tg.is_user_authorized():
+            await tg.disconnect()
+            raise PermissionError("unauthorized")
+
+        return PyTgCalls(tg), tg
 
     async def _prime_chat(self, chat_id):
         """Teach the extra connection the channel's access hash."""
@@ -1218,23 +1272,68 @@ class VoiceChatMod(loader.Module):
             link_preview=False,
         )
 
+    @staticmethod
+    def _telethon_version():
+        try:
+            import telethon
+        except ImportError:
+            return None
+        return _version_tuple(getattr(telethon, "__version__", "0"))
+
+    def _setup_plan(self):
+        """Packages to install, whether a restart is needed, and a warning."""
+        packages = []
+        if importlib.util.find_spec("pytgcalls") is None:
+            packages.append("py-tgcalls")
+        # Always refresh yt-dlp: YouTube breaks old versions every few weeks.
+        packages.append("yt-dlp")
+        restart, warning = False, None
+        version = self._telethon_version()
+        if version is None or version < MIN_TELETHON:
+            if importlib.util.find_spec("hikkatl") is not None:
+                # Hikka runs on hikkatl, so upstream Telethon is ours alone.
+                packages.append(TELETHON_REQUIREMENT)
+                restart = "telethon" in sys.modules
+            else:
+                # Hikka itself runs on this telethon; never swap it under it.
+                warning = self.strings("deps_unsafe").format(
+                    have=".".join(map(str, version or (0,))),
+                    need=".".join(map(str, MIN_TELETHON)),
+                )
+        return packages, restart, warning
+
+    @staticmethod
+    def _pip_command(packages):
+        # Same flags as Hikka's own dependency installer.
+        user_install = (
+            "PIP_TARGET" not in os.environ
+            and "VIRTUAL_ENV" not in os.environ
+            and sys.prefix == getattr(sys, "base_prefix", sys.prefix)
+        )
+        return [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "-q",
+            "--disable-pip-version-check",
+            "--no-warn-script-location",
+            *(["--user"] if user_install else []),
+            *packages,
+        ]
+
     @loader.command(ru_doc="Встановити / оновити залежності")
     async def vcsetup(self, message):
-        """Встановити або оновити py-tgcalls, yt-dlp і Telethon"""
-        if importlib.util.find_spec("hikkatl") is None:
-            # Old Hikka builds ship their fork under the ``telethon`` name;
-            # replacing it with upstream Telethon would break the userbot.
-            return await utils.answer(
-                message,
-                self.strings("deps_unsafe").format(
-                    ".".join(map(str, MIN_TELETHON))
-                ),
-            )
-        message = await utils.answer(message, self.strings("setup_running"))
-        command = [sys.executable, "-m", "pip", "install", "-U", *PIP_PACKAGES]
+        """Встановити відсутні залежності (py-tgcalls, yt-dlp, за потреби Telethon)"""
+        packages, restart, warning = self._setup_plan()
+        listed = " ".join(packages)
+        message = await utils.answer(
+            message, self.strings("setup_running").format(listed)
+        )
         result = await asyncio.to_thread(
             subprocess.run,
-            command,
+            self._pip_command(packages),
             capture_output=True,
             text=True,
             timeout=600,
@@ -1245,6 +1344,10 @@ class VoiceChatMod(loader.Module):
                 message,
                 self.strings("setup_failed").format(utils.escape_html(tail)),
             )
-        await utils.answer(
-            message, self.strings("setup_done").format(self.get_prefix())
-        )
+        importlib.invalidate_caches()
+        text = self.strings("setup_done").format(listed)
+        if restart:
+            text += self.strings("setup_restart").format(self.get_prefix())
+        if warning:
+            text += "\n\n" + warning
+        await utils.answer(message, text)
