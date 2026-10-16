@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 3.5.0
+# meta version: 3.6.0
 # meta description: 🧭 Центр команд, автооновлення та синхронізація статистики Hikka.
 # scope: inline
 # scope: hikka_only
@@ -85,6 +85,7 @@ class ModuleHubMod(loader.Module):
         "airalert": "airalert.py",
         "sessionguard": "sessionguard.py",
         "agentbot": "agentbot.py",
+        "voicechat": "voicechat.py",
     }
 
     MODULES = {
@@ -117,6 +118,12 @@ class ModuleHubMod(loader.Module):
             "name": "VideoDownloader",
             "icon": "🎬",
             "description": "Завантаження відео, музики, транскриптів і діагностика.",
+        },
+        "voicechat": {
+            "class": "VoiceChatMod",
+            "name": "VoiceChat",
+            "icon": "🎙",
+            "description": "YouTube та інші відео й музика в груповому дзвінку.",
         },
         "dailynews": {
             "class": "DailyNewsMod",
@@ -272,7 +279,10 @@ class ModuleHubMod(loader.Module):
 
     SECTIONS = (
         ("📊 Статистика", ("contactstatus", "stats", "analysis")),
-        ("🤖 AI та медіа", ("vdlt", "dailynews", "mistral", "gemma", "math")),
+        (
+            "🤖 AI та медіа",
+            ("vdlt", "voicechat", "dailynews", "mistral", "gemma", "math"),
+        ),
         ("🐺 RotKranz", ("werwolf",)),
         ("🌐 Мережа Hikka", ("hikkanet", "hikkanetchat")),
         ("🛡 Адміністрування", ("groupadmin", "purge", "quiet")),
@@ -437,6 +447,15 @@ class ModuleHubMod(loader.Module):
         "gmself",
         "vdlupdate",
         "vdlreset",
+        "vcnow",
+        "vcqueue",
+        "vcpause",
+        "vcresume",
+        "vcskip",
+        "vcstop",
+        "vcloop",
+        "vcclear",
+        "vcsetup",
     }
 
     MUTATING = {
@@ -466,6 +485,9 @@ class ModuleHubMod(loader.Module):
         "vdlupdate",
         "vdladd",
         "vdlrm",
+        "vcstop",
+        "vcclear",
+        "vcsetup",
         "vdlpm",
         "vdlban",
         "vdlunban",
