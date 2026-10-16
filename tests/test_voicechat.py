@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import os
 import pathlib
+import shlex
 import sys
 import time
 import types
@@ -19,6 +20,14 @@ class _Config(dict):
 class _Module:
     def get_prefix(self):
         return "."
+
+    def get(self, key, default=None):
+        return getattr(self, "_storage", {}).get(key, default)
+
+    def set(self, key, value):
+        if not hasattr(self, "_storage"):
+            self._storage = {}
+        self._storage[key] = value
 
 
 class _Validators:
@@ -43,6 +52,7 @@ def _load_module():
 
     loader.tds = tds
     loader.command = lambda *args, **kwargs: lambda function: function
+    loader.group_member = lambda function: function
     loader.ConfigValue = lambda name, default, *args, **kwargs: (name, default)
     loader.ModuleConfig = _Config
     utils.escape_html = lambda value: str(value)
@@ -103,10 +113,11 @@ class _Calls:
 
 
 class _Message:
-    def __init__(self, args="", chat_id=CHAT, reply=None):
+    def __init__(self, args="", chat_id=CHAT, reply=None, sender_id=1, out=True):
         self.args = args
         self.chat_id = chat_id
-        self.sender_id = 1
+        self.sender_id = sender_id
+        self.out = out
         self.is_reply = reply is not None
         self._reply = reply
 
@@ -564,6 +575,13 @@ class _TgClient:
         return types.SimpleNamespace(chat_id=chat_id, id=ids)
 
 
+_real_sleep = asyncio.sleep
+
+
+async def _no_sleep(delay, *args, **kwargs):
+    await _real_sleep(0)
+
+
 class TelegramStreamTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         import tempfile
@@ -656,6 +674,42 @@ class TelegramStreamTest(unittest.IsolatedAsyncioTestCase):
         self.streamer.unregister(url)
         await asyncio.sleep(0.05)
         self.assertFalse(os.path.exists(path))
+
+    async def test_prefetch_window_fetches_only_the_opening(self):
+        client = _TgClient(self.data)
+        message = types.SimpleNamespace(chat_id=-1, id=5)
+        url = await self.streamer.register(client, message, len(self.data))
+        cache = self.streamer.cache(url)
+        await cache.set_window(2)
+        await self.streamer.prebuffer(url, 0, voicechat.TG_CHUNK)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        self.assertEqual(cache.done, 2)  # the next track waits its turn
+        await cache.set_window(None)  # it starts playing: fetch the rest
+        await cache.wait_for(cache.chunks - 1)
+        for _ in range(50):
+            if cache.complete:
+                break
+            await asyncio.sleep(0.01)
+        self.assertTrue(cache.complete)
+
+    async def test_flaky_network_is_retried_not_fatal(self):
+        client = _TgClient(self.data)
+        original = client.iter_download
+        failures = {"left": 5}
+
+        def flaky(*args, **kwargs):
+            if failures["left"]:
+                failures["left"] -= 1
+                raise ConnectionError("network down")
+            return original(*args, **kwargs)
+
+        client.iter_download = flaky
+        message = types.SimpleNamespace(chat_id=-1, id=5)
+        url = await self.streamer.register(client, message, len(self.data))
+        with mock.patch.object(voicechat.asyncio, "sleep", side_effect=_no_sleep):
+            status, _, body = await self._get(url, "bytes=0-99")
+        self.assertEqual((status, body), (206, self.data[:100]))
 
     async def test_unregistered_token_is_gone(self):
         client = _TgClient(self.data)
@@ -775,8 +829,12 @@ class PlaybackTest(unittest.IsolatedAsyncioTestCase):
     def _player(self):
         return self.mod._players[CHAT]
 
-    async def _end(self, *kinds):
-        self._player().switched_at = 0
+    async def _end(self, *kinds, at_end=True):
+        player = self._player()
+        player.switched_at = 0
+        if at_end and player.current is not None and player.current.duration:
+            # A normal end: playback really reached the track's last second.
+            player.started_at -= float(player.current.duration)
         for kind in kinds:
             await self.mod._on_stream_end(None, _End(kind))
 
@@ -920,6 +978,267 @@ class PlaybackTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("(1)", self._last_answer())
         await self.mod.vcnow(_Message())
         self.assertIn("https://a", self._last_answer())
+
+
+class _Panel:
+    def __init__(self, text, markup):
+        self.text, self.markup = text, markup
+        self.edits = []
+        self.deleted = False
+
+    async def edit(self, text, reply_markup=None):
+        self.edits.append(text)
+        self.text = text
+        if reply_markup is not None:
+            self.markup = reply_markup
+
+    async def delete(self):
+        self.deleted = True
+
+
+class _Inline:
+    def __init__(self):
+        self.forms = []
+
+    async def form(self, text, message=None, reply_markup=None, **kwargs):
+        panel = _Panel(text, reply_markup)
+        self.forms.append(panel)
+        return panel
+
+
+class _Call:
+    def __init__(self, user_id):
+        self.from_user = types.SimpleNamespace(id=user_id)
+        self.answers = []
+        self.answer = mock.AsyncMock(side_effect=lambda text, **k: self.answers.append(text))
+        self.edit = mock.AsyncMock()
+        self.delete = mock.AsyncMock()
+
+
+class FeaturesTest(unittest.IsolatedAsyncioTestCase):
+    setUp = PlaybackTest.setUp
+    _player = PlaybackTest._player
+    _last_answer = PlaybackTest._last_answer
+    _end = PlaybackTest._end
+
+    def _button(self, panel, action):
+        for row in panel.markup:
+            for button in row:
+                if button.get("args", (None, None))[1] == action:
+                    return button
+        raise AssertionError(action)
+
+    # -- access
+    def test_access_modes(self):
+        self.mod._client.tg_id = 1
+        self.assertTrue(self.mod._user_allowed(1, "control"))
+        self.assertFalse(self.mod._user_allowed(7, "view"))
+        self.mod.config["access"] = "queue"
+        self.assertTrue(self.mod._user_allowed(7, "queue"))
+        self.assertFalse(self.mod._user_allowed(7, "control"))
+        self.mod.config["trusted_users"] = [7]
+        self.assertTrue(self.mod._user_allowed(7, "control"))
+        self.mod.config["trusted_users"] = []
+        self.mod.config["access"] = "all"
+        self.assertTrue(self.mod._user_allowed(7, "control"))
+
+    async def test_strangers_are_ignored_silently_in_owner_mode(self):
+        self.mod._client.tg_id = 1
+        vc_utils.answer.reset_mock()
+        await self.mod.vcplay(_Message("https://a", sender_id=7, out=False))
+        self.calls.play.assert_not_awaited()
+        vc_utils.answer.assert_not_awaited()
+
+    async def test_queue_mode_lets_members_add_but_not_skip(self):
+        self.mod._client.tg_id = 1
+        self.mod.config["access"] = "queue"
+        await self.mod.vcadd(_Message("https://a", sender_id=7, out=False))
+        self.assertEqual(self.calls.played[-1][1], "https://a")
+        await self.mod.vcskip(_Message(sender_id=7, out=False))
+        self.assertIn("не дозволено", self._last_answer())
+        self.assertEqual(self._player().current.source, "https://a")
+
+    # -- recovery
+    async def test_early_end_restarts_track_where_it_stopped(self):
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcadd(_Message("https://b"))
+        player = self._player()
+        player.started_at -= 40  # died at 0:40 of 1:40
+        await self._end("AUDIO", "VIDEO", at_end=False)
+        source, offset = self.calls.played[-1][1:]
+        self.assertEqual(source, "https://a")
+        self.assertAlmostEqual(offset, 38, delta=1)
+        self.assertEqual(player.current.recoveries, 1)
+
+    async def test_recovery_gives_up_after_limit(self):
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcadd(_Message("https://b"))
+        self._player().current.recoveries = voicechat.MAX_RECOVERIES
+        await self._end("AUDIO", "VIDEO", at_end=False)
+        self.assertEqual(self.calls.played[-1][1], "https://b")
+
+    # -- prefetch
+    async def test_next_track_is_prepared_while_current_plays(self):
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcadd(_Message("https://b"))
+        upcoming = self._player().queue[0]
+        self.assertIsNotNone(upcoming.prefetch_task)
+        await upcoming.prefetch_task
+        self.assertTrue(upcoming.resolved)
+
+    # -- audio tracks and loudness
+    def test_audio_track_and_loudnorm_go_to_the_sound_ffmpeg_only(self):
+        track = voicechat.Track("https://x/film.mkv")
+        track.video_url = track.audio_url = "https://x/film.mkv"
+        track.audio_streams = [
+            {"lang": "jpn", "title": "", "codec": "aac", "channels": 2},
+            {"lang": "ukr", "title": "Дубляж", "codec": "aac", "channels": 6},
+        ]
+        track.audio_index = 1
+        params = shlex.split(self.mod._ffmpeg_parameters(track))
+        audio = params[params.index("--audio"):]
+        self.assertIn("0:a:1", audio)
+        self.assertIn(voicechat.LOUDNORM, audio)
+        self.assertNotIn("0:a:1", params[: params.index("--audio")])
+        self.mod.config["normalize_audio"] = False
+        params = shlex.split(self.mod._ffmpeg_parameters(track))
+        self.assertNotIn(voicechat.LOUDNORM, params)
+
+    def test_preferred_language_is_picked(self):
+        streams = [
+            {"lang": "eng", "title": "", "codec": "", "channels": 2},
+            {"lang": "", "title": "Українська озвучка (ukr)", "codec": "", "channels": 2},
+            {"lang": "ukr", "title": "", "codec": "", "channels": 2},
+        ]
+        self.assertEqual(self.mod._preferred_audio(streams), 2)
+        self.mod.config["audio_languages"] = ["en"]
+        self.assertEqual(self.mod._preferred_audio(streams), 0)
+        self.mod.config["audio_languages"] = []
+        self.assertIsNone(self.mod._preferred_audio(streams))
+
+    async def test_audio_track_command_switches_and_keeps_position(self):
+        await self.mod.vcplay(_Message("https://a"))
+        player = self._player()
+        player.current.audio_streams = [
+            {"lang": "jpn", "title": "", "codec": "aac", "channels": 2},
+            {"lang": "ukr", "title": "", "codec": "aac", "channels": 2},
+        ]
+        player.started_at -= 30
+        await self.mod.vcaudiotrack(_Message(""))
+        self.assertIn("UKR", self._last_answer())
+        await self.mod.vcaudiotrack(_Message("2"))
+        self.assertEqual(player.current.audio_index, 1)
+        self.assertAlmostEqual(self.calls.played[-1][2], 30, delta=1)
+        await self.mod.vcaudiotrack(_Message("9"))
+        self.assertIn("Немає доріжки", self._last_answer())
+
+    # -- queue management
+    async def test_remove_and_move(self):
+        await self.mod.vcplay(_Message("https://a"))
+        for link in ("https://b", "https://c", "https://d"):
+            await self.mod.vcadd(_Message(link))
+        await self.mod.vcmove(_Message("3 1"))
+        self.assertEqual(
+            [t.source for t in self._player().queue],
+            ["https://d", "https://b", "https://c"],
+        )
+        await self.mod.vcremove(_Message("2"))
+        self.assertEqual(
+            [t.source for t in self._player().queue], ["https://d", "https://c"]
+        )
+        await self.mod.vcremove(_Message("5"))
+        self.assertIn("номер", self._last_answer())
+
+    # -- persistence
+    async def test_queue_survives_a_restart(self):
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcadd(_Message("https://b"))
+        player = self._player()
+        player.started_at -= 50
+        await self.mod.vcvol(_Message("140"))
+        self.mod._save_state()
+        saved = self.mod.get("state")[str(CHAT)]
+        self.assertEqual(saved["current"]["source"], "https://a")
+        self.assertEqual([q["source"] for q in saved["queue"]], ["https://b"])
+        self.assertEqual(saved["volume"], 140)
+
+        fresh = voicechat.VoiceChatMod()
+        fresh._storage = {"state": self.mod.get("state")}
+        fresh._client = mock.Mock(send_message=mock.AsyncMock())
+        fresh._calls = self.calls
+        fresh._prepare_chat = mock.AsyncMock(return_value=None)
+        fresh._resolve = self.mod._resolve
+        fresh._stream = self.mod._stream
+        with mock.patch.object(voicechat, "RESTORE_DELAY", 0):
+            await fresh._restore_all()
+        restored = fresh._players[CHAT]
+        self.assertEqual(restored.current.source, "https://a")
+        self.assertAlmostEqual(self.calls.played[-1][2], 47, delta=2)
+        self.assertEqual([t.source for t in restored.queue], ["https://b"])
+        self.assertEqual(restored.volume, 140)
+
+    async def test_stopping_clears_saved_state(self):
+        await self.mod.vcplay(_Message("https://a"))
+        self.assertIn(str(CHAT), self.mod.get("state"))
+        await self.mod.vcstop(_Message())
+        self.assertEqual(self.mod.get("state"), {})
+
+    # -- panel
+    async def test_panel_buttons_control_playback(self):
+        self.mod.inline = _Inline()
+        self.mod._client.tg_id = 1
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcadd(_Message("https://b"))
+        panel = self._player().panel
+        self.assertIsNotNone(panel)
+        self.assertIn("https://b", panel.text)  # "next up" line after refresh
+
+        stranger = _Call(7)
+        button = self._button(panel, "toggle")
+        await button["callback"](stranger, *button["args"])
+        self.assertFalse(self._player().paused)
+        self.assertIn("не дозволено", stranger.answers[-1])
+
+        owner = _Call(1)
+        await button["callback"](owner, *button["args"])
+        self.assertTrue(self._player().paused)
+        self.calls.pause.assert_awaited()
+
+        volup = self._button(panel, "volup")
+        await volup["callback"](owner, *volup["args"])
+        self.calls.change_volume_call.assert_awaited_with(CHAT, 110)
+
+        skip = self._button(self._player().panel, "skip")
+        await skip["callback"](owner, *skip["args"])
+        self.assertEqual(self._player().current.source, "https://b")
+
+        stop = self._button(self._player().panel, "stop")
+        await stop["callback"](owner, *stop["args"])
+        self.assertNotIn(CHAT, self.mod._players)
+        self.assertIn("зупинено", panel.text)
+
+    async def test_vcnow_reposts_panel_and_removes_old(self):
+        self.mod.inline = _Inline()
+        await self.mod.vcplay(_Message("https://a"))
+        first = self._player().panel
+        await self.mod.vcnow(_Message())
+        self.assertIsNot(self._player().panel, first)
+        self.assertTrue(first.deleted)
+
+    # -- search
+    async def test_search_offers_results_and_queues_the_pick(self):
+        self.mod.inline = _Inline()
+        self.mod._client.tg_id = 1
+        self.mod._search_sync = lambda query, count: [
+            {"url": "https://youtu.be/1", "title": "One", "duration": 61, "channel": None},
+            {"url": "https://youtu.be/2", "title": "Two", "duration": None, "channel": None},
+        ]
+        await self.mod.vcsearch(_Message("songs"))
+        form = self.mod.inline.forms[-1]
+        self.assertIn("1:01", form.markup[0][0]["text"])
+        pick = form.markup[1][0]
+        await pick["callback"](_Call(1), *pick["args"])
+        self.assertEqual(self.calls.played[-1][1], "https://youtu.be/2")
 
 
 if __name__ == "__main__":

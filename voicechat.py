@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 1.7.0
+# meta version: 2.0.0
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -71,6 +71,17 @@ END_GRACE = 4.0
 WATCHDOG_SLACK = 6.0
 STALE_END = 1.5
 MAX_FAILED_IN_ROW = 3
+# A stream that ends this long before its known duration is treated as a
+# dropped connection: the track restarts where it stopped (a few times).
+EARLY_END = 15.0
+MAX_RECOVERIES = 3
+LOUDNORM = "loudnorm=I=-16:TP=-1.5:LRA=11"
+PANEL_REFRESH = 15.0
+SEEK_STEP = 10
+VOLUME_STEP = 10
+RESTORE_DELAY = 15.0
+RESTORE_MAX_AGE = 12 * 60 * 60
+SEARCH_RESULTS = 5
 
 # YouTube asks datacenter IPs to "confirm you're not a bot".  The same answer
 # VideoDownloader (vdlt.py) uses works here: a cookies.txt with a YouTube
@@ -653,6 +664,7 @@ class BrowserSession:
 TG_CHUNK = 512 * 1024  # Telegram wants offsets aligned to the request size.
 TG_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 TG_RETRIES = 4
+TG_GIVE_UP = 8  # failed rounds in a row (with backoff ≈ 2 min) before giving up
 # Free disk space kept aside when caching a file for streaming.
 TG_DISK_RESERVE = 300 * 1024 * 1024
 
@@ -679,6 +691,7 @@ class TgCache:
         self.path = path
         self.workers = max(1, int(workers))
         self.error = None
+        self.window = None  # max chunks ahead of focus to fetch; None = all
         self.started = time.monotonic()
         self.fetched_bytes = 0
         self._cond = asyncio.Condition()
@@ -710,6 +723,12 @@ class TgCache:
             ]
 
     def _next(self):
+        if self.window is not None:
+            stop = min(self.chunks, self.focus + self.window)
+            for index in range(self.focus, stop):
+                if not self.have[index] and index not in self.inflight:
+                    return index
+            return None
         for index in range(self.focus, self.chunks):
             if not self.have[index] and index not in self.inflight:
                 return index
@@ -718,7 +737,14 @@ class TgCache:
                 return index
         return None
 
+    async def set_window(self, window):
+        """Limit (prefetch) or lift (playing) how far ahead workers go."""
+        async with self._cond:
+            self.window = window
+            self._cond.notify_all()
+
     async def _worker(self):
+        failures = 0
         while True:
             async with self._cond:
                 index = self._next()
@@ -734,12 +760,23 @@ class TgCache:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                logger.warning("VoiceChat could not fetch chunk %s: %s", index, error)
+                # Network trouble: give the chunk back and keep trying with a
+                # growing pause; readers fail only after a long outage.
+                failures += 1
+                logger.warning(
+                    "VoiceChat could not fetch chunk %s (%s): %s",
+                    index, failures, error,
+                )
                 async with self._cond:
                     self.inflight.discard(index)
-                    self.error = error
+                    if failures >= TG_GIVE_UP:
+                        self.error = error
                     self._cond.notify_all()
-                return
+                if failures >= TG_GIVE_UP:
+                    return
+                await asyncio.sleep(min(30, 2 ** failures))
+                continue
+            failures = 0
             async with self._cond:
                 self.inflight.discard(index)
                 if not self.have[index]:
@@ -1053,8 +1090,13 @@ class Track:
         self.is_live = False
         self.has_audio = True
         self.stream_url = None
+        self.tg_ref = None  # (chat_id, message_id) of a streamed Telegram file
         self.codecs = None
         self.protocol = None
+        self.audio_streams = []  # [{"lang", "title", "codec", "channels"}]
+        self.audio_index = None  # chosen audio track, None = ffmpeg's pick
+        self.prefetch_task = None
+        self.recoveries = 0
         self.resolved_at = 0.0
 
     @property
@@ -1090,6 +1132,9 @@ class Player:
         self.paused_at = None
         self.switched_at = 0.0
         self.failed_in_row = 0
+        self.panel = None
+        self.ticker = None
+        self.last_panel_text = None
 
     @property
     def paused(self):
@@ -1254,6 +1299,59 @@ class VoiceChatMod(loader.Module):
         "queued_many": "➕ <b>Додано в чергу:</b> {count} шт. з плейлиста",
         "play_failed": "❌ <b>Не вдалося відтворити</b> {title}: <code>{error}</code>",
         "not_playing": "❌ <b>Зараз нічого не грає.</b>",
+        "cfg_audio_languages": (
+            "Бажані мови звукової доріжки по черзі (коди ISO або частина "
+            "назви доріжки), напр. uk, ukr, ru, en"
+        ),
+        "cfg_normalize": "Вирівнювати гучність (loudnorm), щоб треки звучали однаково",
+        "cfg_panel": "Панель керування з кнопками замість текстових повідомлень",
+        "cfg_prefetch": "Заздалегідь готувати наступний трек у черзі",
+        "cfg_access": (
+            "Хто керує: owner — лише власник і довірені; queue — усі в групі "
+            "можуть додавати в чергу й дивитися; all — усі можуть усе"
+        ),
+        "cfg_trusted": "ID користувачів, яким дозволено керувати всім",
+        "cfg_resume": "Після перезапуску Hikka відновлювати чергу й позицію",
+        "no_access": "🔒 <b>Вам це не дозволено.</b>",
+        "atrack_none": "🎚 <b>У цьому треку одна звукова доріжка.</b>",
+        "atrack_list": "🎚 <b>Звукові доріжки</b> (зараз: {current}):\n{tracks}\n\nОбрати: <code>{p}vcaudiotrack N</code>",
+        "atrack_set": "🎚 <b>Доріжка:</b> {}",
+        "atrack_bad": "❌ <b>Немає доріжки з таким номером.</b>",
+        "atrack_auto": "авто",
+        "removed": "🗑 <b>Прибрано з черги:</b> {}",
+        "moved": "↕️ <b>Переміщено на {pos}:</b> {title}",
+        "pos_bad": "❌ <b>Вкажіть номер із черги</b> (див. <code>{}vcqueue</code>).",
+        "search_usage": "❌ <b>Вкажіть запит:</b> <code>{}vcsearch назва</code>",
+        "searching": "🔎 <b>Шукаю…</b>",
+        "search_none": "❌ <b>Нічого не знайдено.</b>",
+        "search_head": "🔎 <b>Результати:</b> {}",
+        "search_text": "{head}\n{lines}\n\nГрати: <code>{p}vcadd посилання</code>",
+        "search_picked": "⏳ <b>Додаю:</b> {}",
+        "restoring": "♻️ <b>Відновлюю відтворення після перезапуску…</b>",
+        "panel_next": "\nДалі: {}",
+        "btn_back": "⏪ 10",
+        "btn_play": "▶️",
+        "btn_pause": "⏸",
+        "btn_fwd": "10 ⏩",
+        "btn_skip": "⏭",
+        "btn_loop": "🔁",
+        "btn_stop": "⏹",
+        "btn_voldown": "🔉",
+        "btn_volup": "🔊",
+        "btn_atrack": "🎚",
+        "btn_queue": "📜",
+        "btn_cancel": "✖️",
+        "toast_paused": "⏸ Пауза",
+        "toast_resumed": "▶️ Грає",
+        "toast_skipped": "⏭ Далі",
+        "toast_stopped": "⏹ Зупинено",
+        "toast_volume": "🔊 Гучність {}%",
+        "toast_loop_on": "🔁 Повтор увімкнено",
+        "toast_loop_off": "➡️ Повтор вимкнено",
+        "toast_seek": "⏩ {}",
+        "toast_atrack": "🎚 {}",
+        "toast_no_access": "🔒 Вам це не дозволено",
+        "toast_ended": "Відтворення вже завершено",
         "paused": "⏸ <b>Пауза.</b> Продовжити: <code>{}vcresume</code>",
         "already_paused": "⏸ <b>Вже на паузі.</b>",
         "resumed": "▶️ <b>Відтворення продовжено.</b>",
@@ -1396,6 +1494,48 @@ class VoiceChatMod(loader.Module):
                 lambda: self.strings("cfg_cookies"),
                 validator=loader.validators.String(),
             ),
+            loader.ConfigValue(
+                "audio_languages",
+                ["uk", "ukr"],
+                lambda: self.strings("cfg_audio_languages"),
+                validator=loader.validators.Series(loader.validators.String()),
+            ),
+            loader.ConfigValue(
+                "normalize_audio",
+                True,
+                lambda: self.strings("cfg_normalize"),
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "panel",
+                True,
+                lambda: self.strings("cfg_panel"),
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "prefetch_next",
+                True,
+                lambda: self.strings("cfg_prefetch"),
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "access",
+                "owner",
+                lambda: self.strings("cfg_access"),
+                validator=loader.validators.Choice(["owner", "queue", "all"]),
+            ),
+            loader.ConfigValue(
+                "trusted_users",
+                [],
+                lambda: self.strings("cfg_trusted"),
+                validator=loader.validators.Series(loader.validators.Integer()),
+            ),
+            loader.ConfigValue(
+                "resume_after_restart",
+                True,
+                lambda: self.strings("cfg_resume"),
+                validator=loader.validators.Boolean(),
+            ),
         )
         self._client = None
         self._calls = None
@@ -1405,11 +1545,13 @@ class VoiceChatMod(loader.Module):
         self._browser = BrowserSession()
         self._streamer = TelegramStreamer()
         self._browser_task = None
+        self._restore_task = None
 
     async def client_ready(self, client, db):
         self._client = client
         shutil.rmtree(WORK_DIR, ignore_errors=True)
         self._browser_task = asyncio.ensure_future(self._browser_loop())
+        self._restore_task = asyncio.ensure_future(self._restore_all())
 
     def _browser_enabled(self):
         return bool(self.config["browser_session"]) and self._browser.available()
@@ -1431,6 +1573,10 @@ class VoiceChatMod(loader.Module):
                 self._browser.record_error(error)
 
     async def on_unload(self):
+        if self._restore_task is not None:
+            self._restore_task.cancel()
+        for player in list(self._players.values()):
+            self._stop_ticker(player)
         await self._streamer.close()
         if self._browser_task is not None:
             self._browser_task.cancel()
@@ -1596,29 +1742,30 @@ class VoiceChatMod(loader.Module):
     async def _prepare(self, message):
         """Shared checks of the play commands; returns ``None`` on failure."""
         chat_id = _chat_id(message)
-        if not str(chat_id).startswith("-"):
-            await utils.answer(message, self.strings("only_groups"))
-            return None
-        error = self._check_dependencies()
+        error = await self._prepare_chat(chat_id)
         if error:
             await utils.answer(message, error)
             return None
+        return chat_id
+
+    async def _prepare_chat(self, chat_id):
+        """Get the call machinery ready for ``chat_id``; error text or None."""
+        if not str(chat_id).startswith("-"):
+            return self.strings("only_groups")
+        error = self._check_dependencies()
+        if error:
+            return error
         try:
             await self._ensure_calls()
             await self._prime_chat(chat_id)
         except PermissionError:
-            await utils.answer(message, self.strings("unauthorized"))
-            return None
+            return self.strings("unauthorized")
         except Exception as error:
             logger.exception("VoiceChat could not connect")
-            await utils.answer(
-                message,
-                self.strings("connect_failed").format(
-                    utils.escape_html(str(error) or type(error).__name__)
-                ),
+            return self.strings("connect_failed").format(
+                utils.escape_html(str(error) or type(error).__name__)
             )
-            return None
-        return chat_id
+        return None
 
     def _player(self, chat_id, create=True):
         player = self._players.get(chat_id)
@@ -1947,8 +2094,9 @@ class VoiceChatMod(loader.Module):
             args += http_args(headers) + hls_args(url)
         args += [
             "-show_entries",
-            "stream=codec_type,codec_name,width,height,avg_frame_rate"
+            "stream=codec_type,codec_name,width,height,avg_frame_rate,channels"
             ":stream_disposition=attached_pic"
+            ":stream_tags=language,title"
             ":format=duration,format_name",
             "-of",
             "json",
@@ -2002,6 +2150,18 @@ class VoiceChatMod(loader.Module):
         else:
             track.video_url = None
         track.has_audio = bool(audios)
+        if track.audio_url == target and len(audios) > 1:
+            track.audio_streams = [
+                {
+                    "lang": ((a.get("tags") or {}).get("language") or "").lower(),
+                    "title": (a.get("tags") or {}).get("title") or "",
+                    "codec": codec_name(a.get("codec_name")) or "",
+                    "channels": a.get("channels") or 0,
+                }
+                for a in audios
+            ]
+            if track.audio_index is None:
+                track.audio_index = self._preferred_audio(track.audio_streams)
         names = [
             codec_name(video.get("codec_name")) if track.video_url else None,
             codec_name(audios[0].get("codec_name")) if audios else None,
@@ -2021,7 +2181,39 @@ class VoiceChatMod(loader.Module):
         elif not track.path and not track.duration:
             track.is_live = True
 
+    def _preferred_audio(self, streams):
+        """Index of the first audio track in a preferred language, or None."""
+        wanted = [
+            str(lang).strip().lower()
+            for lang in (self.config["audio_languages"] or [])
+            if str(lang).strip()
+        ]
+        for lang in wanted:
+            # A language tag beats a mention in another track's title.
+            for index, stream in enumerate(streams):
+                if stream["lang"] and stream["lang"].startswith(lang):
+                    return index
+            for index, stream in enumerate(streams):
+                if lang in stream["title"].lower():
+                    return index
+        return None
+
+    def _audio_track_label(self, stream, index):
+        parts = [stream["lang"].upper() or "—"]
+        if stream["title"]:
+            parts.append(stream["title"])
+        if stream["codec"]:
+            parts.append(stream["codec"])
+        if stream["channels"]:
+            parts.append(f"{stream['channels']}ch")
+        return f"{index + 1}. " + " · ".join(parts)
+
     async def _resolve(self, track):
+        task = track.prefetch_task
+        if task is not None and task is not asyncio.current_task():
+            # The background prefetch is already on it; share its work.
+            with contextlib.suppress(Exception):
+                await task
         if track.resolved:
             return
         local = track.path or track.stream_url
@@ -2177,6 +2369,7 @@ class VoiceChatMod(loader.Module):
                 requester=requester,
             )
             track.stream_url = url
+            track.tg_ref = (reply.chat_id, reply.id)
             track.webpage = None
             return [track]
 
@@ -2242,6 +2435,15 @@ class VoiceChatMod(loader.Module):
         if track.has_video:
             # Output option (after -i): sharper scaling than the default.
             args += ["-atmid", "-sws_flags", "lanczos+accurate_rnd"]
+        audio = []
+        if track.audio_index is not None and len(track.audio_streams) > 1:
+            audio += ["-map", f"0:a:{int(track.audio_index)}"]
+        if track.has_audio and self.config["normalize_audio"]:
+            audio += ["-af", LOUDNORM]
+        if audio:
+            # py-tgcalls: "--audio" starts options for the sound ffmpeg only,
+            # "-atmid" puts them after its input.
+            args += ["--audio", "-atmid", *audio]
         return shlex.join(args) if args else None
 
     def _fps(self, track):
@@ -2366,6 +2568,9 @@ class VoiceChatMod(loader.Module):
     async def _start(self, player, track, offset=0, status=None):
         """Resolve ``track`` and put it on air.  Caller holds ``player.lock``."""
         await self._resolve(track)
+        cache = self._streamer.cache(track.stream_url) if track.stream_url else None
+        if cache is not None:
+            await cache.set_window(None)  # playing now: fetch the whole file
         await self._prebuffer(track, offset, status)
         stream = await self._stream(track, offset)
         from pytgcalls.types import GroupCallConfig
@@ -2394,8 +2599,15 @@ class VoiceChatMod(loader.Module):
         if player.volume != 100:
             with contextlib.suppress(Exception):
                 await self._calls.change_volume_call(player.chat_id, player.volume)
+        self._start_ticker(player)
+        self._schedule_prefetch(player)
+        self._save_state()
 
     async def _announce(self, chat_id, track):
+        player = self._players.get(chat_id)
+        if player is not None and self._panel_enabled():
+            if await self._show_panel(player):
+                return
         if not self.config["announce"]:
             return
         with contextlib.suppress(Exception):
@@ -2455,12 +2667,15 @@ class VoiceChatMod(loader.Module):
 
     async def _leave(self, player):
         self._cancel_end_task(player)
+        self._stop_ticker(player)
         player.generation += 1
         if self._calls is not None:
             with contextlib.suppress(Exception):
                 await self._calls.leave_call(player.chat_id)
         self._drop_files(player, everything=True)
         self._players.pop(player.chat_id, None)
+        await self._close_panel(player)
+        self._save_state()
 
     def _error_text(self, track, error):
         if isinstance(error, YouTubeAuthError):
@@ -2537,14 +2752,45 @@ class VoiceChatMod(loader.Module):
             if player.generation != generation or player.current is None:
                 return
             self._cancel_end_task(player)
+            if await self._recover(player):
+                return
             await self._advance(player)
+
+    async def _recover(self, player):
+        """Restart a track whose stream died long before its end."""
+        track = player.current
+        position = player.position
+        if (
+            player.loop
+            or track.is_live
+            or not track.duration
+            or position >= float(track.duration) - EARLY_END
+            or track.recoveries >= MAX_RECOVERIES
+        ):
+            return False
+        track.recoveries += 1
+        logger.info(
+            "VoiceChat: stream ended at %s of %s, restarting",
+            fmt_time(position), fmt_time(track.duration),
+        )
+        if not (track.path or track.stream_url):
+            track.resolved_at = 0.0  # stream URLs may have expired
+        try:
+            await self._start(player, track, offset=max(0, position - 2))
+        except Exception as error:
+            logger.warning("VoiceChat recovery failed: %s", error)
+            return False
+        return True
 
     async def _on_left_call(self, _, update):
         player = self._players.pop(update.chat_id, None)
         if player is not None:
             self._cancel_end_task(player)
+            self._stop_ticker(player)
             player.generation += 1
             self._drop_files(player, everything=True)
+            await self._close_panel(player)
+            self._save_state()
 
     # ----------------------------------------------------------------- files
 
@@ -2572,9 +2818,395 @@ class VoiceChatMod(loader.Module):
         for track in tracks:
             self._release(track)
 
+    # ---------------------------------------------------------------- access
+
+    def _owner_id(self):
+        return getattr(self._client, "tg_id", None)
+
+    def _user_allowed(self, user_id, kind):
+        """``kind``: view (look), queue (add tracks) or control (everything)."""
+        if user_id is None or user_id == self._owner_id():
+            return True
+        trusted = {int(u) for u in (self.config["trusted_users"] or [])}
+        if user_id in trusted:
+            return True
+        access = self.config["access"]
+        if access == "all":
+            return True
+        if access == "queue":
+            return kind in ("view", "queue")
+        return False
+
+    async def _allowed(self, message, kind):
+        if getattr(message, "out", False):
+            return True
+        if self._user_allowed(getattr(message, "sender_id", None), kind):
+            return True
+        if self.config["access"] != "owner":
+            # In owner-only mode the module stays invisible to others.
+            with contextlib.suppress(Exception):
+                await utils.answer(message, self.strings("no_access"))
+        return False
+
+    # -------------------------------------------------------------- prefetch
+
+    def _schedule_prefetch(self, player):
+        """Resolve and pre-buffer the next track while this one plays."""
+        if not self.config["prefetch_next"] or not player.queue:
+            return
+        track = player.queue[0]
+        if track.prefetch_task is not None or track.resolved:
+            return
+        track.prefetch_task = asyncio.ensure_future(self._prefetch_track(track))
+
+    async def _prefetch_track(self, track):
+        try:
+            await self._resolve(track)
+            cache = (
+                self._streamer.cache(track.stream_url) if track.stream_url else None
+            )
+            if cache is not None:
+                # Only the opening seconds: the playing track keeps the bandwidth.
+                seconds = max(1, int(self.config["tg_prebuffer"]))
+                rate = cache.size / float(track.duration) if track.duration else TG_CHUNK
+                await cache.set_window(max(2, int(rate * seconds) // TG_CHUNK + 2))
+                await self._prebuffer(track)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.info("VoiceChat prefetch of %s failed: %s", track.source, error)
+
+    # ------------------------------------------------------- panel & ticker
+
+    def _panel_enabled(self):
+        return bool(self.config["panel"]) and getattr(self, "inline", None) is not None
+
+    def _panel_text(self, player):
+        track = player.current
+        position = player.position
+        if track.duration and not track.is_live:
+            filled = int(min(1.0, position / float(track.duration)) * 12)
+            bar = "▰" * filled + "▱" * (12 - filled)
+        else:
+            bar = "🔴"
+        text = self.strings("now").format(
+            icon="🎬" if track.has_video else "🎵",
+            title=self._title_html(track),
+            bar=bar,
+            pos=fmt_time(position),
+            duration=self._duration_label(track),
+            state=self.strings("state_paused" if player.paused else "state_playing"),
+            volume=player.volume,
+            loop=self.strings("on" if player.loop else "off"),
+            quality=self._quality_label(track),
+            queued=len(player.queue),
+        )
+        text += self._download_line(track)
+        if len(track.audio_streams) > 1:
+            current = (
+                self._audio_track_label(
+                    track.audio_streams[track.audio_index], track.audio_index
+                )
+                if track.audio_index is not None
+                else self.strings("atrack_auto")
+            )
+            text += "\n" + self.strings("atrack_set").format(utils.escape_html(current))
+        if player.queue:
+            text += self.strings("panel_next").format(self._title_html(player.queue[0]))
+        return text
+
+    def _panel_markup(self, player):
+        chat_id = player.chat_id
+
+        def button(key, action):
+            return {
+                "text": self.strings(key),
+                "callback": self._panel_action,
+                "args": (chat_id, action),
+            }
+
+        rows = [
+            [
+                button("btn_back", "back"),
+                button("btn_play" if player.paused else "btn_pause", "toggle"),
+                button("btn_fwd", "fwd"),
+            ],
+            [
+                button("btn_voldown", "voldown"),
+                button("btn_skip", "skip"),
+                button("btn_volup", "volup"),
+            ],
+            [button("btn_loop", "loop"), button("btn_queue", "queue")],
+        ]
+        if player.current is not None and len(player.current.audio_streams) > 1:
+            rows[2].insert(1, button("btn_atrack", "atrack"))
+        rows[2].append(button("btn_stop", "stop"))
+        return rows
+
+    async def _show_panel(self, player, status=None):
+        """Post a fresh control panel (replacing ``status`` if given)."""
+        if player.current is None:
+            return False
+        old = player.panel
+        text = self._panel_text(player)
+        try:
+            panel = await self.inline.form(
+                text,
+                message=status if status is not None else player.chat_id,
+                reply_markup=self._panel_markup(player),
+                disable_security=True,
+                silent=True,
+            )
+        except Exception as error:
+            logger.info("VoiceChat panel unavailable: %s", error)
+            return False
+        if not panel:
+            return False
+        player.panel = panel
+        player.last_panel_text = text
+        if old is not None and old is not panel:
+            with contextlib.suppress(Exception):
+                await old.delete()
+        return True
+
+    async def _refresh_panel(self, player):
+        if player.panel is None or player.current is None:
+            return
+        text = self._panel_text(player)
+        if text == player.last_panel_text:
+            return
+        try:
+            await player.panel.edit(text, reply_markup=self._panel_markup(player))
+            player.last_panel_text = text
+        except Exception as error:
+            logger.debug("VoiceChat panel refresh failed: %s", error)
+
+    async def _close_panel(self, player):
+        panel, player.panel = player.panel, None
+        if panel is not None:
+            with contextlib.suppress(Exception):
+                await panel.edit(self.strings("stopped"), reply_markup=[])
+
+    def _start_ticker(self, player):
+        if player.ticker is None or player.ticker.done():
+            player.ticker = asyncio.ensure_future(self._ticker(player))
+
+    def _stop_ticker(self, player):
+        task, player.ticker = player.ticker, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _ticker(self, player):
+        """Keep the panel's progress bar and the saved position current."""
+        while player.current is not None and self._players.get(player.chat_id) is player:
+            await asyncio.sleep(PANEL_REFRESH)
+            await self._refresh_panel(player)
+            self._save_state()
+
+    async def _panel_action(self, call, chat_id, action):
+        user = getattr(getattr(call, "from_user", None), "id", None)
+        kind = "view" if action == "queue" else "control"
+
+        async def toast(text, alert=False):
+            with contextlib.suppress(Exception):
+                await call.answer(text, show_alert=alert)
+
+        if not self._user_allowed(user, kind):
+            return await toast(self.strings("toast_no_access"), True)
+        player = self._players.get(chat_id)
+        if player is None or player.current is None or self._calls is None:
+            return await toast(self.strings("toast_ended"))
+        if action == "queue":
+            return await toast(self._queue_plain(player)[:190], True)
+        try:
+            text = await self._act(player, action)
+        except Exception as error:
+            logger.warning("VoiceChat panel action %s failed: %s", action, error)
+            text = f"❌ {str(error)[:150] or type(error).__name__}"
+        await toast(text or "")
+        if self._players.get(chat_id) is player:
+            await self._refresh_panel(player)
+
+    async def _act(self, player, action, value=None):
+        """Shared by commands and panel buttons; returns a short toast."""
+        track = player.current
+        if action in ("toggle", "pause", "resume"):
+            pause = action == "pause" or (action == "toggle" and not player.paused)
+            if pause and not player.paused:
+                await self._calls.pause(player.chat_id)
+                player.mark_paused()
+                return self.strings("toast_paused")
+            if not pause and player.paused:
+                await self._calls.resume(player.chat_id)
+                player.mark_resumed()
+                return self.strings("toast_resumed")
+            return None
+        if action in ("back", "fwd", "seek"):
+            if track.is_live:
+                return self.strings("seek_live")
+            if action == "seek":
+                target = value
+            else:
+                step = -SEEK_STEP if action == "back" else SEEK_STEP
+                target = parse_seek(f"{step:+d}", player.position, track.duration)
+            async with player.lock:
+                await self._start(player, track, offset=target)
+            return self.strings("toast_seek").format(fmt_time(target))
+        if action in ("voldown", "volup", "volume"):
+            if action == "volume":
+                volume = value
+            else:
+                step = -VOLUME_STEP if action == "voldown" else VOLUME_STEP
+                volume = max(1, min(200, player.volume + step))
+            await self._calls.change_volume_call(player.chat_id, int(volume))
+            player.volume = int(volume)
+            self._save_state()
+            return self.strings("toast_volume").format(player.volume)
+        if action == "loop":
+            player.loop = not player.loop
+            self._save_state()
+            return self.strings("toast_loop_on" if player.loop else "toast_loop_off")
+        if action == "skip":
+            async with player.lock:
+                player.loop = False
+                await self._advance(player, announce=False, force_leave=True)
+            return self.strings("toast_skipped")
+        if action == "stop":
+            async with player.lock:
+                await self._leave(player)
+            return self.strings("toast_stopped")
+        if action in ("atrack", "atrack_set"):
+            streams = track.audio_streams
+            if len(streams) < 2:
+                return self.strings("atrack_none")
+            if action == "atrack":
+                current = -1 if track.audio_index is None else track.audio_index
+                value = (current + 1) % len(streams)
+            track.audio_index = value
+            async with player.lock:
+                await self._start(player, track, offset=player.position)
+            return self.strings("toast_atrack").format(
+                self._audio_track_label(streams[value], value)
+            )
+        return None
+
+    def _queue_plain(self, player):
+        lines = []
+        for index, track in enumerate(list(player.queue)[:10], 1):
+            lines.append(f"{index}. {str(track.title)[:40]}")
+        return "\n".join(lines) or self.strings("queue_empty").replace(
+            "<b>", ""
+        ).replace("</b>", "")
+
+    # ----------------------------------------------------------- persistence
+
+    def _track_dict(self, track):
+        if track is None:
+            return None
+        if track.stream_url and track.tg_ref:
+            source = None
+        elif track.path:
+            return None  # downloaded files are gone after a restart
+        else:
+            source = track.source
+        return {
+            "source": source,
+            "tg": list(track.tg_ref) if track.tg_ref else None,
+            "title": str(track.title),
+            "audio_only": track.audio_only,
+            "duration": track.duration,
+            "audio_index": track.audio_index,
+        }
+
+    def _save_state(self):
+        data = {}
+        for chat_id, player in self._players.items():
+            if player.current is None and not player.queue:
+                continue
+            data[str(chat_id)] = {
+                "current": self._track_dict(player.current),
+                "position": round(player.position, 1),
+                "queue": [d for d in map(self._track_dict, player.queue) if d],
+                "loop": player.loop,
+                "volume": player.volume,
+                "saved": time.time(),
+            }
+        with contextlib.suppress(Exception):
+            self.set("state", data)
+
+    async def _track_from_dict(self, data):
+        if data.get("tg"):
+            chat_id, message_id = data["tg"]
+            message = await self._client.get_messages(chat_id, ids=message_id)
+            if message is None or not getattr(message, "file", None):
+                return None
+            file = message.file
+            url = await self._streamer.register(
+                self._client, message, file.size, file.mime_type, file.ext or ""
+            )
+            track = Track(url, title=data.get("title"))
+            track.stream_url = url
+            track.tg_ref = (chat_id, message_id)
+            track.webpage = None
+        elif data.get("source"):
+            track = Track(data["source"], title=data.get("title"))
+        else:
+            return None
+        track.audio_only = bool(data.get("audio_only"))
+        track.duration = data.get("duration")
+        track.audio_index = data.get("audio_index")
+        return track
+
+    async def _restore_all(self):
+        """Pick up the queues that were playing before Hikka restarted."""
+        await asyncio.sleep(RESTORE_DELAY)
+        try:
+            saved = self.get("state", {}) or {}
+        except Exception:
+            return
+        if not self.config["resume_after_restart"] or not saved:
+            return
+        for chat_key, data in saved.items():
+            if time.time() - float(data.get("saved") or 0) > RESTORE_MAX_AGE:
+                continue
+            with contextlib.suppress(Exception):
+                await self._restore_chat(int(chat_key), data)
+        self._save_state()
+
+    async def _restore_chat(self, chat_id, data):
+        tracks = []
+        for item in [data.get("current")] + list(data.get("queue") or []):
+            if item:
+                with contextlib.suppress(Exception):
+                    track = await self._track_from_dict(item)
+                    if track is not None:
+                        tracks.append(track)
+        if not tracks:
+            return
+        if await self._prepare_chat(chat_id):
+            return
+        with contextlib.suppress(Exception):
+            await self._client.send_message(chat_id, self.strings("restoring"))
+        player = self._player(chat_id)
+        player.volume = int(data.get("volume") or 100)
+        first, rest = tracks[0], tracks[1:]
+        position = float(data.get("position") or 0) if data.get("current") else 0
+        async with player.lock:
+            player.queue.extend(rest)
+            player.loop = bool(data.get("loop"))
+            try:
+                await self._start(player, first, offset=max(0, position - 3))
+            except Exception as error:
+                logger.warning("VoiceChat could not resume %s: %s", chat_id, error)
+                await self._advance(player)
+                return
+        await self._announce(chat_id, first)
+
     # -------------------------------------------------------------- commands
 
     async def _play_command(self, message, now, audio_only=False):
+        if not await self._allowed(message, "control" if now else "queue"):
+            return
         args = (utils.get_args_raw(message) or "").strip()
         flags = {"-a", "--audio"}
         words = args.split()
@@ -2604,29 +3236,33 @@ class VoiceChatMod(loader.Module):
             return
         if not tracks:
             return await utils.answer(status, self.strings("no_source"))
+        await self._enqueue(chat_id, tracks, now, status)
 
+    async def _enqueue(self, chat_id, tracks, now, status=None):
+        """Queue ``tracks`` or start the first one; report in ``status``."""
         player = self._player(chat_id)
         async with player.lock:
             if not now and player.current is not None:
                 player.queue.extend(tracks)
+                self._schedule_prefetch(player)
+                self._save_state()
                 if len(tracks) == 1:
-                    return await utils.answer(
-                        status,
-                        self.strings("queued").format(
-                            pos=len(player.queue),
-                            title=self._title_html(tracks[0]),
-                        ),
+                    text = self.strings("queued").format(
+                        pos=len(player.queue), title=self._title_html(tracks[0])
                     )
-                return await utils.answer(
-                    status, self.strings("queued_many").format(count=len(tracks))
-                )
+                else:
+                    text = self.strings("queued_many").format(count=len(tracks))
+                await self._say(chat_id, status, text)
+                await self._refresh_panel(player)
+                return
 
             first, rest = tracks[0], tracks[1:]
             if now:
                 player.queue.extendleft(reversed(rest))
             else:
                 player.queue.extend(rest)
-            status = await utils.answer(status, self.strings("resolving"))
+            if status is not None:
+                status = await utils.answer(status, self.strings("resolving"))
             player.loop = False
             try:
                 await self._start(player, first, status=status)
@@ -2635,12 +3271,25 @@ class VoiceChatMod(loader.Module):
                 self._drop_track_file(first, player)
                 if player.current is None and not player.queue:
                     self._players.pop(chat_id, None)
-                return await utils.answer(status, self._error_text(first, error))
+                await self._say(chat_id, status, self._error_text(first, error))
+                return
+            if self._panel_enabled() and await self._show_panel(player, status):
+                return
             text = self._playing_text(first)
             if rest:
                 text += "\n" + self.strings("queued_many").format(count=len(rest))
-            await utils.answer(status, text, link_preview=False)
+            await self._say(chat_id, status, text)
 
+    async def _say(self, chat_id, status, text):
+        """Edit the status message, or post to the chat when there is none."""
+        with contextlib.suppress(Exception):
+            if status is not None:
+                return await utils.answer(status, text, link_preview=False)
+            return await self._client.send_message(
+                chat_id, text, link_preview=False
+            )
+
+    @loader.group_member
     @loader.command(
         ru_doc="<посилання | запит | відповідь на медіа> [-a] — грати зараз"
     )
@@ -2648,23 +3297,28 @@ class VoiceChatMod(loader.Module):
         """<посилання | запит | відповідь на медіа> [-a] — увімкнути зараз (замінює поточне). -a — лише звук"""
         await self._play_command(message, now=True)
 
+    @loader.group_member
     @loader.command(ru_doc="<посилання | запит | відповідь на медіа> [-a] — у чергу")
     async def vcadd(self, message):
         """<посилання | запит | відповідь на медіа> [-a] — додати в чергу (або грати, якщо тиша)"""
         await self._play_command(message, now=False)
 
+    @loader.group_member
     @loader.command(ru_doc="<посилання | запит> — грати лише звук")
     async def vcaudio(self, message):
         """<посилання | запит | відповідь на медіа> — увімкнути лише звук"""
         await self._play_command(message, now=True, audio_only=True)
 
-    async def _active(self, message):
+    async def _active(self, message, kind="control"):
+        if not await self._allowed(message, kind):
+            return None
         player = self._players.get(_chat_id(message))
         if player is None or player.current is None or self._calls is None:
             await utils.answer(message, self.strings("not_playing"))
             return None
         return player
 
+    @loader.group_member
     @loader.command(ru_doc="Пауза")
     async def vcpause(self, message):
         """Поставити відтворення на паузу"""
@@ -2673,10 +3327,11 @@ class VoiceChatMod(loader.Module):
             return
         if player.paused:
             return await utils.answer(message, self.strings("already_paused"))
-        await self._calls.pause(player.chat_id)
-        player.mark_paused()
+        await self._act(player, "pause")
         await utils.answer(message, self.strings("paused").format(self.get_prefix()))
+        await self._refresh_panel(player)
 
+    @loader.group_member
     @loader.command(ru_doc="Продовжити")
     async def vcresume(self, message):
         """Продовжити відтворення після паузи"""
@@ -2685,10 +3340,11 @@ class VoiceChatMod(loader.Module):
             return
         if not player.paused:
             return await utils.answer(message, self.strings("not_paused"))
-        await self._calls.resume(player.chat_id)
-        player.mark_resumed()
+        await self._act(player, "resume")
         await utils.answer(message, self.strings("resumed"))
+        await self._refresh_panel(player)
 
+    @loader.group_member
     @loader.command(ru_doc="Наступний трек")
     async def vcskip(self, message):
         """Перейти до наступного в черзі"""
@@ -2700,11 +3356,16 @@ class VoiceChatMod(loader.Module):
             track = await self._advance(player, announce=False, force_leave=True)
         if track is None:
             return await utils.answer(message, self.strings("queue_end"))
+        if self._panel_enabled() and await self._show_panel(player, message):
+            return
         await utils.answer(message, self._playing_text(track), link_preview=False)
 
+    @loader.group_member
     @loader.command(ru_doc="Зупинити й вийти з дзвінка")
     async def vcstop(self, message):
         """Зупинити відтворення, очистити чергу й вийти з дзвінка"""
+        if not await self._allowed(message, "control"):
+            return
         chat_id = _chat_id(message)
         player = self._players.get(chat_id)
         if player is None or self._calls is None:
@@ -2716,6 +3377,7 @@ class VoiceChatMod(loader.Module):
             await self._leave(player)
         await utils.answer(message, self.strings("stopped"))
 
+    @loader.group_member
     @loader.command(ru_doc="<1:30 | +15 | -10> — перемотати")
     async def vcseek(self, message):
         """<1:30 | +15 | -10> — перемотати поточний трек"""
@@ -2732,13 +3394,14 @@ class VoiceChatMod(loader.Module):
             return await utils.answer(
                 message, self.strings("seek_usage").format(p=self.get_prefix())
             )
-        async with player.lock:
-            try:
-                await self._start(player, track, offset=target)
-            except Exception as error:
-                return await utils.answer(message, self._error_text(track, error))
+        try:
+            await self._act(player, "seek", target)
+        except Exception as error:
+            return await utils.answer(message, self._error_text(track, error))
         await utils.answer(message, self.strings("seeked").format(fmt_time(target)))
+        await self._refresh_panel(player)
 
+    @loader.group_member
     @loader.command(ru_doc="<1-200> — гучність")
     async def vcvol(self, message):
         """<1-200> — гучність бота в дзвінку"""
@@ -2748,24 +3411,74 @@ class VoiceChatMod(loader.Module):
         value = (utils.get_args_raw(message) or "").strip().rstrip("%")
         if not value.isdigit() or not 1 <= int(value) <= 200:
             return await utils.answer(message, self.strings("volume_usage"))
-        await self._calls.change_volume_call(player.chat_id, int(value))
-        player.volume = int(value)
+        await self._act(player, "volume", int(value))
         await utils.answer(message, self.strings("volume").format(value))
+        await self._refresh_panel(player)
 
+    @loader.group_member
     @loader.command(ru_doc="Повтор поточного треку")
     async def vcloop(self, message):
         """Увімкнути / вимкнути повтор поточного треку"""
         player = await self._active(message)
         if player is None:
             return
-        player.loop = not player.loop
+        await self._act(player, "loop")
         await utils.answer(
             message, self.strings("loop_on" if player.loop else "loop_off")
         )
+        await self._refresh_panel(player)
 
+    @loader.group_member
+    @loader.command(ru_doc="[N] — звукова доріжка (мова озвучки)")
+    async def vcaudiotrack(self, message):
+        """[N] — показати звукові доріжки поточного треку або обрати N-ту"""
+        player = await self._active(message)
+        if player is None:
+            return
+        track = player.current
+        streams = track.audio_streams
+        if len(streams) < 2:
+            return await utils.answer(message, self.strings("atrack_none"))
+        args = (utils.get_args_raw(message) or "").strip()
+        if not args:
+            current = (
+                self._audio_track_label(streams[track.audio_index], track.audio_index)
+                if track.audio_index is not None
+                else self.strings("atrack_auto")
+            )
+            listing = "\n".join(
+                utils.escape_html(self._audio_track_label(stream, index))
+                for index, stream in enumerate(streams)
+            )
+            return await utils.answer(
+                message,
+                self.strings("atrack_list").format(
+                    current=utils.escape_html(current),
+                    tracks=listing,
+                    p=self.get_prefix(),
+                ),
+            )
+        if not args.isdigit() or not 1 <= int(args) <= len(streams):
+            return await utils.answer(message, self.strings("atrack_bad"))
+        index = int(args) - 1
+        try:
+            await self._act(player, "atrack_set", index)
+        except Exception as error:
+            return await utils.answer(message, self._error_text(track, error))
+        await utils.answer(
+            message,
+            self.strings("atrack_set").format(
+                utils.escape_html(self._audio_track_label(streams[index], index))
+            ),
+        )
+        await self._refresh_panel(player)
+
+    @loader.group_member
     @loader.command(ru_doc="Черга")
     async def vcqueue(self, message):
         """Показати чергу"""
+        if not await self._allowed(message, "view"):
+            return
         player = self._players.get(_chat_id(message))
         if player is None or (player.current is None and not player.queue):
             return await utils.answer(message, self.strings("queue_empty"))
@@ -2780,9 +3493,73 @@ class VoiceChatMod(loader.Module):
             lines.append(self.strings("queue_more").format(len(player.queue) - 15))
         await utils.answer(message, "\n".join(lines), link_preview=False)
 
+    def _queue_index(self, player, text):
+        text = (text or "").strip()
+        if not text.isdigit() or not 1 <= int(text) <= len(player.queue):
+            return None
+        return int(text) - 1
+
+    @loader.group_member
+    @loader.command(ru_doc="<N> — прибрати трек із черги")
+    async def vcremove(self, message):
+        """<N> — прибрати N-й трек із черги"""
+        if not await self._allowed(message, "control"):
+            return
+        player = self._players.get(_chat_id(message))
+        index = (
+            self._queue_index(player, utils.get_args_raw(message)) if player else None
+        )
+        if index is None:
+            return await utils.answer(
+                message, self.strings("pos_bad").format(self.get_prefix())
+            )
+        async with player.lock:
+            track = player.queue[index]
+            del player.queue[index]
+            self._drop_track_file(track, player)
+            self._schedule_prefetch(player)
+            self._save_state()
+        await utils.answer(
+            message, self.strings("removed").format(self._title_html(track)),
+            link_preview=False,
+        )
+        await self._refresh_panel(player)
+
+    @loader.group_member
+    @loader.command(ru_doc="<N> <M> — пересунути трек у черзі")
+    async def vcmove(self, message):
+        """<N> <M> — пересунути N-й трек черги на місце M"""
+        if not await self._allowed(message, "control"):
+            return
+        player = self._players.get(_chat_id(message))
+        parts = (utils.get_args_raw(message) or "").split()
+        source = target = None
+        if player is not None and len(parts) == 2:
+            source = self._queue_index(player, parts[0])
+            target = self._queue_index(player, parts[1])
+        if source is None or target is None:
+            return await utils.answer(
+                message, self.strings("pos_bad").format(self.get_prefix())
+            )
+        async with player.lock:
+            track = player.queue[source]
+            del player.queue[source]
+            player.queue.insert(target, track)
+            self._schedule_prefetch(player)
+            self._save_state()
+        await utils.answer(
+            message,
+            self.strings("moved").format(pos=target + 1, title=self._title_html(track)),
+            link_preview=False,
+        )
+        await self._refresh_panel(player)
+
+    @loader.group_member
     @loader.command(ru_doc="Очистити чергу")
     async def vcclear(self, message):
         """Очистити чергу (поточний трек грає далі)"""
+        if not await self._allowed(message, "control"):
+            return
         player = self._players.get(_chat_id(message))
         count = 0
         if player is not None:
@@ -2792,40 +3569,154 @@ class VoiceChatMod(loader.Module):
                 player.queue.clear()
                 for track in tracks:
                     self._drop_track_file(track, player)
+                self._save_state()
         await utils.answer(message, self.strings("cleared").format(count))
 
-    @loader.command(ru_doc="Що зараз грає")
+    @loader.group_member
+    @loader.command(ru_doc="Що зараз грає (панель керування)")
     async def vcnow(self, message):
-        """Що зараз грає: позиція, якість, гучність"""
-        player = await self._active(message)
+        """Що зараз грає: позиція, якість, гучність; панель з кнопками"""
+        player = await self._active(message, "view")
         if player is None:
             return
-        track = player.current
-        position = player.position
-        if track.duration and not track.is_live:
-            filled = int(min(1.0, position / float(track.duration)) * 12)
-            bar = "▰" * filled + "▱" * (12 - filled)
-        else:
-            bar = "🔴"
-        await utils.answer(
-            message,
-            self.strings("now").format(
-                icon="🎬" if track.has_video else "🎵",
-                title=self._title_html(track),
-                bar=bar,
-                pos=fmt_time(position),
-                duration=self._duration_label(track),
-                state=self.strings(
-                    "state_paused" if player.paused else "state_playing"
-                ),
-                volume=player.volume,
-                loop=self.strings("on" if player.loop else "off"),
-                quality=self._quality_label(track),
-                queued=len(player.queue),
+        if self._panel_enabled() and await self._show_panel(player, message):
+            return
+        await utils.answer(message, self._panel_text(player), link_preview=False)
+
+    def _search_sync(self, query, count):
+        import yt_dlp
+
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": "in_playlist",
+            "skip_download": True,
+        }
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(f"ytsearch{count}:{query}", download=False)
+        results = []
+        for entry in (info or {}).get("entries") or []:
+            if not entry:
+                continue
+            link = entry.get("webpage_url") or entry.get("url") or ""
+            if link and not URL_RE.match(link):
+                link = f"https://www.youtube.com/watch?v={link}"
+            if link:
+                results.append(
+                    {
+                        "url": link,
+                        "title": entry.get("title") or link,
+                        "duration": entry.get("duration"),
+                        "channel": entry.get("channel") or entry.get("uploader"),
+                    }
+                )
+        return results
+
+    @loader.group_member
+    @loader.command(ru_doc="<запит> [-a] — пошук на YouTube з вибором")
+    async def vcsearch(self, message):
+        """<запит> [-a] — знайти на YouTube і обрати, що грати (-a — лише звук)"""
+        if not await self._allowed(message, "queue"):
+            return
+        query = (utils.get_args_raw(message) or "").strip()
+        audio_only = False
+        if query.split()[:1] and query.split()[0].lower() in ("-a", "--audio"):
+            audio_only = True
+            query = query.split(None, 1)[1] if len(query.split()) > 1 else ""
+        if not query:
+            return await utils.answer(
+                message, self.strings("search_usage").format(self.get_prefix())
             )
-            + self._download_line(track),
+        error = self._check_dependencies()
+        if error:
+            return await utils.answer(message, error)
+        status = await utils.answer(message, self.strings("searching"))
+        try:
+            results = await asyncio.to_thread(self._search_sync, query, SEARCH_RESULTS)
+        except Exception as error:
+            return await utils.answer(
+                status,
+                self.strings("play_failed").format(
+                    title=utils.escape_html(query),
+                    error=utils.escape_html(str(error)[:300]),
+                ),
+            )
+        if not results:
+            return await utils.answer(status, self.strings("search_none"))
+        chat_id = _chat_id(message)
+        head = self.strings("search_head").format(utils.escape_html(query))
+
+        def label(result):
+            duration = f" · {fmt_time(result['duration'])}" if result["duration"] else ""
+            return f"{str(result['title'])[:50]}{duration}"
+
+        if getattr(self, "inline", None) is not None:
+            buttons = [
+                [
+                    {
+                        "text": f"{index}. {label(result)}",
+                        "callback": self._search_pick,
+                        "args": (chat_id, result, audio_only),
+                    }
+                ]
+                for index, result in enumerate(results, 1)
+            ]
+            buttons.append(
+                [{"text": self.strings("btn_cancel"), "action": "close"}]
+            )
+            with contextlib.suppress(Exception):
+                form = await self.inline.form(
+                    head,
+                    message=status,
+                    reply_markup=buttons,
+                    disable_security=True,
+                    silent=True,
+                )
+                if form:
+                    return
+        lines = "\n".join(
+            f"{index}. <a href=\"{utils.escape_html(r['url'])}\">"
+            f"{utils.escape_html(label(r))}</a>"
+            for index, r in enumerate(results, 1)
+        )
+        await utils.answer(
+            status,
+            self.strings("search_text").format(
+                head=head, lines=lines, p=self.get_prefix()
+            ),
             link_preview=False,
         )
+
+    async def _search_pick(self, call, chat_id, result, audio_only):
+        user = getattr(getattr(call, "from_user", None), "id", None)
+        if not self._user_allowed(user, "queue"):
+            with contextlib.suppress(Exception):
+                await call.answer(self.strings("toast_no_access"), show_alert=True)
+            return
+        with contextlib.suppress(Exception):
+            await call.edit(
+                self.strings("search_picked").format(
+                    utils.escape_html(str(result["title"]))
+                ),
+                reply_markup=[],
+            )
+        error = await self._prepare_chat(chat_id)
+        if error:
+            with contextlib.suppress(Exception):
+                await call.edit(error)
+            return
+        track = Track(
+            result["url"],
+            title=result["title"],
+            audio_only=audio_only,
+            duration=result.get("duration"),
+            requester=user,
+        )
+        # Only an owner-level user may replace what is playing.
+        now = False
+        await self._enqueue(chat_id, [track], now)
+        with contextlib.suppress(Exception):
+            await call.delete()
 
     def _download_line(self, track):
         cache = self._streamer.cache(track.stream_url) if track.stream_url else None
