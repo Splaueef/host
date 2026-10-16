@@ -291,7 +291,7 @@ class YouTubeTest(unittest.TestCase):
             voicechat.Track("https://youtu.be/x"),
             voicechat.YouTubeAuthError({"cookies": None}),
         )
-        self.assertIn("cookies.txt", text)
+        self.assertIn("vcbrowser", text)
         self.assertNotIn("GetPOT", text)
         text = self.mod._error_text(
             voicechat.Track("https://youtu.be/x"),
@@ -409,6 +409,127 @@ class AnySiteTest(unittest.TestCase):
         self.assertIsNone(voicechat.codec_name("none"))
         self.assertEqual(voicechat.clamp_fps(60, 30), 30)
         self.assertEqual(voicechat.clamp_fps(None, 24), 24)
+
+
+COOKIES_TXT = """# Netscape HTTP Cookie File
+.youtube.com\tTRUE\t/\tTRUE\t1999999999\tSAPISID\tabc
+#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1999999999\t__Secure-1PSIDTS\tts1
+www.youtube.com\tFALSE\t/\tTRUE\t0\t__Host-GAPS\tg
+.example.com\tTRUE\t/\tFALSE\t0\tother\tx
+"""
+
+
+class BrowserTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mod = voicechat.VoiceChatMod()
+        self.mod.lookup = lambda name: None
+        self.mod._browser = voicechat.BrowserSession(self.tmp.name)
+        patcher = mock.patch.object(
+            voicechat.BrowserSession, "available", staticmethod(lambda: True)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        work = mock.patch.object(
+            voicechat, "WORK_DIR", str(pathlib.Path(self.tmp.name, "work"))
+        )
+        work.start()
+        self.addCleanup(work.stop)
+
+    def _fake_refresh(self, logged_in=True):
+        browser = self.mod._browser
+        calls = []
+
+        async def refresh(import_cookies=None):
+            calls.append(import_cookies)
+            cookies = import_cookies or voicechat.parse_netscape(COOKIES_TXT)
+            pathlib.Path(browser.profile).mkdir(parents=True, exist_ok=True)
+            pathlib.Path(browser.cookie_file).write_text(
+                voicechat.to_netscape(cookies)
+            )
+            return browser._save_state(
+                refreshed_at=voicechat.time.time(),
+                logged_in=logged_in,
+                count=len(cookies),
+            )
+
+        browser.refresh = refresh
+        return calls
+
+    def test_netscape_round_trip_keeps_http_only_and_session(self):
+        cookies = voicechat.parse_netscape(COOKIES_TXT)
+        self.assertEqual(len(cookies), 4)
+        self.assertTrue(cookies[1]["httpOnly"])
+        self.assertEqual(cookies[2]["expires"], -1)
+        again = voicechat.parse_netscape(voicechat.to_netscape(cookies))
+        self.assertEqual(again, cookies)
+        self.assertTrue(voicechat.is_logged_in(cookies))
+        self.assertEqual(len(voicechat.session_cookies(cookies)), 3)
+
+    def test_host_prefixed_cookie_uses_url(self):
+        host = voicechat.to_playwright(voicechat.parse_netscape(COOKIES_TXT)[2])
+        self.assertEqual(host["url"], "https://www.youtube.com/")
+        self.assertNotIn("domain", host)
+        plain = voicechat.to_playwright(voicechat.parse_netscape(COOKIES_TXT)[0])
+        self.assertEqual((plain["domain"], plain["path"]), (".youtube.com", "/"))
+
+    async def test_import_command_hands_cookies_to_browser(self):
+        calls = self._fake_refresh()
+        path = pathlib.Path(self.tmp.name, "in.txt")
+        path.write_text(COOKIES_TXT)
+        vc_utils.answer.reset_mock()
+        await self.mod.vcbrowser(_Message(f"import {path}"))
+        self.assertEqual(len(calls[0]), 3)  # only YouTube/Google cookies
+        self.assertIn("Сесію оновлено", vc_utils.answer.await_args.args[1])
+        self.assertTrue(self.mod._browser.has_session())
+
+    async def test_snapshot_is_preferred_and_never_handed_out_itself(self):
+        self._fake_refresh()
+        await self.mod._browser.refresh()
+        context = self.mod._yt_context("https://youtu.be/x")
+        self.assertEqual(context["cookies"], self.mod._browser.cookie_file)
+        self.assertTrue(context["snapshot"])
+        attempts = self.mod._youtube_attempts({}, context)
+        used = {a.get("cookiefile") for a in attempts if a.get("cookiefile")}
+        self.assertEqual(len(used), 1)
+        self.assertNotIn(self.mod._browser.cookie_file, used)
+        # Anonymous fallback follows the cookie attempts.
+        self.assertTrue(any("cookiefile" not in a for a in attempts))
+
+    async def test_logged_out_browser_is_not_used(self):
+        self._fake_refresh(logged_in=False)
+        await self.mod._browser.refresh()
+        with mock.patch.object(voicechat, "YT_COOKIE_FILES", ()):
+            context = self.mod._yt_context("https://youtu.be/x")
+        self.assertIsNone(context["cookies"])
+
+    async def test_bot_check_refreshes_browser_once_and_retries(self):
+        calls = self._fake_refresh()
+        await self.mod._browser.refresh()
+        self.mod._browser._save_state(refreshed_at=1)
+        results = iter([RuntimeError("Sign in to confirm you're not a bot"), {"ok": 1}])
+
+        def extract(track, context):
+            result = next(results)
+            if isinstance(result, Exception):
+                raise result
+            return {"title": "T", "url": "u", "acodec": "opus"}
+
+        self.mod._extract_sync = extract
+        track = voicechat.Track("https://youtu.be/x")
+        await self.mod._resolve(track)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(track.title, "T")
+
+    async def test_status_explains_setup(self):
+        vc_utils.answer.reset_mock()
+        await self.mod.vcbrowser(_Message(""))
+        text = vc_utils.answer.await_args.args[1]
+        self.assertIn("vcbrowser setup", text)
+        self.assertIn("приватне вікно", text)
 
 
 class SetupTest(unittest.TestCase):

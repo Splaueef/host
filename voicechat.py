@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 1.4.0
+# meta version: 1.5.0
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -99,6 +99,12 @@ YT_CLIENT_PROFILES = (
     (["android_vr"], False),
     (["mweb"], False),
     (["default", "ios", "web_embedded", "-tv"], True),
+)
+# Without cookies only the clients that usually work anonymously.
+YT_ANON_PROFILES = (
+    (None, False),
+    (["tv_simply", "default", "-tv"], False),
+    (["android_vr"], False),
 )
 YT_FATAL_MARKERS = (
     "private video",
@@ -434,6 +440,209 @@ def _version_tuple(version):
     return tuple(parts[:3])
 
 
+# ------------------------------------------------------- virtual browser
+#
+# A static cookies.txt dies quickly: Google rotates session cookies all the
+# time, and whoever rotates first (the browser it came from, VideoDownloader's
+# yt-dlp, this module's yt-dlp) invalidates every other copy.  Here a headless
+# Chromium with its own profile owns the session: it revisits YouTube on a
+# timer, lets Google rotate the cookies the way a real browser does, and
+# exports a fresh cookies.txt.  yt-dlp only ever gets a copy of that file, so
+# nothing else rotates the session behind the browser's back.
+BROWSER_DIR = os.path.abspath(".voicechat_browser")
+BROWSER_HOME = "https://www.youtube.com/"
+BROWSER_SETTLE_MS = 10000
+SESSION_DOMAINS = ("youtube.com", "google.com", "youtu.be")
+LOGIN_COOKIES = ("SAPISID", "__Secure-3PAPISID", "__Secure-1PSID", "LOGIN_INFO")
+BROWSER_ARGS = (
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+)
+
+
+def parse_netscape(text):
+    """cookies.txt (Netscape format) -> list of cookie dicts."""
+    cookies = []
+    for line in (text or "").splitlines():
+        http_only = line.startswith("#HttpOnly_")
+        if http_only:
+            line = line[len("#HttpOnly_"):]
+        elif not line.strip() or line.startswith("#"):
+            continue
+        parts = line.rstrip("\r\n").split("\t")
+        if len(parts) < 7:
+            continue
+        domain, _, path, secure, expires, name, value = parts[:7]
+        try:
+            expires = int(float(expires))
+        except ValueError:
+            expires = 0
+        cookies.append(
+            {
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": path or "/",
+                "expires": expires if expires > 0 else -1,
+                "secure": secure.upper() == "TRUE",
+                "httpOnly": http_only,
+            }
+        )
+    return cookies
+
+
+def to_netscape(cookies):
+    lines = ["# Netscape HTTP Cookie File", "# Exported by VoiceChat browser", ""]
+    for cookie in cookies:
+        domain = cookie.get("domain") or ""
+        expires = cookie.get("expires")
+        expires = int(expires) if expires and expires > 0 else 0
+        prefix = "#HttpOnly_" if cookie.get("httpOnly") else ""
+        lines.append(
+            "\t".join(
+                (
+                    prefix + domain,
+                    "TRUE" if domain.startswith(".") else "FALSE",
+                    cookie.get("path") or "/",
+                    "TRUE" if cookie.get("secure") else "FALSE",
+                    str(expires),
+                    cookie.get("name") or "",
+                    cookie.get("value") or "",
+                )
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def session_cookies(cookies):
+    return [
+        cookie
+        for cookie in cookies
+        if any(
+            (cookie.get("domain") or "").lstrip(".").endswith(domain)
+            for domain in SESSION_DOMAINS
+        )
+    ]
+
+
+def is_logged_in(cookies):
+    names = {
+        cookie.get("name")
+        for cookie in cookies
+        if "youtube.com" in (cookie.get("domain") or "")
+    }
+    return any(name in names for name in LOGIN_COOKIES)
+
+
+def to_playwright(cookie):
+    """A parsed cookie as Playwright's ``add_cookies`` wants it."""
+    result = {
+        "name": cookie["name"],
+        "value": cookie["value"],
+        "expires": cookie.get("expires", -1),
+        "httpOnly": bool(cookie.get("httpOnly")),
+        "secure": bool(cookie.get("secure")),
+        "sameSite": "Lax",
+    }
+    if cookie["name"].startswith("__Host-"):
+        # __Host- cookies must not carry a Domain attribute.
+        host = cookie["domain"].lstrip(".")
+        result["url"] = f"https://{host}/"
+    else:
+        result["domain"] = cookie["domain"]
+        result["path"] = cookie.get("path") or "/"
+    return result
+
+
+class BrowserSession:
+    """Headless Chromium profile that keeps a YouTube session alive."""
+
+    def __init__(self, root=BROWSER_DIR):
+        self.root = root
+        self.profile = os.path.join(root, "profile")
+        self.cookie_file = os.path.join(root, "cookies.txt")
+        self.state_file = os.path.join(root, "state.json")
+        self.lock = asyncio.Lock()
+
+    @staticmethod
+    def available():
+        return importlib.util.find_spec("playwright") is not None
+
+    def state(self):
+        try:
+            with open(self.state_file, encoding="utf-8") as handle:
+                return json.load(handle)
+        except (OSError, ValueError):
+            return {}
+
+    def _save_state(self, **values):
+        state = {**self.state(), **values}
+        os.makedirs(self.root, exist_ok=True)
+        with open(self.state_file, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+        return state
+
+    @property
+    def configured(self):
+        return os.path.isdir(self.profile)
+
+    def has_session(self):
+        return bool(self.state().get("logged_in")) and os.path.isfile(
+            self.cookie_file
+        )
+
+    def age(self):
+        refreshed = self.state().get("refreshed_at") or 0
+        return time.time() - refreshed if refreshed else float("inf")
+
+    async def refresh(self, import_cookies=None):
+        """Visit YouTube, let Google rotate the cookies, export them."""
+        from playwright.async_api import async_playwright
+
+        async with self.lock:
+            os.makedirs(self.profile, exist_ok=True)
+            async with async_playwright() as playwright:
+                context = await playwright.chromium.launch_persistent_context(
+                    self.profile,
+                    headless=True,
+                    args=list(BROWSER_ARGS),
+                    user_agent=BROWSER_UA,
+                    locale="en-US",
+                )
+                try:
+                    if import_cookies:
+                        await context.clear_cookies()
+                        await context.add_cookies(
+                            [to_playwright(c) for c in import_cookies]
+                        )
+                    page = context.pages[0] if context.pages else await context.new_page()
+                    await page.goto(
+                        BROWSER_HOME, wait_until="domcontentloaded", timeout=60000
+                    )
+                    # YouTube's page calls RotateCookies by itself; give it time.
+                    await page.wait_for_timeout(BROWSER_SETTLE_MS)
+                    cookies = session_cookies(await context.cookies())
+                finally:
+                    await context.close()
+            temp = self.cookie_file + ".tmp"
+            with open(temp, "w", encoding="utf-8") as handle:
+                handle.write(to_netscape(cookies))
+            os.replace(temp, self.cookie_file)
+            return self._save_state(
+                refreshed_at=time.time(),
+                logged_in=is_logged_in(cookies),
+                count=len(cookies),
+                error=None,
+            )
+
+    def record_error(self, error):
+        return self._save_state(error=str(error)[:300], failed_at=time.time())
+
+    def reset(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
 class YouTubeAuthError(Exception):
     """YouTube's bot check rejected every client and cookie combination."""
 
@@ -558,14 +767,70 @@ class VoiceChatMod(loader.Module):
         "yt_auth": (
             "❌ <b>YouTube просить підтвердити, що це не бот, а робочих "
             "cookies не знайдено.</b>\n"
-            "Покладіть cookies.txt із входом у YouTube у "
-            "<code>/home/rkbot/URKbot/cookies.txt</code> (його ж використовує "
-            "VideoDownloader, див. <code>{p}vdlcookies</code>) або вкажіть шлях "
-            "у <code>{p}config VoiceChat</code> → <code>cookies_file</code>."
+            "Налаштуйте віртуальний браузер: <code>{p}vcbrowser</code> — він "
+            "сам підтримуватиме сесію YouTube живою."
         ),
         "yt_auth_cookies": (
             "❌ <b>YouTube не прийняв cookies</b> (<code>{file}</code>). "
-            "Схоже, сесія застаріла — оновіть cookies.txt."
+            "Схоже, сесія застаріла.\n"
+            "Щоб це не повторювалось, передайте сесію віртуальному браузеру: "
+            "<code>{p}vcbrowser</code>."
+        ),
+        "cfg_browser_session": (
+            "Тримати сесію YouTube у віртуальному браузері (headless Chromium) "
+            "і брати cookies з нього"
+        ),
+        "cfg_browser_refresh": "Як часто браузер оновлює сесію YouTube (хвилин)",
+        "br_status": (
+            "🌐 <b>Віртуальний браузер</b>\n\n"
+            "Playwright: {installed}\n"
+            "Сесія YouTube: {session}\n"
+            "Cookies: {count}\n"
+            "Останнє оновлення: {refreshed}\n"
+            "Автооновлення: кожні {every} хв{error}\n\n"
+            "<b>Як підключити:</b>\n"
+            "1. <code>{p}vcbrowser setup</code> — встановити Chromium (один раз).\n"
+            "2. На комп'ютері відкрийте <b>приватне вікно</b>, увійдіть у YouTube "
+            "(краще окремим акаунтом), експортуйте cookies.txt розширенням "
+            "«Get cookies.txt LOCALLY» і <b>закрийте вікно</b>, не виходячи з "
+            "акаунта — тоді сесію не ротуватиме ваш браузер.\n"
+            "3. Надішліть файл сюди й відповідайте на нього "
+            "<code>{p}vcbrowser import</code>.\n\n"
+            "Далі браузер сам відкриває YouTube за розкладом, Google оновлює "
+            "cookies як у звичайному браузері, а yt-dlp отримує свіжу копію."
+        ),
+        "br_yes": "🟢 так",
+        "br_no": "🔴 ні",
+        "br_none": "—",
+        "br_logged": "🟢 активна",
+        "br_logged_out": "🔴 немає входу в акаунт",
+        "br_error": "\nОстання помилка: <code>{}</code>",
+        "br_need_setup": (
+            "❌ <b>Playwright не встановлено.</b> Виконайте "
+            "<code>{}vcbrowser setup</code>."
+        ),
+        "br_setup_running": (
+            "⏳ <b>Встановлюю Playwright і Chromium…</b> Це може зайняти кілька "
+            "хвилин."
+        ),
+        "br_setup_done": (
+            "✅ <b>Віртуальний браузер встановлено.</b> Тепер "
+            "<code>{}vcbrowser import</code> у відповідь на cookies.txt."
+        ),
+        "br_no_file": (
+            "❌ <b>Відповідайте на файл cookies.txt</b> або вкажіть шлях: "
+            "<code>{}vcbrowser import /шлях/cookies.txt</code>."
+        ),
+        "br_bad_file": "❌ <b>У файлі немає cookies YouTube.</b>",
+        "br_working": "⏳ <b>Відкриваю YouTube у віртуальному браузері…</b>",
+        "br_done": (
+            "✅ <b>Сесію оновлено.</b> Cookies: {count}, вхід в акаунт: {session}."
+        ),
+        "br_failed": "❌ <b>Браузер не зміг оновити сесію:</b> <code>{}</code>",
+        "br_reset": "🗑 <b>Профіль віртуального браузера видалено.</b>",
+        "br_usage": (
+            "❌ <b>Дії:</b> <code>setup</code>, <code>import</code>, "
+            "<code>refresh</code>, <code>reset</code>."
         ),
         "only_groups": "❌ <b>Групові дзвінки є лише в групах і каналах.</b>",
         "no_source": (
@@ -698,6 +963,18 @@ class VoiceChatMod(loader.Module):
                 validator=loader.validators.Integer(minimum=1, maximum=4000),
             ),
             loader.ConfigValue(
+                "browser_session",
+                True,
+                lambda: self.strings("cfg_browser_session"),
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "browser_refresh_min",
+                30,
+                lambda: self.strings("cfg_browser_refresh"),
+                validator=loader.validators.Integer(minimum=10, maximum=720),
+            ),
+            loader.ConfigValue(
                 "cookies_file",
                 "",
                 lambda: self.strings("cfg_cookies"),
@@ -709,12 +986,37 @@ class VoiceChatMod(loader.Module):
         self._tg = None
         self._connect_lock = asyncio.Lock()
         self._players = {}
+        self._browser = BrowserSession()
+        self._browser_task = None
 
     async def client_ready(self, client, db):
         self._client = client
         shutil.rmtree(WORK_DIR, ignore_errors=True)
+        self._browser_task = asyncio.ensure_future(self._browser_loop())
+
+    def _browser_enabled(self):
+        return bool(self.config["browser_session"]) and self._browser.available()
+
+    async def _browser_loop(self):
+        """Revisit YouTube on schedule so the session never goes stale."""
+        while True:
+            await asyncio.sleep(60)
+            if not self._browser_enabled() or not self._browser.configured:
+                continue
+            if self._browser.age() < int(self.config["browser_refresh_min"]) * 60:
+                continue
+            try:
+                await self._browser.refresh()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning("VoiceChat browser refresh failed: %s", error)
+                self._browser.record_error(error)
 
     async def on_unload(self):
+        if self._browser_task is not None:
+            self._browser_task.cancel()
+            self._browser_task = None
         for player in list(self._players.values()):
             self._cancel_end_task(player)
             if self._calls is not None and player.current is not None:
@@ -949,6 +1251,10 @@ class VoiceChatMod(loader.Module):
             else (_registered_domain(urlsplit(url).hostname or ""),)
         )
         candidates = []
+        snapshot = None
+        if youtube and self._browser_enabled() and self._browser.has_session():
+            snapshot = self._browser.cookie_file
+            candidates.append(snapshot)
         configured = str(self.config["cookies_file"] or "").strip()
         if configured:
             candidates.append(os.path.expanduser(configured))
@@ -968,15 +1274,26 @@ class VoiceChatMod(loader.Module):
                 browser = _parse_browser_cookies(vdl._yt_browser_cookies_value())
         if browser and browser[1] and not os.path.isdir(browser[1]):
             browser = None
-        return {"cookies": cookies, "runtime": runtime, "browser": browser}
+        return {
+            "cookies": cookies,
+            "snapshot": cookies is not None and cookies == snapshot,
+            "runtime": runtime,
+            "browser": browser,
+        }
 
     @staticmethod
-    def _cookie_copy(path):
-        """yt-dlp writes rotated cookies back; use a copy if that is denied."""
-        if os.access(path, os.W_OK):
+    def _cookie_copy(path, force=False):
+        """yt-dlp writes cookies back; give it a copy when it must not.
+
+        ``force`` is for the browser's export: only the browser may rotate
+        that session, so yt-dlp never touches the original.
+        """
+        if not force and os.access(path, os.W_OK):
             return path
         os.makedirs(WORK_DIR, exist_ok=True)
-        copy = os.path.join(WORK_DIR, "cookies.txt")
+        copy = os.path.join(
+            WORK_DIR, f"cookies-{os.getpid()}-{time.monotonic_ns()}.txt"
+        )
         shutil.copyfile(path, copy)
         return copy
 
@@ -990,14 +1307,27 @@ class VoiceChatMod(loader.Module):
             extra["remote_components"] = {"ejs:github"}
         cookie_sets = []
         if context.get("cookies"):
-            cookie_sets.append({"cookiefile": self._cookie_copy(context["cookies"])})
+            cookie_sets.append(
+                (
+                    {
+                        "cookiefile": self._cookie_copy(
+                            context["cookies"], force=context.get("snapshot")
+                        )
+                    },
+                    YT_CLIENT_PROFILES,
+                )
+            )
+            # A stale session can fail where no cookies at all still pass.
+            cookie_sets.append(({}, YT_ANON_PROFILES))
         else:
-            cookie_sets.append({})
+            cookie_sets.append(({}, YT_CLIENT_PROFILES))
         if context.get("browser"):
-            cookie_sets.append({"cookiesfrombrowser": context["browser"]})
+            cookie_sets.append(
+                ({"cookiesfrombrowser": context["browser"]}, YT_CLIENT_PROFILES)
+            )
         attempts = []
-        for cookie_opts in cookie_sets:
-            for clients, missing_pot in YT_CLIENT_PROFILES:
+        for cookie_opts, profiles in cookie_sets:
+            for clients, missing_pot in profiles:
                 options = {**base, **extra, **cookie_opts}
                 youtube_args = {}
                 if clients:
@@ -1287,12 +1617,32 @@ class VoiceChatMod(loader.Module):
         try:
             info = await asyncio.to_thread(self._extract_sync, track, context)
         except Exception as error:
-            if youtube and is_auth_error(error):
+            if not (youtube and is_auth_error(error)):
+                raise
+            info = await self._retry_with_fresh_browser(track)
+            if info is None:
                 raise YouTubeAuthError(context or {}) from error
-            raise
         self._apply_info(track, info)
         if not youtube:
             await self._probe_track(track)
+
+    async def _retry_with_fresh_browser(self, track):
+        """After a bot check, renew the browser session once and retry."""
+        if not (self._browser_enabled() and self._browser.configured):
+            return None
+        if self._browser.age() < 120:
+            return None
+        try:
+            await self._browser.refresh()
+        except Exception as error:
+            logger.warning("VoiceChat browser refresh failed: %s", error)
+            self._browser.record_error(error)
+            return None
+        context = self._yt_context(track.source)
+        try:
+            return await asyncio.to_thread(self._extract_sync, track, context)
+        except Exception:
+            return None
 
     def _playlist_sync(self, url, audio_only, requester, context=None):
         import yt_dlp
@@ -1612,7 +1962,7 @@ class VoiceChatMod(loader.Module):
             cookies = error.context.get("cookies")
             if cookies:
                 return self.strings("yt_auth_cookies").format(
-                    file=utils.escape_html(cookies)
+                    file=utils.escape_html(cookies), p=self.get_prefix()
                 )
             return self.strings("yt_auth").format(p=self.get_prefix())
         return self.strings("play_failed").format(
@@ -1966,6 +2316,138 @@ class VoiceChatMod(loader.Module):
             ),
             link_preview=False,
         )
+
+    def _browser_status(self):
+        state = self._browser.state()
+        refreshed = state.get("refreshed_at")
+        if refreshed:
+            minutes = int((time.time() - refreshed) // 60)
+            refreshed_text = f"{minutes} хв тому"
+        else:
+            refreshed_text = self.strings("br_none")
+        if not self._browser.configured:
+            session = self.strings("br_none")
+        elif state.get("logged_in"):
+            session = self.strings("br_logged")
+        else:
+            session = self.strings("br_logged_out")
+        error = state.get("error")
+        return self.strings("br_status").format(
+            installed=self.strings(
+                "br_yes" if self._browser.available() else "br_no"
+            ),
+            session=session,
+            count=state.get("count", self.strings("br_none")),
+            refreshed=refreshed_text,
+            every=self.config["browser_refresh_min"],
+            error=(
+                self.strings("br_error").format(utils.escape_html(error))
+                if error
+                else ""
+            ),
+            p=self.get_prefix(),
+        )
+
+    async def _browser_setup(self, message):
+        message = await utils.answer(message, self.strings("br_setup_running"))
+        commands = [
+            self._pip_command(["playwright"]),
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+        ]
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            # System libraries Chromium needs (apt); only possible as root.
+            commands.append(
+                [sys.executable, "-m", "playwright", "install-deps", "chromium"]
+            )
+        for command in commands:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                command,
+                capture_output=True,
+                text=True,
+                timeout=1200,
+            )
+            if result.returncode != 0:
+                tail = (result.stderr or result.stdout or "")[-800:]
+                return await utils.answer(
+                    message,
+                    self.strings("setup_failed").format(utils.escape_html(tail)),
+                )
+            importlib.invalidate_caches()
+        await utils.answer(
+            message, self.strings("br_setup_done").format(self.get_prefix())
+        )
+
+    async def _read_cookie_source(self, message, path):
+        if path:
+            with open(os.path.expanduser(path), encoding="utf-8") as handle:
+                return handle.read()
+        reply = await message.get_reply_message()
+        if reply is None or not getattr(reply, "file", None):
+            return None
+        data = await self._client.download_media(reply, file=bytes)
+        return data.decode("utf-8", "replace") if data else None
+
+    async def _browser_refresh(self, message, cookies=None):
+        message = await utils.answer(message, self.strings("br_working"))
+        try:
+            state = await self._browser.refresh(import_cookies=cookies)
+        except Exception as error:
+            logger.exception("VoiceChat browser refresh failed")
+            self._browser.record_error(error)
+            return await utils.answer(
+                message,
+                self.strings("br_failed").format(
+                    utils.escape_html(str(error)[:400] or type(error).__name__)
+                ),
+            )
+        await utils.answer(
+            message,
+            self.strings("br_done").format(
+                count=state.get("count", 0),
+                session=self.strings(
+                    "br_logged" if state.get("logged_in") else "br_logged_out"
+                ),
+            ),
+        )
+
+    @loader.command(ru_doc="[setup|import|refresh|reset] — віртуальний браузер для YouTube")
+    async def vcbrowser(self, message):
+        """[setup|import|refresh|reset] — віртуальний браузер, що тримає сесію YouTube живою"""
+        args = (utils.get_args_raw(message) or "").strip()
+        action, _, rest = args.partition(" ")
+        action = action.lower()
+        if not action:
+            return await utils.answer(message, self._browser_status())
+        if action == "setup":
+            return await self._browser_setup(message)
+        if action == "reset":
+            async with self._browser.lock:
+                self._browser.reset()
+            return await utils.answer(message, self.strings("br_reset"))
+        if action not in ("import", "refresh"):
+            return await utils.answer(message, self.strings("br_usage"))
+        if not self._browser.available():
+            return await utils.answer(
+                message, self.strings("br_need_setup").format(self.get_prefix())
+            )
+        if action == "refresh":
+            return await self._browser_refresh(message)
+        try:
+            text = await self._read_cookie_source(message, rest.strip())
+        except OSError as error:
+            return await utils.answer(
+                message,
+                self.strings("br_failed").format(utils.escape_html(str(error))),
+            )
+        if text is None:
+            return await utils.answer(
+                message, self.strings("br_no_file").format(self.get_prefix())
+            )
+        cookies = session_cookies(parse_netscape(text))
+        if not any("youtube.com" in c["domain"] for c in cookies):
+            return await utils.answer(message, self.strings("br_bad_file"))
+        await self._browser_refresh(message, cookies)
 
     @staticmethod
     def _telethon_version():

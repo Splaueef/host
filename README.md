@@ -489,13 +489,32 @@ VP9, AV1, AAC, Opus, AC-3…), роздільність, частоту кадр
 медіафайлом. Коли черга закінчується, бот виходить із дзвінка (`auto_leave`).
 
 **YouTube і «Sign in to confirm you're not a bot».** YouTube часто вимагає
-вхід від серверних IP. VoiceChat робить те саме, що VideoDownloader: бере
-cookies.txt із сесією YouTube (`cookies_file` у `.config VoiceChat`, інакше
-cookies VideoDownloader, інакше `/home/rkbot/URKbot/cookies.txt` чи його копію
-в `/data/...`), підключає Deno/Node для JS-перевірок YouTube і по черзі пробує
-кілька клієнтів YouTube (`web_safari`, `tv_simply`, `android_vr`, `mweb`…).
-Якщо завантажено VideoDownloader, береться і його fallback на cookies Firefox.
-Коли жодна комбінація не пройшла, модуль пише, що треба оновити cookies.
+вхід від серверних IP. Статичний cookies.txt швидко застаріває: Google
+постійно ротує cookies сесії, і хто ротував першим (браузер, з якого їх
+експортували, VideoDownloader чи VoiceChat), той і лишається з робочою
+сесією, а решта копій «вмирає». Тому VoiceChat має **віртуальний браузер**:
+
+```text
+.vcbrowser            — стан сесії та інструкція
+.vcbrowser setup      — встановити Playwright і Chromium (один раз)
+.vcbrowser import     — у відповідь на cookies.txt (або з шляхом до файлу)
+.vcbrowser refresh    — оновити сесію зараз
+.vcbrowser reset      — видалити профіль браузера
+```
+
+Headless Chromium із власним профілем (`.voicechat_browser/`) раз на
+`browser_refresh_min` хвилин (типово 30) відкриває YouTube, Google ротує
+cookies як у звичайному браузері, і браузер експортує свіжий cookies.txt.
+yt-dlp отримує лише **копію** цього файлу, тож сесію ротує тільки браузер.
+Якщо YouTube все ж відмовив, браузер одразу оновлює сесію й робить ще одну
+спробу. Щоб сесію не «перебивав» ваш браузер, експортуйте cookies у
+приватному вікні (краще окремим акаунтом) і закрийте вікно, не виходячи з
+акаунта.
+
+Без віртуального браузера модуль бере cookies так само, як VideoDownloader:
+`cookies_file`, cookies VideoDownloader або `/home/rkbot/URKbot/cookies.txt`;
+підключає Deno/Node для JS-перевірок YouTube, перебирає клієнти YouTube, а із
+застарілими cookies пробує ще й без них.
 
 **Як це влаштовано.** Якщо Hikka працює на звичайному Telethon 1.40+ (як
 форк Splaueef/hikka з Telethon 1.44), модуль передає бібліотеці
