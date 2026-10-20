@@ -1093,27 +1093,46 @@ class VideoDownloaderMod(loader.Module):
     # that browser is the one place the session lives: YouTube cookies come
     # from it, and after a bot check VoiceChat renews it.  This module does not
     # start Firefox for YouTube then, which would only rotate a second session.
+    # VoiceChat may run on another account of the same Hikka: every account
+    # has its own loader, and Hikka lists all their clients in ``allclients``.
 
-    def _voicechat(self):
+    def _voicechat_modules(self) -> list[tuple]:
+        """(account id or None for this one, VoiceChat), this account first."""
+        found = []
         lookup = getattr(self, "lookup", None)
-        if lookup is None:
-            return None
-        with contextlib.suppress(Exception):
-            return lookup("VoiceChat") or None
-        return None
+        if lookup is not None:
+            with contextlib.suppress(Exception):
+                found.append((None, lookup("VoiceChat") or None))
+        own = getattr(self, "allmodules", None)
+        for client in list(getattr(own, "allclients", None) or []):
+            modules = getattr(client, "loader", None)
+            if modules is None or modules is own:
+                continue
+            with contextlib.suppress(Exception):
+                found.append((getattr(client, "tg_id", None), modules.lookup("VoiceChat") or None))
+        return [(account, module) for account, module in found if module]
+
+    def _voicechat_session(self) -> tuple:
+        """(account id, browser) of the VoiceChat browser to use, or (None, None).
+
+        A browser with a logged-in session wins over one that is only set up.
+        """
+        ready = []
+        for account, voicechat in self._voicechat_modules():
+            browser = getattr(voicechat, "_browser", None)
+            try:
+                if browser is not None and voicechat._browser_enabled() and browser.configured:
+                    ready.append((not browser.has_session(), len(ready), account, browser))
+            except Exception as e:
+                logger.debug("VoiceChat browser is unavailable: %s", e)
+        if not ready:
+            return None, None
+        _, _, account, browser = min(ready, key=lambda item: item[:2])
+        return account, browser
 
     def _voicechat_browser(self):
         """VoiceChat's browser session, if it is enabled and set up."""
-        voicechat = self._voicechat()
-        browser = getattr(voicechat, "_browser", None)
-        if browser is None:
-            return None
-        try:
-            if voicechat._browser_enabled() and browser.configured:
-                return browser
-        except Exception as e:
-            logger.debug("VoiceChat browser is unavailable: %s", e)
-        return None
+        return self._voicechat_session()[1]
 
     def _voicechat_cookies(self) -> str | None:
         """A private copy of VoiceChat's YouTube cookies.
@@ -1164,15 +1183,16 @@ class VideoDownloaderMod(loader.Module):
         return browser.has_session()
 
     def _voicechat_status(self) -> str:
-        browser = self._voicechat_browser()
+        account, browser = self._voicechat_session()
         if browser is None:
             return "—"
+        where = f" (акаунт <code>{account}</code>)" if account else ""
         try:
             if browser.has_session():
-                return "✅ сесія YouTube з віртуального браузера VoiceChat"
+                return f"✅ сесія YouTube з віртуального браузера VoiceChat{where}"
         except Exception:
             pass
-        return "⚠️ браузер VoiceChat налаштовано, але входу в YouTube немає"
+        return f"⚠️ браузер VoiceChat{where} налаштовано, але входу в YouTube немає"
 
     def _youtube_auth_text(self) -> str:
         if self._voicechat_browser() is not None:

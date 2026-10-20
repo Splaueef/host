@@ -721,6 +721,38 @@ class VoiceChatSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await waiting)
         self.assertEqual(browser.refreshes, 0)
 
+    def _accounts(self, module, *others):
+        """Put ``module`` on account 1 and the given VoiceChats on 2, 3…"""
+        own = types.SimpleNamespace()
+        clients = [types.SimpleNamespace(tg_id=1, loader=own)]
+        for number, voicechat in enumerate(others, 2):
+            loader = types.SimpleNamespace(
+                lookup=lambda name, vc=voicechat: vc if name == "VoiceChat" else False
+            )
+            clients.append(types.SimpleNamespace(tg_id=number, loader=loader))
+        own.allclients = clients
+        module.allmodules = own
+
+    def test_voicechat_on_another_account_is_used(self):
+        browser = _FakeBrowser(self.session)
+        module = self._module()
+        self._accounts(module, None, _voicechat(browser))
+        self.assertIs(module._voicechat_browser(), browser)
+        cookies = module._download_cookies("https://youtu.be/x")
+        self.assertIn("voicechat_cookies", cookies)
+        self.assertIn("<code>3</code>", module._voicechat_status())
+
+    def test_this_account_and_logged_in_sessions_win(self):
+        local = _FakeBrowser(self.session)
+        other = _FakeBrowser(self.session)
+        module = self._module(_voicechat(local))
+        self._accounts(module, _voicechat(other))
+        self.assertIs(module._voicechat_browser(), local)
+        self.assertNotIn("<code>", module._voicechat_status())
+
+        local.logged_in = False
+        self.assertIs(module._voicechat_browser(), other)
+
     async def test_other_sites_still_use_firefox(self):
         module = self._module(_voicechat(_FakeBrowser(self.session)))
         module._refresh_firefox_cookies_sync = unittest.mock.Mock(return_value=False)
