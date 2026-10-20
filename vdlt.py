@@ -1,4 +1,4 @@
-__version__ = (7, 2, 0)
+__version__ = (7, 3, 0)
 VERSION = ".".join(map(str, __version__))
 
 import os
@@ -215,6 +215,11 @@ STALE_WORK_SECONDS = 6 * 3600
 # not after every broken or private link.
 FORCED_UPDATE_INTERVAL = 6 * 3600
 MEDIA_CACHE_LIMIT = 500
+# VoiceChat (voicechat.py) keeps a YouTube session alive in its own headless
+# browser.  yt-dlp gets throwaway copies of that session, removed after this.
+VOICECHAT_COOKIE_TTL = 3600
+# A session renewed this recently is fresh: renewing it again will not help.
+VOICECHAT_REFRESH_GAP = 120
 
 
 def _empty_stats() -> dict:
@@ -889,6 +894,7 @@ class VideoDownloaderMod(loader.Module):
         "music_choose_match": "<b>🎵 Знайдено кілька треків:</b>\nОберіть потрібний:",
         "err_file":           "<b>❌ Не вдалося отримати файл.</b>",
         "err_youtube_auth":   "<b>❌ YouTube просить підтвердити, що це не бот. Якщо відео приватне/18+, онови cookies: <code>.vdlcookies</code>. Для публічних відео модуль спершу пробує режим без cookies, щоб YouTube рідше ротував сесію.</b>",
+        "err_youtube_auth_vc": "<b>❌ YouTube просить підтвердити, що це не бот, навіть після оновлення сесії у віртуальному браузері VoiceChat. Перевір вхід в акаунт: <code>.vcbrowser</code>.</b>",
         "err_size":           "<b>❌ Файл завеликий ({} МБ). Знижую якість...</b>",
         "err_size_final":     "<b>❌ Файл завеликий навіть у найнижчій якості.</b>",
         "err_limit":          "<b>🚫 Денний ліміт ({} завантажень) вичерпано.</b>",
@@ -946,7 +952,8 @@ class VideoDownloaderMod(loader.Module):
             "├ Шлях: <code>{path}</code>\n"
             "├ Режим YouTube: <code>{mode}</code>\n"
             "├ Browser cookies: <code>{browser}</code>\n"
-            "├ Порядок: файл cookies → оновлення Firefox → browser cookies.\n"
+            "├ VoiceChat: {voicechat}\n"
+            "├ Порядок: {order}.\n"
             "└ Домени в cookies.txt:\n{domains}"
         ),
         "js_runtime_status":  "<b>🟢 JS Runtime: <code>{rt}</code></b>",
@@ -1069,7 +1076,128 @@ class VideoDownloaderMod(loader.Module):
         )
 
     def _cookies_for(self, url: str) -> str | None:
+        """This module's own cookies file (VoiceChat reads it as well)."""
         return self._cookie_manager().file_for(url)
+
+    def _download_cookies(self, url: str) -> str | None:
+        """Cookies for a download: VoiceChat's YouTube session comes first."""
+        if _is_youtube_url(url):
+            shared = self._voicechat_cookies()
+            if shared:
+                return shared
+        return self._cookies_for(url)
+
+    # ── VoiceChat ─────────────────────────────────────────────────────────────
+    #
+    # When VoiceChat is loaded and its virtual browser holds a YouTube session,
+    # that browser is the one place the session lives: YouTube cookies come
+    # from it, and after a bot check VoiceChat renews it.  This module does not
+    # start Firefox for YouTube then, which would only rotate a second session.
+    # VoiceChat may run on another account of the same Hikka: every account
+    # has its own loader, and Hikka lists all their clients in ``allclients``.
+
+    def _voicechat_modules(self) -> list[tuple]:
+        """(account id or None for this one, VoiceChat), this account first."""
+        found = []
+        lookup = getattr(self, "lookup", None)
+        if lookup is not None:
+            with contextlib.suppress(Exception):
+                found.append((None, lookup("VoiceChat") or None))
+        own = getattr(self, "allmodules", None)
+        for client in list(getattr(own, "allclients", None) or []):
+            modules = getattr(client, "loader", None)
+            if modules is None or modules is own:
+                continue
+            with contextlib.suppress(Exception):
+                found.append((getattr(client, "tg_id", None), modules.lookup("VoiceChat") or None))
+        return [(account, module) for account, module in found if module]
+
+    def _voicechat_session(self) -> tuple:
+        """(account id, browser) of the VoiceChat browser to use, or (None, None).
+
+        A browser with a logged-in session wins over one that is only set up.
+        """
+        ready = []
+        for account, voicechat in self._voicechat_modules():
+            browser = getattr(voicechat, "_browser", None)
+            try:
+                if browser is not None and voicechat._browser_enabled() and browser.configured:
+                    ready.append((not browser.has_session(), len(ready), account, browser))
+            except Exception as e:
+                logger.debug("VoiceChat browser is unavailable: %s", e)
+        if not ready:
+            return None, None
+        _, _, account, browser = min(ready, key=lambda item: item[:2])
+        return account, browser
+
+    def _voicechat_browser(self):
+        """VoiceChat's browser session, if it is enabled and set up."""
+        return self._voicechat_session()[1]
+
+    def _voicechat_cookies(self) -> str | None:
+        """A private copy of VoiceChat's YouTube cookies.
+
+        yt-dlp writes cookies back, and only VoiceChat's browser may rotate
+        that session, so yt-dlp never gets the original file.
+        """
+        browser = self._voicechat_browser()
+        if browser is None:
+            return None
+        try:
+            if not browser.has_session() or not _cookie_file_has_domain(
+                browser.cookie_file, COOKIE_DOMAINS["YouTube"]
+            ):
+                return None
+            folder = os.path.join(self._work_root(), "voicechat_cookies")
+            os.makedirs(folder, exist_ok=True)
+            now = time.time()
+            for name in os.listdir(folder):
+                path = os.path.join(folder, name)
+                with contextlib.suppress(OSError):
+                    if now - os.path.getmtime(path) > VOICECHAT_COOKIE_TTL:
+                        os.remove(path)
+            copy = os.path.join(folder, f"cookies_{os.urandom(4).hex()}.txt")
+            shutil.copyfile(browser.cookie_file, copy)
+            return copy
+        except Exception as e:
+            logger.warning("Could not copy VoiceChat cookies: %s", e)
+            return None
+
+    async def _refresh_voicechat_session(self, browser) -> bool:
+        """Let VoiceChat's browser renew the session after a bot check."""
+        if browser.lock.locked():
+            # VoiceChat is renewing it right now (on its timer or for its own
+            # bot check): wait for that instead of opening YouTube twice.
+            async with browser.lock:
+                pass
+            return browser.has_session()
+        if browser.age() < VOICECHAT_REFRESH_GAP:
+            return False
+        try:
+            await browser.refresh()
+        except Exception as e:
+            logger.warning("VoiceChat browser refresh failed: %s", e)
+            with contextlib.suppress(Exception):
+                browser.record_error(e)
+            return False
+        return browser.has_session()
+
+    def _voicechat_status(self) -> str:
+        account, browser = self._voicechat_session()
+        if browser is None:
+            return "—"
+        where = f" (акаунт <code>{account}</code>)" if account else ""
+        try:
+            if browser.has_session():
+                return f"✅ сесія YouTube з віртуального браузера VoiceChat{where}"
+        except Exception:
+            pass
+        return f"⚠️ браузер VoiceChat{where} налаштовано, але входу в YouTube немає"
+
+    def _youtube_auth_text(self) -> str:
+        if self._voicechat_browser() is not None:
+            return self.strings("err_youtube_auth_vc")
+        return self.strings("err_youtube_auth")
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
@@ -1762,7 +1890,7 @@ class VideoDownloaderMod(loader.Module):
     async def _dl_instagram_ytdlp(self, url: str, base_name: str, audio: bool) -> list | None:
         import yt_dlp
 
-        cookies = self._cookies_for(url)
+        cookies = self._download_cookies(url)
         is_vertical = _is_vertical_url(url)
 
         def _dl():
@@ -1955,7 +2083,7 @@ class VideoDownloaderMod(loader.Module):
         import requests
         import yt_dlp
 
-        cookies = self._cookies_for(url)
+        cookies = self._download_cookies(url)
 
         def _dl():
             opts = {"quiet": True, "no_warnings": True,
@@ -2016,7 +2144,7 @@ class VideoDownloaderMod(loader.Module):
         return configured
 
     def _youtube_cookie_candidates(self, url: str) -> list[tuple[str | None, bool, str]]:
-        cookies = self._cookies_for(url)
+        cookies = self._download_cookies(url)
         if not _is_youtube_url(url):
             return [(cookies, False, "cookies" if cookies else "anon")]
         mode = self._yt_cookies_mode()
@@ -2312,7 +2440,7 @@ class VideoDownloaderMod(loader.Module):
         audio: bool, quality: str, vertical: bool = False
     ) -> str | None:
         loop = asyncio.get_event_loop()
-        cookies = self._cookies_for(url)
+        cookies = self._download_cookies(url)
         chain = (
             ["bestaudio/best", "bestaudio", "best"]
             if audio
@@ -2614,9 +2742,26 @@ class VideoDownloaderMod(loader.Module):
         return started and manager.firefox_has_url(url)
 
     async def _dl_with_refreshed_browser(
-        self, url: str, base_name: str, audio: bool
+        self, url: str, base_name: str, audio: bool, status_msg=None
     ) -> list[str] | str | None:
-        """Refresh Firefox state, then make the one final browser-cookie attempt."""
+        """Refresh the browser session, then make one final attempt.
+
+        YouTube goes to VoiceChat's browser when it holds the session;
+        everything else (and YouTube without VoiceChat) to Firefox.
+        """
+        browser = self._voicechat_browser()
+        if (browser is not None and _is_youtube_url(url)
+                and self._yt_cookies_mode() != "never"):
+            if not await self._refresh_voicechat_session(browser):
+                return None
+            if self.config.get("use_cli_ytdlp", True):
+                return await utils.run_sync(
+                    self._run_ytdlp_cli_sync, url, base_name, audio
+                )
+            return await self._dl_youtube(
+                url, base_name, status_msg, audio,
+                str(self.config.get("quality", "720")),
+            )
         refreshed = await utils.run_sync(self._refresh_firefox_cookies_sync, url)
         if not refreshed:
             return None
@@ -2693,7 +2838,7 @@ class VideoDownloaderMod(loader.Module):
     async def _dl_gallery_dl(self, url: str, base_name: str) -> list | None:
         if not self.config.get("use_gallery_dl", True):
             return None
-        cookies = self._cookies_for(url)
+        cookies = self._download_cookies(url)
 
         def _run():
             try:
@@ -3031,7 +3176,7 @@ class VideoDownloaderMod(loader.Module):
             if cobalt_result:
                 return cobalt_result
             if youtube_auth_failed:
-                await status_msg.edit(self.strings("err_youtube_auth"))
+                await status_msg.edit(self._youtube_auth_text())
                 return "AUTH_REQUIRED"
             return None
 
@@ -3083,7 +3228,7 @@ class VideoDownloaderMod(loader.Module):
         import yt_dlp
         import requests
 
-        cookies = self._cookies_for(url)
+        cookies = self._download_cookies(url)
         lang = self.config.get("transcript_lang", "uk")
 
         def _lang_candidates() -> list[str]:
@@ -3296,7 +3441,7 @@ class VideoDownloaderMod(loader.Module):
         import yt_dlp
 
         opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
-        cookies = self._cookies_for(url)
+        cookies = self._download_cookies(url)
         if cookies:
             opts["cookiefile"] = cookies
         if _is_youtube_url(url):
@@ -3717,7 +3862,7 @@ class VideoDownloaderMod(loader.Module):
     async def _dl_playlist(self, url: str, status_msg, message, audio: bool):
         import yt_dlp
 
-        cookies = self._cookies_for(url)
+        cookies = self._download_cookies(url)
         max_v = self.config["playlist_max"]
 
         def _info():
@@ -3877,9 +4022,10 @@ class VideoDownloaderMod(loader.Module):
 
             # Firefox is a session refresh service, not a generic downloader.
             # Start it only after yt-dlp explicitly classified an auth failure.
-            if result == "AUTH_REQUIRED":
+            auth_failed = result == "AUTH_REQUIRED"
+            if auth_failed:
                 browser_result = await self._dl_with_refreshed_browser(
-                    url, f"{base}_browser", audio
+                    url, f"{base}_browser", audio, status_msg
                 )
                 if browser_result == "TOO_LARGE":
                     result = "TOO_LARGE"
@@ -3936,7 +4082,11 @@ class VideoDownloaderMod(loader.Module):
             else:
                 logger.warning("All methods failed for url=%s", url)
                 self._stats["err"] += 1
-                await status_msg.edit(self.strings("err_file"))
+                await status_msg.edit(
+                    self._youtube_auth_text()
+                    if auth_failed and _is_youtube_url(url)
+                    else self.strings("err_file")
+                )
 
         except asyncio.TimeoutError:
             self._stats["err"] += 1
@@ -4405,7 +4555,14 @@ class VideoDownloaderMod(loader.Module):
                 default=_s(self._cookie_manager().cookies_file),
                 path=utils.escape_html(self._cookie_manager().cookies_file),
                 mode=self.config.get("yt_cookies_mode", "auto"),
-                browser=self._yt_browser_cookies_value(), domains=domains
+                browser=self._yt_browser_cookies_value(), domains=domains,
+                voicechat=self._voicechat_status(),
+                order=(
+                    "YouTube — сесія VoiceChat (її оновлює браузер VoiceChat), "
+                    "інші сайти — файл cookies → оновлення Firefox → browser cookies"
+                    if self._voicechat_browser() is not None
+                    else "файл cookies → оновлення Firefox → browser cookies"
+                ),
             )
         )
 
@@ -4474,7 +4631,8 @@ class VideoDownloaderMod(loader.Module):
             f"├ FFmpeg: {mark(executable('ffmpeg', self.config.get('ffmpeg_path', '')))}\n"
             f"└ ffprobe: {mark(executable('ffprobe'))}\n\n"
             f"<b>Cookies</b>\n├ File: {mark(os.path.isfile(manager.cookies_file))} <code>{utils.escape_html(manager.cookies_file)}</code>\n"
-            f"{domain_lines}\n└ Firefox DB: {mark(manager.firefox_profile_valid())}\n\n"
+            f"{domain_lines}\n├ Firefox DB: {mark(manager.firefox_profile_valid())}\n"
+            f"└ VoiceChat: {self._voicechat_status()}\n\n"
             f"<b>Firefox</b>\n├ Binary: {mark(firefox)} <code>{utils.escape_html(firefox or 'not found')}</code>\n"
             f"├ Profile: <code>{utils.escape_html(manager.firefox_profile or 'not configured')}</code>\n"
             f"└ User: <code>{utils.escape_html(manager.browser_user)}</code>\n\n"

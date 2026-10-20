@@ -11,6 +11,7 @@ sys.path[:] = [entry for entry in sys.path if entry not in ("", str(_REPO))]
 
 import asyncio
 import tempfile
+import time
 import types
 import unittest
 import unittest.mock
@@ -595,6 +596,171 @@ class MediaInfoTests(unittest.IsolatedAsyncioTestCase):
         suffix = module._source_suffix("https://x.com/a?b=1&c=2", "X/Twitter")
         self.assertIn('href="https://x.com/a?b=1&amp;c=2"', suffix)
         self.assertIn("X/Twitter", suffix)
+
+
+class _FakeBrowser:
+    """The part of VoiceChat's BrowserSession that VideoDownloader uses."""
+
+    def __init__(self, cookie_file, logged_in=True, age=3600):
+        self.cookie_file = cookie_file
+        self.configured = True
+        self.lock = asyncio.Lock()
+        self.logged_in = logged_in
+        self._age = age
+        self.refreshes = 0
+
+    def has_session(self):
+        return self.logged_in and os.path.isfile(self.cookie_file)
+
+    def age(self):
+        return self._age
+
+    async def refresh(self):
+        self.refreshes += 1
+        self._age = 0
+
+    def record_error(self, error):
+        pass
+
+
+def _voicechat(browser, enabled=True):
+    return types.SimpleNamespace(_browser=browser, _browser_enabled=lambda: enabled)
+
+
+class VoiceChatSessionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        _install_utils()
+        self.directory = tempfile.TemporaryDirectory()
+        self.cwd = os.getcwd()
+        os.chdir(self.directory.name)
+        self.session = os.path.join(self.directory.name, "vc_cookies.txt")
+        pathlib.Path(self.session).write_text(
+            ".youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tv\n"
+        )
+        self.own = os.path.join(self.directory.name, "own.txt")
+        pathlib.Path(self.own).write_text(
+            ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tmine\n"
+            ".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tig\n"
+        )
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        self.directory.cleanup()
+
+    def _module(self, voicechat=None):
+        module = _module(cookies_file=self.own, firefox_profile="", browser_user="")
+        module.lookup = lambda name: voicechat if name == "VoiceChat" else None
+        return module
+
+    def test_youtube_uses_a_copy_of_the_voicechat_session(self):
+        module = self._module(_voicechat(_FakeBrowser(self.session)))
+        first = module._download_cookies("https://youtu.be/x")
+        second = module._download_cookies("https://youtu.be/x")
+        self.assertNotIn(first, (self.session, self.own))
+        self.assertNotEqual(first, second)
+        self.assertEqual(pathlib.Path(first).read_text(), pathlib.Path(self.session).read_text())
+        # Other sites and VoiceChat's own lookup keep the module's file.
+        self.assertEqual(module._download_cookies("https://instagram.com/p/x"), self.own)
+        self.assertEqual(module._cookies_for("https://youtu.be/x"), self.own)
+
+    def test_own_cookies_without_a_voicechat_session(self):
+        for voicechat in (
+            None,
+            _voicechat(_FakeBrowser(self.session), enabled=False),
+            _voicechat(_FakeBrowser(self.session, logged_in=False)),
+        ):
+            module = self._module(voicechat)
+            self.assertEqual(module._download_cookies("https://youtu.be/x"), self.own)
+
+    def test_old_session_copies_are_removed(self):
+        module = self._module(_voicechat(_FakeBrowser(self.session)))
+        old = module._download_cookies("https://youtu.be/x")
+        stale = time.time() - vdlt.VOICECHAT_COOKIE_TTL - 10
+        os.utime(old, (stale, stale))
+        module._download_cookies("https://youtu.be/x")
+        self.assertFalse(os.path.exists(old))
+
+    async def test_bot_check_renews_voicechat_session_instead_of_firefox(self):
+        browser = _FakeBrowser(self.session)
+        module = self._module(_voicechat(browser))
+        module._refresh_firefox_cookies_sync = unittest.mock.Mock(return_value=True)
+        seen = []
+
+        def cli(url, base, audio, browser_retry=False):
+            seen.append((module._youtube_cookie_candidates(url)[0][0], browser_retry))
+            return ["video.mp4"]
+
+        module._run_ytdlp_cli_sync = cli
+        result = await module._dl_with_refreshed_browser("https://youtu.be/x", "b", False)
+
+        self.assertEqual(result, ["video.mp4"])
+        self.assertEqual(browser.refreshes, 1)
+        module._refresh_firefox_cookies_sync.assert_not_called()
+        cookies, browser_retry = seen[0]
+        self.assertFalse(browser_retry)
+        self.assertIn("voicechat_cookies", cookies)
+
+    async def test_fresh_session_is_not_renewed_again(self):
+        browser = _FakeBrowser(self.session, age=10)
+        module = self._module(_voicechat(browser))
+        module._run_ytdlp_cli_sync = unittest.mock.Mock()
+        self.assertIsNone(
+            await module._dl_with_refreshed_browser("https://youtu.be/x", "b", False)
+        )
+        self.assertEqual(browser.refreshes, 0)
+        module._run_ytdlp_cli_sync.assert_not_called()
+
+    async def test_running_refresh_is_awaited_not_repeated(self):
+        browser = _FakeBrowser(self.session)
+        module = self._module(_voicechat(browser))
+        await browser.lock.acquire()
+        waiting = asyncio.ensure_future(module._refresh_voicechat_session(browser))
+        await asyncio.sleep(0)
+        self.assertFalse(waiting.done())
+        browser.lock.release()
+        self.assertTrue(await waiting)
+        self.assertEqual(browser.refreshes, 0)
+
+    def _accounts(self, module, *others):
+        """Put ``module`` on account 1 and the given VoiceChats on 2, 3…"""
+        own = types.SimpleNamespace()
+        clients = [types.SimpleNamespace(tg_id=1, loader=own)]
+        for number, voicechat in enumerate(others, 2):
+            loader = types.SimpleNamespace(
+                lookup=lambda name, vc=voicechat: vc if name == "VoiceChat" else False
+            )
+            clients.append(types.SimpleNamespace(tg_id=number, loader=loader))
+        own.allclients = clients
+        module.allmodules = own
+
+    def test_voicechat_on_another_account_is_used(self):
+        browser = _FakeBrowser(self.session)
+        module = self._module()
+        self._accounts(module, None, _voicechat(browser))
+        self.assertIs(module._voicechat_browser(), browser)
+        cookies = module._download_cookies("https://youtu.be/x")
+        self.assertIn("voicechat_cookies", cookies)
+        self.assertIn("<code>3</code>", module._voicechat_status())
+
+    def test_this_account_and_logged_in_sessions_win(self):
+        local = _FakeBrowser(self.session)
+        other = _FakeBrowser(self.session)
+        module = self._module(_voicechat(local))
+        self._accounts(module, _voicechat(other))
+        self.assertIs(module._voicechat_browser(), local)
+        self.assertNotIn("<code>", module._voicechat_status())
+
+        local.logged_in = False
+        self.assertIs(module._voicechat_browser(), other)
+
+    async def test_other_sites_still_use_firefox(self):
+        module = self._module(_voicechat(_FakeBrowser(self.session)))
+        module._refresh_firefox_cookies_sync = unittest.mock.Mock(return_value=False)
+        result = await module._dl_with_refreshed_browser(
+            "https://instagram.com/p/x", "b", False
+        )
+        self.assertIsNone(result)
+        module._refresh_firefox_cookies_sync.assert_called_once()
 
 
 if __name__ == "__main__":
