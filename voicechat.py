@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 2.5.0
+# meta version: 2.6.0
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -113,7 +113,15 @@ INFO_CACHE_TTL = 30 * 60  # reuse a resolved link for this long
 INFO_CACHE_SIZE = 64
 SAVE_EVERY = 60.0  # the playback position is saved at most this often
 PREBUFFER_MIN = 3  # seconds, when Telegram downloads twice as fast as needed
-LANCZOS_FROM = 1.5  # downscale ratio from which lanczos is worth its CPU
+# Scaling is done after the frame rate is lowered (the "fps" filter drops
+# frames first), and with bilinear: lanczos cost several times more CPU for
+# a difference nobody sees after the call's own video compression.
+SCALE_FLAGS = "bilinear"
+# Automatic quality also watches this module's own CPU (Hikka, which encodes
+# the video inside ntgcalls, plus its ffmpeg processes), in percent of one
+# core: on a many-core server the whole system rarely looks busy even when
+# the stream eats two cores.  ``cpu_limit`` config, 0 turns it off.
+DEFAULT_CPU_LIMIT = 150
 WARM_UP_DELAY = 20.0
 # Radio: music posts read from a channel and played round and round.
 RADIO_SKIP = 10  # deleted / non-audio posts skipped in a row before giving up
@@ -1332,8 +1340,8 @@ class VoiceChatMod(loader.Module):
         "cfg_video_quality": (
             "Максимальна якість відео: 4k, 1440p, 1080p, 720p, 480p, 360p. "
             "Береться найкраща якість джерела, але не вище цієї. Відео "
-            "кодується на сервері в реальному часі: вище 1080p потрібен "
-            "дуже потужний процесор, інакше картинка зависатиме"
+            "кодується на сервері в реальному часі: 1080p вже займає близько "
+            "двох ядер, вище — потрібен дуже потужний процесор"
         ),
         "cfg_max_fps": "Макс. кадрів за секунду (30 або 60; 60 — удвічі більше навантаження)",
         "cfg_video_mode": (
@@ -1468,6 +1476,11 @@ class VoiceChatMod(loader.Module):
             "Автоматично знижувати роздільність, якщо процесор не встигає "
             "(і повертати, коли звільниться)"
         ),
+        "cfg_cpu_limit": (
+            "Авто-якість: знижувати роздільність, коли модуль (Hikka з "
+            "кодуванням + ffmpeg) займає більше стількох % одного ядра "
+            "(100 = одне ядро; 0 — дивитися лише на завантаження всього сервера)"
+        ),
         "cfg_decode_threads": (
             "Потоків на декодування відео (0 — половина ядер; менше потоків "
             "лишає більше процесора для кодування в дзвінок)"
@@ -1478,10 +1491,12 @@ class VoiceChatMod(loader.Module):
             "Процесор сервера: <b>{system}%</b> ({cores} ядер), load {load}\n"
             "Hikka (з кодуванням відео в дзвінок): <b>{hikka}%</b>\n"
             "ffmpeg (декодування): <b>{ffmpeg}%</b> · процесів: {processes}\n"
+            "Модуль разом: <b>{own}%</b> одного ядра{limit}\n"
             "Пам'ять: {memory}\n"
             "{players}\n\n{verdict}"
         ),
         "stats_player": "🎬 {title}\n   {quality}{level}",
+        "stats_limit": " (ліміт авто-якості {}%)",
         "stats_level": " · авто-якість: −{} крок(и)",
         "stats_ok": "🟢 Запас є — відео має йти плавно.",
         "stats_busy": (
@@ -1670,7 +1685,7 @@ class VoiceChatMod(loader.Module):
         self.config = loader.ModuleConfig(
             loader.ConfigValue(
                 "video_quality",
-                "1080p",
+                "720p",
                 lambda: self.strings("cfg_video_quality"),
                 validator=loader.validators.Choice(list(VIDEO_CAPS)),
             ),
@@ -1765,6 +1780,12 @@ class VoiceChatMod(loader.Module):
                 validator=loader.validators.Boolean(),
             ),
             loader.ConfigValue(
+                "cpu_limit",
+                DEFAULT_CPU_LIMIT,
+                lambda: self.strings("cfg_cpu_limit"),
+                validator=loader.validators.Integer(minimum=0, maximum=6400),
+            ),
+            loader.ConfigValue(
                 "decode_threads",
                 0,
                 lambda: self.strings("cfg_decode_threads"),
@@ -1836,6 +1857,7 @@ class VoiceChatMod(loader.Module):
         self._process = None
         self._children = {}
         self._last_system = None
+        self._last_own = None
         self._yt_first = {}
         self._saved_at = 0.0
         self._browser_task = None
@@ -2151,6 +2173,10 @@ class VoiceChatMod(loader.Module):
     def _ydl_options(self, audio_only):
         cap = self.config["video_quality"]
         short_side = VIDEO_CAPS.get(cap, VIDEO_CAPS["1080p"])[1]
+        try:
+            max_fps = int(self.config["max_fps"])
+        except (KeyError, TypeError, ValueError):
+            max_fps = DEFAULT_FPS
         options = {
             "quiet": True,
             "no_warnings": True,
@@ -2161,15 +2187,17 @@ class VoiceChatMod(loader.Module):
         if audio_only:
             options["format"] = "bestaudio/best"
         else:
-            # Best video stream up to the cap plus best audio; SDR and codecs
-            # up to VP9 are preferred because HDR/AV1 at 4K costs a lot of CPU
-            # to decode and colours wash out when HDR is squeezed into yuv420p.
+            # Best video stream up to the cap plus best audio.  A source
+            # above max_fps would be decoded in full only to drop frames, so
+            # the frame rate is capped too.  SDR is preferred (HDR washes
+            # out in yuv420p); H.264 decodes far cheaper than VP9/AV1 and
+            # YouTube has it up to 1080p, above that VP9 is the limit.
             options["format"] = "bv*+ba/b"
             options["format_sort"] = [
                 f"res:{short_side}",
-                "fps",
+                f"fps:{max_fps}",
                 "hdr:sdr",
-                "vcodec:vp9",
+                "vcodec:h264" if short_side <= 1080 else "vcodec:vp9",
             ]
         return options
 
@@ -2831,26 +2859,29 @@ class VoiceChatMod(loader.Module):
 
     # --------------------------------------------------------------- playing
 
-    def _ffmpeg_parameters(self, track, offset=0):
+    def _ffmpeg_parameters(self, track, offset=0, frame=None):
+        """ffmpeg options for py-tgcalls; ``frame`` is (width, height, fps)
+        of the picture sent when the caller knows it exactly."""
         args = []
         if offset and not track.is_live:
             args += ["-ss", str(int(offset))]
         if not track.path:
             args += http_args(track.headers)
             args += hls_args(track.video_url, track.audio_url)
-        if track.has_video and track.width and track.height:
-            out_w, _ = fit_frame(
-                track.width, track.height, self._video_cap(track)
-            )
-            ratio = track.width / max(1, out_w)
-            if ratio >= LANCZOS_FROM:
-                # Output option (after -i): a big downscale is worth lanczos;
-                # small ones look the same with the lighter default.
-                args += ["-atmid", "-sws_flags", "lanczos"]
         if track.has_video:
             # Video decoder threads only ("--video" section, before -i): the
             # rest of the cores stay free for encoding into the call.
             args += ["--video", "-threads", str(self._decode_threads())]
+            if frame is not None:
+                # py-tgcalls scales every decoded frame and only then lets
+                # "-r" throw the extra ones away (half of them for 60 fps).
+                # The last -vf wins, so this one ("-atend") drops frames
+                # first and scales the rest with a cheaper filter.
+                width, height, fps = frame
+                args += [
+                    "-atend", "-an", "-sn", "-dn", "-vf",
+                    f"fps={fps},scale={width}:{height}:flags={SCALE_FLAGS}",
+                ]
         audio = []
         if track.audio_index is not None and len(track.audio_streams) > 1:
             audio += ["-map", f"0:a:{int(track.audio_index)}"]
@@ -2908,7 +2939,13 @@ class VoiceChatMod(loader.Module):
         )
 
         patch_pytgcalls()
-        params = self._ffmpeg_parameters(track, offset)
+        frame = None
+        if track.has_video:
+            width, height = fit_frame(
+                track.width, track.height, self._video_cap(track)
+            )
+            frame = (width, height, self._fps(track))
+        params = self._ffmpeg_parameters(track, offset, frame)
 
         def shell(path, parameters):
             # Strip here too: ``build_command`` may be py-tgcalls' original.
@@ -2929,10 +2966,8 @@ class VoiceChatMod(loader.Module):
                 MediaSource.SHELL, shell(track.audio_url, audio), audio
             )
         if track.has_video:
-            width, height = fit_frame(
-                track.width, track.height, self._video_cap(track)
-            )
-            video = VideoParameters(width, height, self._fps(track), True)
+            width, height, fps = frame
+            video = VideoParameters(width, height, fps, True)
             camera = VideoStream(
                 MediaSource.SHELL, shell(track.video_url, video), video
             )
@@ -3564,6 +3599,8 @@ class VoiceChatMod(loader.Module):
             "cores": cores,
             "hikka": hikka / cores,
             "ffmpeg": ffmpeg / cores,
+            # Both together in percent of one core, like top shows them.
+            "own": hikka + ffmpeg,
             "processes": len(children),
             "load": load,
             "memory": memory,
@@ -3581,7 +3618,8 @@ class VoiceChatMod(loader.Module):
         if sample is None:
             return
         self._last_system = sample["system"]
-        if sample["system"] < OVERLOAD_PERCENT:
+        self._last_own = sample["own"]
+        if not self._overloaded(sample):
             player.overload_hits = 0
             return
         player.overload_hits += 1
@@ -3592,8 +3630,9 @@ class VoiceChatMod(loader.Module):
         player.quality_drop += 1
         track.quality_drop = player.quality_drop
         logger.info(
-            "VoiceChat: CPU at %.0f%%, lowering video to %s",
-            sample["system"], self._video_cap(track),
+            "VoiceChat: CPU at %.0f%% (module %.0f%% of a core), "
+            "lowering video to %s",
+            sample["system"], sample["own"], self._video_cap(track),
         )
         async with player.lock:
             if player.current is track:
@@ -3604,12 +3643,31 @@ class VoiceChatMod(loader.Module):
                 self.strings("quality_down").format(self._video_cap(track)),
             )
 
+    def _cpu_limit(self):
+        try:
+            return max(0, int(self.config["cpu_limit"]))
+        except (KeyError, TypeError, ValueError):
+            return DEFAULT_CPU_LIMIT
+
+    def _overloaded(self, sample):
+        limit = self._cpu_limit()
+        return sample["system"] >= OVERLOAD_PERCENT or bool(
+            limit and sample.get("own", 0.0) >= limit
+        )
+
     def _relax_quality(self, player, track):
         """A new track may go one step back up once the CPU has room."""
+        limit = self._cpu_limit()
+        own_calm = (
+            not limit
+            or self._last_own is None
+            or self._last_own < limit * RELAX_PERCENT / OVERLOAD_PERCENT
+        )
         if (
             player.quality_drop > 0
             and self._last_system is not None
             and self._last_system < RELAX_PERCENT
+            and own_calm
         ):
             player.quality_drop -= 1
         track.quality_drop = player.quality_drop
@@ -3626,6 +3684,7 @@ class VoiceChatMod(loader.Module):
         if sample is None:
             return await utils.answer(message, self.strings("stats_unavailable"))
         self._last_system = sample["system"]
+        self._last_own = sample["own"]
         lines = []
         for player in self._players.values():
             if player.current is None:
@@ -3648,7 +3707,8 @@ class VoiceChatMod(loader.Module):
             if memory is not None
             else "—"
         )
-        if sample["system"] >= OVERLOAD_PERCENT:
+        limit = self._cpu_limit()
+        if self._overloaded(sample):
             verdict = self.strings("stats_over")
         elif sample["system"] >= 70:
             verdict = self.strings("stats_busy").format(p=self.get_prefix())
@@ -3663,6 +3723,8 @@ class VoiceChatMod(loader.Module):
                 hikka=round(sample["hikka"]),
                 ffmpeg=round(sample["ffmpeg"]),
                 processes=sample["processes"],
+                own=round(sample["own"]),
+                limit=self.strings("stats_limit").format(limit) if limit else "",
                 memory=memory_text,
                 players="\n".join(lines),
                 verdict=verdict,
