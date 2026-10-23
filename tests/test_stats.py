@@ -1,5 +1,6 @@
 """Regression tests for DailyStat message accounting."""
 
+import asyncio
 import datetime
 import importlib.util
 import pathlib
@@ -135,6 +136,31 @@ class DailyStatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(day["senders"]["2"]["count"], 1)
         self.assertEqual(day["users"]["1"]["id"], 1)
         self.assertEqual(day["users"]["1"]["username"], "alice")
+
+    async def test_message_burst_is_saved_once_after_delay(self):
+        alice = types.SimpleNamespace(id=1, first_name="Alice", username="alice")
+        with mock.patch.object(
+            self.module, "set", wraps=self.module.set
+        ) as set_value, mock.patch.object(stats, "SAVE_DELAY", 0.01):
+            for _ in range(10):
+                await self.module.watcher(_Message(private=True, sender=alice))
+
+            set_value.assert_not_called()
+            day = self.module._get_day(self.module._today_key())
+            self.assertEqual(day["received"], 10)
+
+            await asyncio.sleep(0.05)
+
+        set_value.assert_called_once_with("stats", self.module.get("stats"))
+        self.assertIsNone(self.module._save_handle)
+
+    async def test_pending_counters_are_saved_on_unload(self):
+        self.module._record_message(123, "Private Name", False, hour=10)
+        with mock.patch.object(self.module, "set", wraps=self.module.set) as set_value:
+            await self.module.on_unload()
+
+        set_value.assert_called_once()
+        self.assertIsNone(self.module._save_handle)
 
     async def test_group_and_channel_outgoing_messages_are_counted(self):
         alice = types.SimpleNamespace(id=1, first_name="Alice")

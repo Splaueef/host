@@ -1,7 +1,8 @@
 # meta developer: @Huai_Baike
-# meta version: 2.2.0
+# meta version: 2.2.1
 # meta description: 📊 Статистика вашої активності в Telegram — повідомлення, чати, піки по годинах.
 
+import asyncio
 import datetime
 import logging
 import re
@@ -10,6 +11,11 @@ from .. import loader, utils
 
 
 logger = logging.getLogger(__name__)
+
+# Seconds to collect counters in memory before saving them. Saving makes Hikka
+# serialize the whole history (megabytes after a few months), which used to
+# happen on every message.
+SAVE_DELAY = 5
 
 
 @loader.tds
@@ -101,6 +107,7 @@ class DailyStatMod(loader.Module):
             ),
         )
         self._last_prune = None
+        self._save_handle = None
 
     async def client_ready(self, client, db):
         self._client = client
@@ -277,11 +284,34 @@ class DailyStatMod(loader.Module):
         return normalized
 
     def _save_day(self, key: str, data: dict):
-        stats = self.get("stats", {})
-        if not isinstance(stats, dict):
-            stats = {}
+        stored = self.get("stats", {})
+        stats = stored if isinstance(stored, dict) else {}
         stats[key] = data
-        self.set("stats", stats)
+        # The stored dict is already updated in place, so only its saving is
+        # postponed
+        if stats is not stored or not self._schedule_save():
+            self.set("stats", stats)
+
+    def _schedule_save(self) -> bool:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        if self._save_handle is None:
+            self._save_handle = loop.call_later(SAVE_DELAY, self._flush_stats)
+        return True
+
+    def _flush_stats(self):
+        if self._save_handle is None:
+            return
+        self._save_handle.cancel()
+        self._save_handle = None
+        stats = self.get("stats")
+        if isinstance(stats, dict):
+            self.set("stats", stats)
+
+    async def on_unload(self):
+        self._flush_stats()
 
     @staticmethod
     def _coerce_user_id(user_id):
