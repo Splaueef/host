@@ -1,5 +1,5 @@
 # ©️ Dan Gazizullin, 2021-2023
-# meta version: 1.0.0
+# meta version: 1.1.0
 # This file is a part of Hikka Userbot
 # 🌐 https://github.com/Splaueef/hikka
 # You can redistribute it and/or modify it under the terms of the GNU AGPLv3
@@ -14,14 +14,21 @@ import tempfile
 import typing
 from types import ModuleType
 
-import hikkatl
-from hikkatl.errors.rpcerrorlist import MessageIdInvalidError
-from hikkatl.sessions import StringSession
-from hikkatl.tl.types import Message
+import telethon
+from telethon.errors.rpcerrorlist import MessageIdInvalidError
+from telethon.sessions import StringSession
+from telethon.tl.types import Message
 from meval import meval
 
 from .. import loader, main, utils
 from ..log import HikkaException
+
+
+async def _run(*args, **kwargs) -> str:
+    """Run a program in a thread, so compiling or running code doesn't freeze the userbot"""
+    return (
+        await utils.run_sync(subprocess.check_output, *args, **kwargs)
+    ).decode()
 
 
 class Brainfuck:
@@ -147,6 +154,7 @@ class Evaluator(loader.Module):
     """Виконує (оцінює) код різними мовами програмування."""
 
     strings = {"name": "Evaluator"}
+    _tl_cache = None
 
     @loader.command(alias="eval")
     async def e(self, message: Message):
@@ -194,7 +202,7 @@ class Evaluator(loader.Module):
     @loader.command()
     async def ecpp(self, message: Message, c: bool = False):
         try:
-            subprocess.check_output(
+            await _run(
                 ["gcc" if c else "g++", "--version"],
                 stderr=subprocess.STDOUT,
             )
@@ -217,22 +225,22 @@ class Evaluator(loader.Module):
                 f.write(code)
 
             try:
-                result = subprocess.check_output(
+                result = await _run(
                     ["gcc" if c else "g++", "-o", "code", "code.cpp"],
                     cwd=tmpdir,
                     stderr=subprocess.STDOUT,
-                ).decode()
+                )
             except subprocess.CalledProcessError as e:
                 result = e.output.decode()
                 error = True
 
             if not result:
                 try:
-                    result = subprocess.check_output(
+                    result = await _run(
                         ["./code"],
                         cwd=tmpdir,
                         stderr=subprocess.STDOUT,
-                    ).decode()
+                    )
                 except subprocess.CalledProcessError as e:
                     result = e.output.decode()
                     error = True
@@ -254,7 +262,7 @@ class Evaluator(loader.Module):
     @loader.command()
     async def enode(self, message: Message):
         try:
-            subprocess.check_output(
+            await _run(
                 ["node", "--version"],
                 stderr=subprocess.STDOUT,
             )
@@ -276,11 +284,11 @@ class Evaluator(loader.Module):
                 f.write(code)
 
             try:
-                result = subprocess.check_output(
+                result = await _run(
                     ["node", "code.js"],
                     cwd=tmpdir,
                     stderr=subprocess.STDOUT,
-                ).decode()
+                )
             except subprocess.CalledProcessError as e:
                 result = e.output.decode()
                 error = True
@@ -298,7 +306,7 @@ class Evaluator(loader.Module):
     @loader.command()
     async def ephp(self, message: Message):
         try:
-            subprocess.check_output(
+            await _run(
                 ["php", "--version"],
                 stderr=subprocess.STDOUT,
             )
@@ -320,11 +328,11 @@ class Evaluator(loader.Module):
                 f.write(f"<?php {code} ?>")
 
             try:
-                result = subprocess.check_output(
+                result = await _run(
                     ["php", "code.php"],
                     cwd=tmpdir,
                     stderr=subprocess.STDOUT,
-                ).decode()
+                )
             except subprocess.CalledProcessError as e:
                 result = e.output.decode()
                 error = True
@@ -342,7 +350,7 @@ class Evaluator(loader.Module):
     @loader.command()
     async def eruby(self, message: Message):
         try:
-            subprocess.check_output(
+            await _run(
                 ["ruby", "--version"],
                 stderr=subprocess.STDOUT,
             )
@@ -364,11 +372,11 @@ class Evaluator(loader.Module):
                 f.write(code)
 
             try:
-                result = subprocess.check_output(
+                result = await _run(
                     ["ruby", "code.rb"],
                     cwd=tmpdir,
                     stderr=subprocess.STDOUT,
-                ).decode()
+                )
             except subprocess.CalledProcessError as e:
                 result = e.output.decode()
                 error = True
@@ -449,22 +457,32 @@ class Evaluator(loader.Module):
             "client": self._client,
             "reply": reply,
             "r": reply,
-            **self.get_sub(hikkatl.tl.types),
-            **self.get_sub(hikkatl.tl.functions),
+            **self._tl_namespace(),
             "event": message,
             "chat": message.to_id,
-            "hikkatl": hikkatl,
-            "telethon": hikkatl,
+            "hikkatl": telethon,
+            "telethon": telethon,
             "utils": utils,
             "main": main,
             "loader": loader,
-            "f": hikkatl.tl.functions,
+            "f": telethon.tl.functions,
             "c": self._client,
             "m": message,
             "lookup": self.lookup,
             "self": self,
             "db": self.db,
         }
+
+    def _tl_namespace(self) -> dict:
+        # Walking every TL type and function takes a while, and the result
+        # never changes, so build it on the first eval only
+        if self._tl_cache is None:
+            self._tl_cache = {
+                **self.get_sub(telethon.tl.types),
+                **self.get_sub(telethon.tl.functions),
+            }
+
+        return self._tl_cache
 
     def get_sub(self, obj: typing.Any, _depth: int = 1) -> dict:
         """Get all callable capitalised objects in an object recursively, ignoring _*"""
@@ -485,7 +503,7 @@ class Evaluator(loader.Module):
                             lambda x: x[0][0] != "_"
                             and isinstance(x[1], ModuleType)
                             and x[1] != obj
-                            and x[1].__package__.rsplit(".", _depth)[0] == "hikkatl.tl",
+                            and x[1].__package__.rsplit(".", _depth)[0] == "telethon.tl",
                             obj.__dict__.items(),
                         )
                     ]
