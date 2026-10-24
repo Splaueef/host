@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 2.6.1
+# meta version: 2.8.0
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -90,6 +90,11 @@ MAX_RECOVERIES = 3
 OVERLOAD_PERCENT = 90.0
 OVERLOAD_SAMPLES = 2  # ticks in a row (PANEL_REFRESH apart)
 RELAX_PERCENT = 55.0  # below this a new track may step back up
+# Stepping back up multiplies the encoding cost by the pixel ratio (360p →
+# 480p ≈ ×1.8): a new track goes up only when the load measured at the
+# current quality, scaled so, stays under this share of the limit.
+# Otherwise every track would start high, overload and step down again.
+RELAX_HEADROOM = 0.8
 QUALITY_STEPS = ("4k", "1440p", "1080p", "720p", "480p", "360p")
 PANEL_REFRESH = 15.0
 # Hikka's inline.form() posts the panel and then waits, with no time limit,
@@ -1268,6 +1273,51 @@ class Track:
         return not self.audio_only and bool(self.video_url)
 
 
+class BotPanel:
+    """A panel posted by the inline bot itself (Bot API sendMessage).
+
+    Stands in for Hikka's InlineMessage when the inline query fails: edit()
+    and delete() go through the Bot API with the chat and message IDs.
+    """
+
+    inline_message_id = None  # so the rich panel (inline-only) is not tried
+
+    def __init__(self, module, player, message_id):
+        self._module = module
+        self._player = player
+        self.chat_id = player.chat_id
+        self.message_id = message_id
+
+    async def edit(self, text, reply_markup=None):
+        payload = {
+            "chat_id": self.chat_id,
+            "message_id": self.message_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = self._module._bot_keyboard(
+                self._player, reply_markup
+            )
+        try:
+            data = await self._module._bot_api("editMessageText", payload)
+        except Exception as error:
+            logger.debug("VoiceChat bot panel edit failed: %s", error)
+            return False
+        if isinstance(data, dict) and data.get("ok"):
+            return True
+        description = str(data.get("description") if isinstance(data, dict) else data)
+        return "not modified" in description.lower() or False
+
+    async def delete(self):
+        with contextlib.suppress(Exception):
+            await self._module._bot_api(
+                "deleteMessage",
+                {"chat_id": self.chat_id, "message_id": self.message_id},
+            )
+
+
 class Player:
     """Per-chat playback state."""
 
@@ -1684,6 +1734,13 @@ class VoiceChatMod(loader.Module):
             "→ {bot} → <b>Enabled</b>, потім <code>{p}vcnow</code>."
         ),
         "inline_your_bot": "бот Hikka",
+        "bot_panel_hint": (
+            "⚠️ <b>Панель з кнопками недоступна</b>: inline-бот Hikka не "
+            "відповідає на запит панелі, а надіслати її сам не може, бо його "
+            "немає в цьому чаті. Поки що панель текстова, керуйте командами.\n"
+            "Щоб повернути кнопки, додайте {bot} у групу (можна без прав "
+            "адміністратора), потім <code>{p}vcnow</code>."
+        ),
     }
 
     def __init__(self):
@@ -1872,6 +1929,8 @@ class VoiceChatMod(loader.Module):
         self._inline_broken = False
         self._inline_hint_sent = False
         self._panel_retry_at = 0.0
+        self._bot_panel_broken = False
+        self._bot_hint_sent = False
         self._rich_broken = False
 
     async def client_ready(self, client, db):
@@ -2145,6 +2204,8 @@ class VoiceChatMod(loader.Module):
             with contextlib.suppress(TypeError, ValueError):
                 player.volume = max(1, min(200, int(settings.get("volume") or 100)))
             player.radio = bool(settings.get("radio"))
+            if self.config["auto_quality"]:
+                player.quality_drop = self._saved_drop(settings)
             player.radio_channel = settings.get("radio_channel") or None
             player.radio_last = settings.get("radio_last")
         return player
@@ -2899,14 +2960,7 @@ class VoiceChatMod(loader.Module):
 
     def _video_cap(self, track):
         """The configured quality cap, lowered by automatic quality steps."""
-        cap = self.config["video_quality"]
-        if cap not in QUALITY_STEPS:
-            cap = "1080p"
-        index = min(
-            len(QUALITY_STEPS) - 1,
-            QUALITY_STEPS.index(cap) + max(0, int(track.quality_drop)),
-        )
-        return QUALITY_STEPS[index]
+        return self._cap_after(track.quality_drop)
 
     def _decode_threads(self):
         configured = int(self.config["decode_threads"] or 0)
@@ -3635,6 +3689,7 @@ class VoiceChatMod(loader.Module):
         player.overload_hits = 0
         player.quality_drop += 1
         track.quality_drop = player.quality_drop
+        self._store_quality(player)
         logger.info(
             "VoiceChat: CPU at %.0f%% (module %.0f%% of a core), "
             "lowering video to %s",
@@ -3661,22 +3716,55 @@ class VoiceChatMod(loader.Module):
             limit and sample.get("own", 0.0) >= limit
         )
 
+    def _step_up_cost(self, player):
+        """How many times more pixels one step back up encodes."""
+        current = self._cap_after(player.quality_drop)
+        higher = self._cap_after(player.quality_drop - 1)
+        width, height = VIDEO_CAPS[current]
+        up_width, up_height = VIDEO_CAPS[higher]
+        return (up_width * up_height) / float(width * height)
+
     def _relax_quality(self, player, track):
-        """A new track may go one step back up once the CPU has room."""
-        limit = self._cpu_limit()
-        own_calm = (
-            not limit
-            or self._last_own is None
-            or self._last_own < limit * RELAX_PERCENT / OVERLOAD_PERCENT
-        )
-        if (
-            player.quality_drop > 0
-            and self._last_system is not None
-            and self._last_system < RELAX_PERCENT
-            and own_calm
-        ):
-            player.quality_drop -= 1
+        """A new track may go one step back up once the CPU has room for it."""
+        if player.quality_drop > 0 and self._last_system is not None:
+            cost = self._step_up_cost(player)
+            limit = self._cpu_limit()
+            own_fits = (
+                not limit
+                or self._last_own is None
+                or self._last_own * cost < limit * RELAX_HEADROOM
+            )
+            if (
+                self._last_system < RELAX_PERCENT
+                and self._last_system * cost < OVERLOAD_PERCENT * RELAX_HEADROOM
+                and own_fits
+            ):
+                player.quality_drop -= 1
+                self._store_quality(player)
         track.quality_drop = player.quality_drop
+
+    def _cap_after(self, drop):
+        cap = self.config["video_quality"]
+        if cap not in QUALITY_STEPS:
+            cap = "1080p"
+        index = QUALITY_STEPS.index(cap) + max(0, int(drop))
+        return QUALITY_STEPS[min(len(QUALITY_STEPS) - 1, index)]
+
+    def _store_quality(self, player):
+        """Remember the quality this server manages for the chat (restarts too)."""
+        self._store_settings(
+            player.chat_id,
+            video_cap=self._cap_after(player.quality_drop) if player.quality_drop else None,
+        )
+
+    def _saved_drop(self, settings):
+        """Steps below video_quality that the saved quality stands for."""
+        cap, saved = self.config["video_quality"], settings.get("video_cap")
+        if cap not in QUALITY_STEPS:
+            cap = "1080p"
+        if saved not in QUALITY_STEPS:
+            return 0
+        return max(0, QUALITY_STEPS.index(saved) - QUALITY_STEPS.index(cap))
 
     @loader.group_member
     @loader.command(ru_doc="Навантаження сервера й чи встигає відео")
@@ -4205,37 +4293,24 @@ class VoiceChatMod(loader.Module):
 
     async def _show_panel(self, player, status=None):
         """Post a fresh control panel (replacing ``status`` if given)."""
-        if player.current is None or self._inline_broken:
-            return False
-        if time.monotonic() < self._panel_retry_at:
+        if player.current is None:
             return False
         old = player.panel
         text = self._panel_text(player)
-        posted_at = time.time()
-        task = asyncio.ensure_future(
-            self.inline.form(
-                text,
-                message=status if status is not None else player.chat_id,
-                reply_markup=self._panel_markup(player),
-                disable_security=True,
-                silent=True,
-            )
-        )
-        try:
-            panel = await asyncio.wait_for(task, PANEL_TIMEOUT)
-        except asyncio.TimeoutError:
-            await self._delete_stray_panel(player.chat_id, posted_at)
-            await self._inline_failed(player, "no chosen_inline_result")
-            return False
-        except Exception as error:
-            logger.info("VoiceChat panel unavailable: %s", error)
-            self._panel_retry_at = time.monotonic() + PANEL_RETRY
-            return False
-        if not panel:
-            logger.info("VoiceChat: Hikka could not post the panel, using text")
-            self._panel_retry_at = time.monotonic() + PANEL_RETRY
-            await self._delete_invoke_error(player.chat_id, posted_at, status)
-            return False
+        panel = None
+        tried = not self._inline_broken and time.monotonic() >= self._panel_retry_at
+        if tried:
+            panel = await self._inline_panel(player, status, text)
+        if panel is None:
+            # Hikka's inline panel is unavailable: the bot posts it itself.
+            panel = await self._post_bot_panel(player, text)
+            if panel is None:
+                if tried and self._inline_broken:
+                    await self._inline_failed(player, "no chosen_inline_result")
+                return False
+            if status is not None and getattr(status, "out", False):
+                with contextlib.suppress(Exception):
+                    await status.delete()  # as Hikka does with its own panel
         player.panel = panel
         player.last_panel_text = text
         player.panel_failures = 0
@@ -4251,6 +4326,107 @@ class VoiceChatMod(loader.Module):
                 await self._client.delete_messages(player.chat_id, player.now_message)
             player.now_message = None
         return True
+
+    async def _inline_panel(self, player, status, text):
+        """The panel through Hikka's inline.form(); None when it failed."""
+        posted_at = time.time()
+        task = asyncio.ensure_future(
+            self.inline.form(
+                text,
+                message=status if status is not None else player.chat_id,
+                reply_markup=self._panel_markup(player),
+                disable_security=True,
+                silent=True,
+            )
+        )
+        try:
+            panel = await asyncio.wait_for(task, PANEL_TIMEOUT)
+        except asyncio.TimeoutError:
+            await self._delete_stray_panel(player.chat_id, posted_at)
+            logger.warning(
+                "VoiceChat: no chosen_inline_result for the inline panel "
+                "(inline feedback is off in @BotFather)"
+            )
+            self._inline_broken = True
+            return None
+        except Exception as error:
+            logger.info("VoiceChat panel unavailable: %s", error)
+            self._panel_retry_at = time.monotonic() + PANEL_RETRY
+            return None
+        if not panel:
+            logger.warning(
+                "VoiceChat: Hikka could not post the inline panel (see the "
+                "traceback above, e.g. 'No query results')"
+            )
+            self._panel_retry_at = time.monotonic() + PANEL_RETRY
+            await self._delete_invoke_error(player.chat_id, posted_at, status)
+            return None
+        return panel
+
+    async def _post_bot_panel(self, player, text):
+        """The panel as the inline bot's own message in the chat.
+
+        Needs no inline query and no inline feedback, only the bot in the
+        group.  None when it cannot post there (then the text panel is used).
+        """
+        if self._bot_panel_broken or not self._bot_token():
+            return None
+        if not callable(getattr(self.inline, "generate_markup", None)):
+            return None
+        markup = self._panel_markup(player)
+        try:
+            data = await self._bot_api(
+                "sendMessage",
+                {
+                    "chat_id": player.chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                    "disable_notification": True,
+                    "reply_markup": self._bot_keyboard(player, markup),
+                },
+            )
+        except Exception as error:
+            logger.info("VoiceChat: the bot could not post the panel: %s", error)
+            return None
+        result = data.get("result") if isinstance(data, dict) else None
+        if not (isinstance(data, dict) and data.get("ok")) or not isinstance(result, dict):
+            description = (
+                data.get("description") if isinstance(data, dict) else data
+            )
+            logger.warning(
+                "VoiceChat: the bot cannot post the panel here (%s), using text",
+                description,
+            )
+            self._bot_panel_broken = True
+            if not self._bot_hint_sent:
+                self._bot_hint_sent = True
+                bot = getattr(self.inline, "bot_username", None)
+                with contextlib.suppress(Exception):
+                    await self._client.send_message(
+                        player.chat_id,
+                        self.strings("bot_panel_hint").format(
+                            bot=f"@{bot}" if bot else self.strings("inline_your_bot"),
+                            p=self.get_prefix(),
+                        ),
+                    )
+            return None
+        return BotPanel(self, player, result.get("message_id"))
+
+    def _bot_keyboard(self, player, markup):
+        """Bot API reply_markup for the panel buttons (Hikka runs them)."""
+        if not markup:
+            return {"inline_keyboard": []}
+        self._rich_callbacks(player, markup)
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": button["text"], "callback_data": button["_callback_data"]}
+                    for button in row
+                ]
+                for row in markup
+            ]
+        }
 
     async def _delete_stray_panel(self, chat_id, since):
         """Remove the panel Hikka posted but never handed over."""
@@ -5112,6 +5288,7 @@ class VoiceChatMod(loader.Module):
             return
         self._inline_broken = False  # e.g. inline feedback was switched on
         self._panel_retry_at = 0.0
+        self._bot_panel_broken = False  # e.g. the bot was added to the group
         if self._panel_enabled() and await self._show_panel(player, message):
             return
         if self._panel_enabled() and player.now_message is not None:

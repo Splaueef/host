@@ -366,6 +366,28 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
         await self.module._install_module("minigames", "me")
         self.module.invoke.assert_awaited_once()
 
+    async def test_without_hikkanet_versions_come_from_github(self):
+        games = _loaded("MiniGamesMod", {})
+        games.__version__ = (1, 3, 0)
+        self.module.allmodules.modules = [games]
+        manifest = {f: "1.0.0" for f in self.module.REPO_FILES.values()}
+        manifest["minigames.py"] = "1.4.0"
+        self.module._fetch_github_manifest = mock.AsyncMock(
+            return_value=(manifest, {})
+        )
+
+        async def invoke(command, source, peer=None):
+            games.__version__ = (1, 4, 0)
+
+        self.module.invoke = invoke
+        report = await self.module.check_module_updates(peer="me")
+        self.assertEqual(report["source"], "github")
+        self.assertEqual([item["key"] for item in report["updated"]], ["minigames"])
+
+        self.module.config["github_fallback"] = False
+        with self.assertRaises(RuntimeError):
+            await self.module.check_module_updates(peer="me")
+
     def test_catalog_ids_follow_hikka_hub_naming(self):
         self.assertEqual(self.module._catalog_module_id("sysinfo"), "info")
         self.assertEqual(self.module._catalog_module_id("vdlt"), "videodownloader")

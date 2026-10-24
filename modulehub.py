@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 3.7.0
+# meta version: 3.7.1
 # meta description: 🧭 Центр команд, автооновлення та синхронізація статистики Hikka.
 # scope: inline
 # scope: hikka_only
@@ -772,6 +772,37 @@ class ModuleHubMod(loader.Module):
         payload = await network.api_module_versions()
         return self._validate_update_manifest(payload)
 
+    def _github_updates_allowed(self):
+        return (
+            str(self.config["install_source"]) == "github"
+            or bool(self.config["github_fallback"])
+        )
+
+    async def _fetch_github_manifest(self):
+        """module_versions.json from the repository (no HikkaNet needed)."""
+        import aiohttp
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as session:
+            async with session.get(f"{self.REPO_BASE}/module_versions.json") as response:
+                if response.status != 200:
+                    raise RuntimeError(
+                        f"GitHub не віддав module_versions.json (HTTP {response.status})"
+                    )
+                payload = await response.json(content_type=None)
+        if isinstance(payload, dict):
+            payload = {**payload, "repository": self.UPDATE_REPOSITORY}
+        return self._validate_update_manifest(payload)
+
+    async def _fetch_update_manifest(self):
+        """Versions from HikkaNet, or from GitHub when HikkaNet is not set up."""
+        if self._network_module() is not None:
+            return (*await self._fetch_network_manifest(), "hikkanet")
+        if not self._github_updates_allowed():
+            raise RuntimeError("HikkaNet не налаштовано, а github_fallback вимкнено")
+        return (*await self._fetch_github_manifest(), "github")
+
     def _excluded_update_keys(self):
         raw_values = list(self.config["auto_update_exclude"] or [])
         excluded = set()
@@ -799,7 +830,7 @@ class ModuleHubMod(loader.Module):
         if self._update_lock.locked():
             raise RuntimeError("Перевірка оновлень уже виконується")
         async with self._update_lock:
-            manifest, manifest_changes = await self._fetch_network_manifest()
+            manifest, manifest_changes, source = await self._fetch_update_manifest()
             stored = self._storage_get("modulehub_versions", {})
             stored = dict(stored) if isinstance(stored, dict) else {}
             excluded = self._excluded_update_keys()
@@ -813,7 +844,7 @@ class ModuleHubMod(loader.Module):
             candidates = []
             report = {
                 "checked_at": int(time.time()),
-                "source": "hikkanet",
+                "source": source,
                 "checked": 0,
                 "current": 0,
                 "available": [],
@@ -1038,11 +1069,14 @@ class ModuleHubMod(loader.Module):
                             "modulehub_last_update_reconcile", now
                         )
                         await self._notify_update_report(report)
-                    event_report = await self._poll_module_update_events(
-                        peer="me"
-                    )
-                    if event_report is not None:
-                        await self._notify_update_report(event_report)
+                    # Update events come only through HikkaNet; without it
+                    # the hourly check above reads the versions from GitHub.
+                    if self._network_module() is not None:
+                        event_report = await self._poll_module_update_events(
+                            peer="me"
+                        )
+                        if event_report is not None:
+                            await self._notify_update_report(event_report)
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
