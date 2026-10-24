@@ -2201,3 +2201,52 @@ class FailedPanelTest(unittest.IsolatedAsyncioTestCase):
         calls = self.mod.inline.calls
         await self.mod._show_panel(self._player())
         self.assertEqual(self.mod.inline.calls, calls)
+
+    def _bot(self, answer):
+        self.mod.inline._token = "123:abc"
+        self.mod.inline.bot_username = "hikka_test_bot"
+        self.mod.inline.generate_markup = _RichInline.generate_markup.__get__(
+            self.mod.inline
+        )
+        self.mod.inline.custom_map = {}
+        self.sent = []
+
+        async def call(method, payload):
+            self.sent.append((method, payload))
+            return answer(method)
+
+        self.mod._bot_api = call
+
+    async def test_the_bot_posts_the_panel_when_the_inline_query_fails(self):
+        self._bot(lambda method: {"ok": True, "result": {"message_id": 555}})
+        await self.mod.vcplay(_Message("https://a"))
+        player = self._player()
+        self.assertIsInstance(player.panel, voicechat.BotPanel)
+        method, payload = self.sent[0]
+        self.assertEqual(method, "sendMessage")
+        self.assertEqual(payload["chat_id"], CHAT)
+        data = [b["callback_data"] for row in payload["reply_markup"]["inline_keyboard"] for b in row]
+        self.assertTrue(all(d in self.mod.inline.custom_map for d in data))
+        # The panel is edited by message ID, without new inline attempts.
+        calls = self.mod.inline.calls
+        player.started_at -= 30
+        await self.mod._update_panel(player)
+        method, payload = self.sent[-1]
+        self.assertEqual(method, "editMessageText")
+        self.assertEqual(payload["message_id"], 555)
+        self.assertIn("0:30", payload["text"])
+        self.assertEqual(self.mod.inline.calls, calls)
+
+    async def test_hint_when_the_bot_is_not_in_the_group(self):
+        self._bot(
+            lambda method: {"ok": False, "description": "Bad Request: chat not found"}
+        )
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcnow(_Message())
+        self.assertIsNone(self._player().panel)
+        hints = [
+            c.args[1]
+            for c in self.mod._client.send_message.await_args_list
+            if "@hikka_test_bot" in c.args[1]
+        ]
+        self.assertEqual(len(hints), 1)
