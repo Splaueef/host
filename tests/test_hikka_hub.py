@@ -21,6 +21,10 @@ from hikka_hub.security import derive_hmac_key, sign_with_secret
 from hikka_hub.storage import Store
 
 
+async def _raise():
+    raise RuntimeError("offline")
+
+
 class HikkaHubApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -801,6 +805,60 @@ class HikkaHubApiTests(unittest.IsolatedAsyncioTestCase):
             app, {"hello.py": "1.5.0"}, fetch
         )
         self.assertEqual(imported[0]["previous_version"], "1.4.0")
+
+
+    async def test_import_retries_and_repairs_entries_of_the_old_reader(self):
+        app = self.client.server.app
+        truncated = self.MODULE_SOURCE.split("    async def byecmd")[0]
+        full = self.MODULE_SOURCE
+        current = {"source": truncated}
+
+        async def fetch(filename):
+            return current["source"]
+
+        await _import_official_modules(app, {"hello.py": "1.0.0"}, fetch)
+        await _import_official_modules(app, {"broken.py": "1.0.0"}, lambda name: _raise())
+        state = (await self.store.get_service_state(CATALOG_IMPORT_STATE_KEY))["value"]
+        for entry in state.values():  # what Hikka Hub 2.2.0 stored
+            entry.pop("reader", None)
+        state["broken.py"] = {"version": "1.0.0", "status": "syntax_error"}
+        await self.store.set_service_state(CATALOG_IMPORT_STATE_KEY, state)
+
+        current["source"] = full
+        fetched = []
+
+        async def fetch_full(filename):
+            fetched.append(filename)
+            return full
+
+        await _import_official_modules(
+            app, {"hello.py": "1.0.0", "broken.py": "1.0.0"}, fetch_full
+        )
+        self.assertEqual(sorted(fetched), ["broken.py", "hello.py"])
+        response = await self._request(
+            "GET", "/v1/catalog/modules/helloworld/source", who="two"
+        )
+        self.assertEqual((await response.json())["data"]["source"], full)
+
+        fetched.clear()
+        await _import_official_modules(
+            app, {"hello.py": "1.0.0", "broken.py": "1.0.0"}, fetch_full
+        )
+        self.assertEqual(fetched, [])
+
+    async def test_large_bodies_are_read_completely(self):
+        from hikka_hub.app import _read_limited
+
+        class Content:
+            def __init__(self, data):
+                self.data = data
+
+            async def read(self, size):
+                chunk, self.data = self.data[: min(size, 1000)], self.data[min(size, 1000):]
+                return chunk
+
+        self.assertEqual(len(await _read_limited(Content(b"x" * 5000), 10000)), 5000)
+        self.assertEqual(len(await _read_limited(Content(b"x" * 5000), 3000)), 3001)
 
 
 if __name__ == "__main__":

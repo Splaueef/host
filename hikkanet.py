@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 2.3.0
+# meta version: 2.3.1
 # meta description: 🔐 HikkaNet: вузли, каталог модулів, пошта, глобальні ігри, чат, події та статистика.
 # scope: inline
 # scope: hikka_only
@@ -32,7 +32,7 @@ from .. import loader, utils
 
 
 logger = logging.getLogger(__name__)
-__version__ = (2, 3, 0)
+__version__ = (2, 3, 1)
 _PROTOCOL = "HIKKA-HUB-V1"
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$")
@@ -236,6 +236,23 @@ def _find_sensitive_field(value, path=""):
 def _preview(value, maximum=350) -> str:
     rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     return rendered if len(rendered) <= maximum else rendered[: maximum - 1] + "…"
+
+
+async def _read_limited(content, limit) -> bytes:
+    """Read a body up to ``limit + 1`` bytes.
+
+    ``StreamReader.read(n)`` returns as soon as any data is buffered, so one
+    call may yield only the first chunk of a large response.
+    """
+    chunks = []
+    size = 0
+    while size <= limit:
+        chunk = await content.read(min(65536, limit + 1 - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    return b"".join(chunks)
 
 
 def _catalog_id(value) -> str:
@@ -584,7 +601,7 @@ class HikkaNetMod(loader.Module):
                 timeout=timeout,
                 ssl=ssl,
             ) as response:
-                raw = await response.content.read(max_bytes + 1)
+                raw = await _read_limited(response.content, max_bytes)
                 if len(raw) > max_bytes:
                     raise HubClientError("Відповідь сервера завелика")
                 try:

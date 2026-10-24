@@ -50,6 +50,10 @@ MODULE_REPOSITORY = "Splaueef/host"
 MODULE_SOURCE_URL = "https://raw.githubusercontent.com/Splaueef/host/main/{}"
 CATALOG_IMPORT_STATE_KEY = "catalog_imports"
 OFFICIAL_TAG = "official"
+# Hikka Hub 2.2.0 could read large files truncated: such a copy was either
+# recorded as broken or, if the cut still parsed, published incomplete. Entries
+# without this marker are fetched once more and repaired.
+IMPORT_READER = 2
 MODULE_STATE_KEY = "module_versions"
 MODULE_UPDATE_TOPIC = "system.module_updates"
 MODULE_MANIFEST_LIMIT = 131072
@@ -363,6 +367,23 @@ def _validate_module_changes(payload: Any) -> dict[str, str]:
     return result
 
 
+async def _read_limited(content, limit: int) -> bytes:
+    """Read a body up to ``limit + 1`` bytes.
+
+    ``StreamReader.read(n)`` returns as soon as any data is buffered, so one
+    call may yield only the first chunk of a large response.
+    """
+    chunks = []
+    size = 0
+    while size <= limit:
+        chunk = await content.read(min(65536, limit + 1 - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    return b"".join(chunks)
+
+
 async def _fetch_module_manifest(
     session: aiohttp.ClientSession,
 ) -> tuple[dict[str, str], dict[str, str]]:
@@ -375,7 +396,7 @@ async def _fetch_module_manifest(
             or (final.hostname or "").lower() != "raw.githubusercontent.com"
         ):
             raise RuntimeError(f"module manifest returned HTTP {response.status}")
-        raw = await response.content.read(MODULE_MANIFEST_LIMIT + 1)
+        raw = await _read_limited(response.content, MODULE_MANIFEST_LIMIT)
     if len(raw) > MODULE_MANIFEST_LIMIT:
         raise RuntimeError("module manifest is too large")
     try:
@@ -472,7 +493,7 @@ async def _fetch_module_source(
             or (final.hostname or "").lower() != "raw.githubusercontent.com"
         ):
             raise RuntimeError(f"{filename} returned HTTP {response.status}")
-        raw = await response.content.read(limit + 1)
+        raw = await _read_limited(response.content, limit)
     if len(raw) > limit:
         raise RuntimeError(f"{filename} is larger than the module source limit")
     try:
@@ -501,9 +522,13 @@ async def _import_official_modules(
     imported = []
     for filename, version in sorted(modules.items()):
         previous = state.get(filename)
-        if isinstance(previous, dict) and previous.get("version") == version:
+        if (
+            isinstance(previous, dict)
+            and previous.get("version") == version
+            and previous.get("reader") == IMPORT_READER
+        ):
             continue
-        entry = {"version": version, "checked_at": int(time.time())}
+        entry = {"version": version, "checked_at": int(time.time()), "reader": IMPORT_READER}
         try:
             source = await fetch_source(filename)
             info = analyse_source(source, settings.module_source_limit)
@@ -520,6 +545,10 @@ async def _import_official_modules(
             )
             entry["module_id"] = info.module_id
             error = result.get("error")
+            if error == "version_not_newer" and await store.catalog_repair_official(
+                info, source
+            ):
+                logger.warning("Replaced truncated copy of %s %s", filename, version)
             # An equal version was imported before the state was saved.
             entry["status"] = "ok" if error in (None, "version_not_newer") else error
             if error is None:
