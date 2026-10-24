@@ -2093,14 +2093,21 @@ class RichPanelTest(unittest.IsolatedAsyncioTestCase):
     setUp = PlaybackTest.setUp
     _player = PlaybackTest._player
 
-    def _api(self, answer=None):
+    def _api(self, answer=None, bot_in_chat=True):
         self.sent = []
 
         async def call(method, payload):
             self.sent.append((method, payload))
+            if method == "sendMessage":
+                if not bot_in_chat:
+                    return {"ok": False, "description": "Bad Request: chat not found"}
+                return {"ok": True, "result": {"message_id": 555}}
             return answer or {"ok": True, "result": True}
 
         self.mod._bot_api = call
+
+    def _edits(self):
+        return [payload for method, payload in self.sent if method == "editMessageText"]
 
     @staticmethod
     def _buttons(payload):
@@ -2111,13 +2118,24 @@ class RichPanelTest(unittest.IsolatedAsyncioTestCase):
             for button in block["buttons"]
         ]
 
-    async def test_panel_is_shown_and_kept_as_rich_text(self):
+    async def test_the_bot_panel_is_shown_and_kept_as_rich_text(self):
         self.mod.inline = _RichInline()
         self._api()
         await self.mod.vcplay(_Message("https://a"))
         await self.mod.vcadd(_Message("https://b"))
-        method, payload = self.sent[0]
-        self.assertEqual(method, "editMessageText")
+        self.assertEqual(self.sent[0][0], "sendMessage")
+        self.assertEqual(self.mod.inline.forms, [])  # no inline query at all
+        payload = self._edits()[0]
+        self.assertEqual((payload["chat_id"], payload["message_id"]), (CHAT, 555))
+        self.assertIn("rich_message", payload)
+
+    async def test_panel_is_shown_and_kept_as_rich_text(self):
+        # Hikka's inline panel, when the bot is not in the chat.
+        self.mod.inline = _RichInline()
+        self._api(bot_in_chat=False)
+        await self.mod.vcplay(_Message("https://a"))
+        await self.mod.vcadd(_Message("https://b"))
+        payload = self._edits()[0]
         self.assertEqual(payload["inline_message_id"], "AAAAinline")
         self.assertEqual(payload["reply_markup"], {"inline_keyboard": []})
         blocks = payload["rich_message"]["blocks"]
@@ -2154,22 +2172,25 @@ class RichPanelTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_refused_rich_text_falls_back_to_the_html_panel(self):
         self.mod.inline = _RichInline()
-        self._api({"ok": False, "description": "Bad Request: rich messages are not supported"})
+        self._api(
+            {"ok": False, "description": "Bad Request: rich messages are not supported"},
+            bot_in_chat=False,
+        )
         await self.mod.vcplay(_Message("https://a"))
         await self.mod.vcadd(_Message("https://b"))
         panel = self._player().panel
         self.assertTrue(self.mod._rich_broken)
         self.assertIs(panel, self.mod.inline.forms[0])
         self.assertIn("https://b", panel.text)  # edited the usual way
-        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self._edits()), 1)
 
     async def test_html_style_keeps_the_classic_panel(self):
         self.mod.inline = _RichInline()
         self.mod.config["panel_style"] = "html"
-        self._api()
+        self._api(bot_in_chat=False)
         await self.mod.vcplay(_Message("https://a"))
         await self.mod.vcadd(_Message("https://b"))
-        self.assertEqual(self.sent, [])
+        self.assertEqual(self._edits(), [])
         self.assertIn("https://b", self._player().panel.text)
 
 
@@ -2249,11 +2270,14 @@ class FailedPanelTest(unittest.IsolatedAsyncioTestCase):
 
         self.mod._bot_api = call
 
-    async def test_the_bot_posts_the_panel_when_the_inline_query_fails(self):
+    async def test_the_bot_posts_the_panel_without_an_inline_query(self):
+        self.mod.config["panel_style"] = "html"
         self._bot(lambda method: {"ok": True, "result": {"message_id": 555}})
         await self.mod.vcplay(_Message("https://a"))
         player = self._player()
         self.assertIsInstance(player.panel, voicechat.BotPanel)
+        self.assertEqual(self.mod.inline.calls, 0)  # no "No query results"
+        self.assertEqual(self.chat, [])
         method, payload = self.sent[0]
         self.assertEqual(method, "sendMessage")
         self.assertEqual(payload["chat_id"], CHAT)

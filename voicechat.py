@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 2.8.0
+# meta version: 2.8.1
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -1280,7 +1280,7 @@ class BotPanel:
     and delete() go through the Bot API with the chat and message IDs.
     """
 
-    inline_message_id = None  # so the rich panel (inline-only) is not tried
+    inline_message_id = None  # edited by chat_id + message_id instead
 
     def __init__(self, module, player, message_id):
         self._module = module
@@ -4099,10 +4099,20 @@ class VoiceChatMod(loader.Module):
             self.config["panel_style"] == "rich"
             and not self._rich_broken
             and player.panel is not None
-            and bool(getattr(player.panel, "inline_message_id", None))
+            and bool(self._panel_target(player.panel))
             and bool(self._bot_token())
             and callable(getattr(self.inline, "generate_markup", None))
         )
+
+    @staticmethod
+    def _panel_target(panel):
+        """Bot API IDs of a panel: Hikka's inline one or the bot's message."""
+        inline_id = getattr(panel, "inline_message_id", None)
+        if inline_id:
+            return {"inline_message_id": str(inline_id)}
+        if isinstance(panel, BotPanel) and panel.message_id:
+            return {"chat_id": panel.chat_id, "message_id": panel.message_id}
+        return None
 
     async def _bot_api(self, method, payload):
         """Call the Bot API directly (Hikka's aiogram may not know the method)."""
@@ -4243,7 +4253,7 @@ class VoiceChatMod(loader.Module):
         try:
             self._rich_callbacks(player, markup)
             payload = {
-                "inline_message_id": str(player.panel.inline_message_id),
+                **self._panel_target(player.panel),
                 "rich_message": self._panel_rich(player, markup),
                 "reply_markup": {"inline_keyboard": []},
             }
@@ -4297,20 +4307,26 @@ class VoiceChatMod(loader.Module):
             return False
         old = player.panel
         text = self._panel_text(player)
-        panel = None
-        tried = not self._inline_broken and time.monotonic() >= self._panel_retry_at
-        if tried:
-            panel = await self._inline_panel(player, status, text)
+        # The bot's own message first: it needs no inline query (which
+        # fails with "No query results" when the bot answers slowly) and no
+        # inline feedback.  Hikka's inline panel is for chats without the bot.
+        panel = await self._post_bot_panel(player, text)
+        tried = False
         if panel is None:
-            # Hikka's inline panel is unavailable: the bot posts it itself.
-            panel = await self._post_bot_panel(player, text)
-            if panel is None:
-                if tried and self._inline_broken:
-                    await self._inline_failed(player, "no chosen_inline_result")
-                return False
-            if status is not None and getattr(status, "out", False):
-                with contextlib.suppress(Exception):
-                    await status.delete()  # as Hikka does with its own panel
+            tried = (
+                not self._inline_broken and time.monotonic() >= self._panel_retry_at
+            )
+            if tried:
+                panel = await self._inline_panel(player, status, text)
+        elif status is not None and getattr(status, "out", False):
+            with contextlib.suppress(Exception):
+                await status.delete()  # as Hikka does with its own panel
+        if panel is None:
+            if tried and self._inline_broken:
+                await self._inline_failed(player, "no chosen_inline_result")
+            elif self._bot_panel_broken:
+                await self._bot_panel_hint(player)
+            return False
         player.panel = panel
         player.last_panel_text = text
         player.panel_failures = 0
@@ -4395,23 +4411,27 @@ class VoiceChatMod(loader.Module):
                 data.get("description") if isinstance(data, dict) else data
             )
             logger.warning(
-                "VoiceChat: the bot cannot post the panel here (%s), using text",
+                "VoiceChat: the bot cannot post the panel here (%s)",
                 description,
             )
             self._bot_panel_broken = True
-            if not self._bot_hint_sent:
-                self._bot_hint_sent = True
-                bot = getattr(self.inline, "bot_username", None)
-                with contextlib.suppress(Exception):
-                    await self._client.send_message(
-                        player.chat_id,
-                        self.strings("bot_panel_hint").format(
-                            bot=f"@{bot}" if bot else self.strings("inline_your_bot"),
-                            p=self.get_prefix(),
-                        ),
-                    )
             return None
         return BotPanel(self, player, result.get("message_id"))
+
+    async def _bot_panel_hint(self, player):
+        """Neither the bot nor Hikka's inline query could post the panel."""
+        if self._bot_hint_sent:
+            return
+        self._bot_hint_sent = True
+        bot = getattr(self.inline, "bot_username", None)
+        with contextlib.suppress(Exception):
+            await self._client.send_message(
+                player.chat_id,
+                self.strings("bot_panel_hint").format(
+                    bot=f"@{bot}" if bot else self.strings("inline_your_bot"),
+                    p=self.get_prefix(),
+                ),
+            )
 
     def _bot_keyboard(self, player, markup):
         """Bot API reply_markup for the panel buttons (Hikka runs them)."""
