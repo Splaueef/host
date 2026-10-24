@@ -1,10 +1,11 @@
 # meta developer: @Huang_Baike
-# meta version: 1.0.0
+# meta version: 1.1.0
 # meta description: Автоматично завершує всі нові невідомі сесії Telegram.
 
 """Protect a Telegram account from newly-created, untrusted sessions."""
 
 import asyncio
+import contextlib
 import datetime
 import logging
 import time
@@ -21,6 +22,9 @@ from .. import loader, utils
 
 logger = logging.getLogger(__name__)
 
+BOT_API = "https://api.telegram.org/bot{token}/{method}"
+EPHEMERAL_RETRY = 10 * 60
+
 
 @loader.tds
 class SessionGuardMod(loader.Module):
@@ -35,6 +39,10 @@ class SessionGuardMod(loader.Module):
         ),
         "cfg_notifications": (
             "Надсилати у «Збережені повідомлення» звіти про нові сесії"
+        ),
+        "cfg_ephemeral": (
+            "У групах показувати відповіді команд лише вам — ефемерним "
+            "повідомленням inline-бота (бот має бути в групі)"
         ),
         "baseline_ready": (
             "🛡 <b>SessionGuard активовано.</b>\n"
@@ -122,6 +130,12 @@ class SessionGuardMod(loader.Module):
                 lambda: self.strings("cfg_notifications"),
                 validator=loader.validators.Boolean(),
             ),
+            loader.ConfigValue(
+                "ephemeral",
+                True,
+                lambda: self.strings("cfg_ephemeral"),
+                validator=loader.validators.Boolean(),
+            ),
         )
         self._client = None
         self._guard_lock = asyncio.Lock()
@@ -132,6 +146,7 @@ class SessionGuardMod(loader.Module):
         self._retry_after = {}
         self._reported_failures = set()
         self._completed_hashes = set()
+        self._ephemeral_blocked = {}
 
     async def client_ready(self, client, db):
         self._client = client
@@ -428,18 +443,81 @@ class SessionGuardMod(loader.Module):
             return
         await self._audit_sessions()
 
+    def _bot_token(self):
+        inline = getattr(self, "inline", None)
+        return getattr(inline, "_token", None) or getattr(
+            getattr(inline, "bot", None), "token", None
+        )
+
+    async def _answer(self, message, text):
+        """Answer a command; in a group only its sender sees the reply."""
+        if not await self._send_ephemeral(message, text):
+            await utils.answer(message, text)
+
+    async def _send_ephemeral(self, message, text):
+        """Send ``text`` as an ephemeral message of the inline bot.
+
+        Telegram shows such a message only to ``receiver_user_id``; it works
+        in groups where the bot is a member.  False when it cannot be sent
+        here, so the caller answers as usual.
+        """
+        chat_id = getattr(message, "chat_id", None)
+        receiver = getattr(message, "sender_id", None)
+        token = self._bot_token()
+        if (
+            not self.config["ephemeral"]
+            or not getattr(message, "is_group", False)
+            or not chat_id
+            or not receiver
+            or not token
+            or self._ephemeral_blocked.get(chat_id, 0) > time.monotonic()
+        ):
+            return False
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True},
+            "ephemeral_message_parameters": {"receiver_user_id": receiver},
+        }
+        try:
+            import aiohttp
+
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as session:
+                async with session.post(
+                    BOT_API.format(token=token, method="sendMessage"), json=payload
+                ) as response:
+                    data = await response.json(content_type=None)
+        except Exception as error:
+            logger.debug("SessionGuard ephemeral answer failed: %s", error)
+            return False
+        if not isinstance(data, dict) or not data.get("ok"):
+            data = data if isinstance(data, dict) else {"description": str(data)}
+            description = str(data.get("description", ""))
+            if data.get("error_code") == 403 or "chat not found" in description.lower():
+                # The bot is not in this group: do not ask again for a while.
+                self._ephemeral_blocked[chat_id] = time.monotonic() + EPHEMERAL_RETRY
+            logger.info("SessionGuard: no ephemeral answer here (%s)", description)
+            return False
+        if getattr(message, "out", False):
+            with contextlib.suppress(Exception):
+                await message.delete()
+        return True
+
     async def _list_sessions(self, message):
         try:
             authorizations = await self._fetch_authorizations()
         except (RPCError, ConnectionError, OSError) as error:
-            await utils.answer(
+            await self._answer(
                 message,
                 self.strings("check_failed").format(utils.escape_html(str(error))),
             )
             return
         except Exception as error:
             logger.exception("Unable to list Telegram sessions")
-            await utils.answer(
+            await self._answer(
                 message,
                 self.strings("check_failed").format(utils.escape_html(str(error))),
             )
@@ -471,20 +549,20 @@ class SessionGuardMod(loader.Module):
         body = "\n".join(lines) if lines else self.strings("no_sessions")
         if len(authorizations) > 30:
             body += f"\n…ще {len(authorizations) - 30} сесій"
-        await utils.answer(message, self.strings("sessions_title").format(body))
+        await self._answer(message, self.strings("sessions_title").format(body))
 
     async def _trust_all(self, message):
         try:
             authorizations = await self._fetch_authorizations()
         except (RPCError, ConnectionError, OSError) as error:
-            await utils.answer(
+            await self._answer(
                 message,
                 self.strings("check_failed").format(utils.escape_html(str(error))),
             )
             return
         except Exception as error:
             logger.exception("Unable to replace SessionGuard baseline")
-            await utils.answer(
+            await self._answer(
                 message,
                 self.strings("check_failed").format(utils.escape_html(str(error))),
             )
@@ -507,7 +585,7 @@ class SessionGuardMod(loader.Module):
         self._last_check = self._now_iso()
         self._last_error = None
         self._next_check = time.monotonic() + int(self.config["check_interval"])
-        await utils.answer(message, self.strings("trusted_all").format(len(hashes)))
+        await self._answer(message, self.strings("trusted_all").format(len(hashes)))
 
     @loader.command()
     async def sessionguard(self, message):
@@ -516,7 +594,7 @@ class SessionGuardMod(loader.Module):
         command = args.split(maxsplit=1)[0].lower() if args else ""
 
         if not command or command == "status":
-            await utils.answer(
+            await self._answer(
                 message,
                 self.strings("status").format(
                     state=(
@@ -543,7 +621,7 @@ class SessionGuardMod(loader.Module):
 
         if command == "check":
             success = await self._audit_sessions(force=True)
-            await utils.answer(
+            await self._answer(
                 message,
                 self.strings("checked")
                 if success
@@ -556,7 +634,7 @@ class SessionGuardMod(loader.Module):
         if command == "on":
             self.config["enabled"] = True
             success = await self._audit_sessions(force=True)
-            await utils.answer(
+            await self._answer(
                 message,
                 self.strings("enabled")
                 if success
@@ -568,13 +646,13 @@ class SessionGuardMod(loader.Module):
 
         if command == "off":
             self.config["enabled"] = False
-            await utils.answer(message, self.strings("disabled"))
+            await self._answer(message, self.strings("disabled"))
             return
 
         if command == "trustall":
             confirmation = args.split(maxsplit=1)[1] if " " in args else ""
             if confirmation.strip() != "CONFIRM":
-                await utils.answer(
+                await self._answer(
                     message,
                     self.strings("trust_warning").format(
                         utils.escape_html(self.get_prefix())
@@ -584,4 +662,4 @@ class SessionGuardMod(loader.Module):
             await self._trust_all(message)
             return
 
-        await utils.answer(message, self.strings("help"))
+        await self._answer(message, self.strings("help"))

@@ -7,6 +7,7 @@ import pathlib
 import sys
 import types
 import unittest
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 
@@ -17,6 +18,17 @@ class _Module:
     def set(self, key, value):
         self._storage = getattr(self, "_storage", {})
         self._storage[key] = value
+
+
+class _ConfigValue:
+    def __init__(self, key, default, doc, validator=None):
+        self.key = key
+        self.default = default
+
+
+class _ModuleConfig(dict):
+    def __init__(self, *values):
+        super().__init__((value.key, value.default) for value in values)
 
 
 def _decorator(*args, **kwargs):
@@ -35,6 +47,9 @@ def _load_module():
     loader.raw_handler = _decorator
     loader.command = _decorator
     loader.loop = _decorator
+    loader.ConfigValue = _ConfigValue
+    loader.ModuleConfig = _ModuleConfig
+    loader.validators = types.SimpleNamespace(Boolean=lambda: object())
     utils.escape_html = (
         lambda value: str(value)
         .replace("&", "&amp;")
@@ -904,6 +919,105 @@ class ContactStatusAsyncTests(unittest.IsolatedAsyncioTestCase):
         sent = self.module._client.sent_files[0]
         self.assertEqual(sent["peer_id"], call.form["chat"])
         self.assertTrue(sent["name"].endswith(".json"))
+
+
+class _BotResponse:
+    def __init__(self, data):
+        self.data = data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def json(self, content_type=None):
+        return self.data
+
+
+class _BotSession:
+    def __init__(self, calls):
+        self.calls = calls
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _BotResponse({"ok": True, "result": {"message_id": 0}})
+
+
+class ContactStatusEphemeralTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.module = contactstatus.ContactStatusMod()
+        self.module._ensure_storage()
+        self.module._client = _Client()
+        self.module.inline = _InlineManager()
+        self.module.inline._token = "123:abc"
+        self.calls = []
+        day = datetime.datetime(2026, 9, 8, tzinfo=UTC)
+        self.module.set("contacts", {"1": {"name": "Alice", "username": "alice"}})
+        self.module.set("watchlist", ["1"])
+        self.module._store_interval(1, day.replace(hour=8), day.replace(hour=9))
+        self.module._now = lambda: day.replace(hour=12)
+
+    def _group_message(self, args):
+        message = _Message(args)
+        message.chat_id = -1001
+        message.sender_id = 42
+        message.is_group = True
+        message.out = True
+        return message
+
+    def _bot(self):
+        return mock.patch(
+            "aiohttp.ClientSession",
+            lambda *args, **kwargs: _BotSession(self.calls),
+        )
+
+    async def test_group_stats_skip_the_public_inline_form(self):
+        message = self._group_message("today")
+
+        with self._bot():
+            await self.module.contactstats(message)
+
+        self.assertEqual(self.module.inline.forms, [])
+        url, kwargs = self.calls[0]
+        self.assertTrue(url.endswith("/sendMessage"))
+        self.assertEqual(
+            json.loads(kwargs["data"]["ephemeral_message_parameters"]),
+            {"receiver_user_id": 42},
+        )
+        self.assertTrue(message.deleted)
+
+    async def test_group_export_is_sent_as_an_ephemeral_document(self):
+        message = self._group_message("json today")
+
+        with self._bot():
+            await self.module.contactexport(message)
+
+        self.assertEqual(self.module._client.sent_files, [])
+        url, kwargs = self.calls[-1]
+        self.assertTrue(url.endswith("/sendDocument"))
+        fields = {
+            field[0]["name"]: field[0].get("filename") or field[2]
+            for field in kwargs["data"]._fields
+        }
+        self.assertTrue(fields["document"].endswith(".json"))
+        self.assertEqual(fields["chat_id"], "-1001")
+        self.assertTrue(message.deleted)
+
+    async def test_private_chat_export_still_uses_the_userbot(self):
+        message = _Message("json today")
+
+        with self._bot():
+            await self.module.contactexport(message)
+
+        self.assertEqual(self.calls, [])
+        self.assertEqual(len(self.module._client.sent_files), 1)
 
 
 if __name__ == "__main__":

@@ -251,3 +251,93 @@ class SessionGuardTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _BotResponse:
+    def __init__(self, data):
+        self.data = data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def json(self, content_type=None):
+        return self.data
+
+
+class _BotSession:
+    def __init__(self, reply, calls):
+        self.reply = reply
+        self.calls = calls
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _BotResponse(self.reply)
+
+
+class _GroupMessage:
+    def __init__(self, is_group=True):
+        self.args = "status"
+        self.chat_id = -1001
+        self.sender_id = 42
+        self.is_group = is_group
+        self.out = True
+        self.delete = mock.AsyncMock()
+
+
+class SessionGuardEphemeralTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        sessionguard.utils.answer.reset_mock()
+        self.module = sessionguard.SessionGuardMod()
+        self.module.inline = types.SimpleNamespace(_token="123:abc")
+        self.calls = []
+
+    def _bot(self, reply):
+        return mock.patch(
+            "aiohttp.ClientSession",
+            lambda *args, **kwargs: _BotSession(reply, self.calls),
+        )
+
+    async def test_group_status_goes_only_to_the_sender(self):
+        message = _GroupMessage()
+
+        with self._bot({"ok": True, "result": {"message_id": 0}}):
+            await self.module.sessionguard(message)
+
+        url, kwargs = self.calls[0]
+        self.assertTrue(url.endswith("/bot123:abc/sendMessage"))
+        self.assertEqual(kwargs["json"]["chat_id"], -1001)
+        self.assertEqual(
+            kwargs["json"]["ephemeral_message_parameters"], {"receiver_user_id": 42}
+        )
+        message.delete.assert_awaited_once()
+        sessionguard.utils.answer.assert_not_awaited()
+
+    async def test_bot_outside_the_group_falls_back_and_is_not_asked_again(self):
+        message = _GroupMessage()
+        reply = {"ok": False, "error_code": 403, "description": "Forbidden"}
+
+        with self._bot(reply):
+            await self.module.sessionguard(message)
+            await self.module.sessionguard(message)
+
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(sessionguard.utils.answer.await_count, 2)
+        message.delete.assert_not_awaited()
+
+    async def test_private_chats_and_disabled_option_answer_as_usual(self):
+        with self._bot({"ok": True}):
+            await self.module.sessionguard(_GroupMessage(is_group=False))
+            self.module.config["ephemeral"] = False
+            await self.module.sessionguard(_GroupMessage())
+
+        self.assertEqual(self.calls, [])
+        self.assertEqual(sessionguard.utils.answer.await_count, 2)
