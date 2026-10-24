@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 2.0.0
+# meta version: 2.1.0
 # meta description: 💬 Глобальні кімнати HikkaNet з online-учасниками та історією.
 # scope: hikka_only
 
@@ -18,7 +18,7 @@ from .. import loader, utils
 
 
 logger = logging.getLogger(__name__)
-__version__ = (2, 0, 0)
+__version__ = (2, 1, 0)
 ROOM_RE = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 
 
@@ -270,8 +270,8 @@ class HikkaNetChatMod(loader.Module):
                     "me",
                     f"💬 <b>HikkaNet · #{_esc(room)}</b>\n"
                     f"<b>{_esc(nickname)}</b> "
-                    f"<code>{_esc(event.get('sender_instance_id'))}</code>\n\n"
-                    f"{_esc_limit(text, 3500)}",
+                    f"<code>{_esc(event.get('sender_instance_id'))}</code>\n"
+                    f"<blockquote>{_esc_limit(text, 3500)}</blockquote>",
                     parse_mode="html",
                 )
                 self._count("messages_received")
@@ -290,7 +290,7 @@ class HikkaNetChatMod(loader.Module):
         return (
             f"<b>{_esc(payload.get('nickname') or 'Hikka')}</b> "
             f"<code>{_esc(event.get('sender_instance_id'))}</code> · {shown_time}\n"
-            f"{_esc_limit(str(payload.get('body', ''))[:2000], 3000)}"
+            f"<blockquote>{_esc_limit(str(payload.get('body', ''))[:2000], 3000)}</blockquote>"
         )
 
     def _status_text(self):
@@ -298,21 +298,25 @@ class HikkaNetChatMod(loader.Module):
         rooms = self._rooms()
         active = str(self.config["active_room"] or "—")
         lines = [
-            "💬 <b>HikkaNetChat</b>",
-            "",
-            f"Мережа: <b>{'🟢 підключена' if network else '🔴 недоступна'}</b>",
-            f"Псевдонім: <b>{_esc(self._nickname())}</b>",
-            f"Активна кімната: <code>#{_esc(active)}</code>",
-            "Кімнати: " + (", ".join(f"<code>#{_esc(x)}</code>" for x in rooms) or "—"),
-            "",
-            "<code>.hksay текст</code> — написати",
-            "<code>.hkhistory [room]</code> — історія",
-            "<code>.hkrooms</code> — глобальні кімнати",
-            "<code>.hkmembers [room]</code> — хто online",
-            "<code>.hkjoin room</code> — приєднатися",
-            "<code>.hkroom room</code> — вибрати активну",
-            "<code>.hkleave [room]</code> — вийти",
-            "<code>.hknick [ім'я]</code> — псевдонім",
+            "💬 <b>HikkaNetChat</b> · "
+            + ("🟢 мережа підключена" if network else "🔴 мережа недоступна"),
+            "<blockquote>"
+            f"🪪 Псевдонім: <b>{_esc(self._nickname())}</b>\n"
+            f"📍 Активна кімната: <code>#{_esc(active)}</code>\n"
+            "🏠 Кімнати: "
+            + (", ".join(f"<code>#{_esc(x)}</code>" for x in rooms) or "—")
+            + "</blockquote>",
+            "⌨️ <b>Команди</b>",
+            "<blockquote expandable>"
+            "<code>.hksay текст</code> — написати\n"
+            "<code>.hkhistory [room]</code> — історія\n"
+            "<code>.hkrooms</code> — глобальні кімнати\n"
+            "<code>.hkmembers [room]</code> — хто online\n"
+            "<code>.hkjoin room</code> — приєднатися\n"
+            "<code>.hkroom room</code> — вибрати активну\n"
+            "<code>.hkleave [room]</code> — вийти\n"
+            "<code>.hknick [ім'я]</code> — псевдонім"
+            "</blockquote>",
         ]
         if self._last_error:
             lines.extend(["", f"Остання помилка: <code>{_esc(self._last_error)}</code>"])

@@ -1,5 +1,5 @@
 # meta developer: @Codex
-# meta version: 1.1.0
+# meta version: 1.2.0
 # meta description: Точний час VPS, час Hikka, UTC, Unix timestamp і аптайм модуля.
 
 import datetime
@@ -46,17 +46,18 @@ class TimeInfoMod(loader.Module):
             "(наприклад Europe/Kyiv)"
         ),
         "time": (
-            "🕰 <b>Точний час</b>\n\n"
-            "🖥 <b>VPS:</b> <code>{vps}</code>\n"
+            "🕰 <b>Точний час</b>\n"
+            "<blockquote>🖥 <b>VPS:</b> <code>{vps}</code>\n"
             "🤖 <b>Hikka:</b> <code>{hikka}</code>\n"
-            "🌐 <b>UTC:</b> <code>{utc}</code>\n"
-            "🔢 <b>Unix:</b> <code>{timestamp}</code>\n"
-            "⏱ <b>Аптайм модуля:</b> <code>{uptime}</code>\n\n"
-            "<i>Усі значення отримані з одного знімка системного годинника.</i>"
+            "🌐 <b>UTC:</b> <code>{utc}</code></blockquote>\n"
+            "<blockquote>🔢 <b>Unix:</b> <code>{timestamp}</code>\n"
+            "⏱ <b>Аптайм модуля:</b> {uptime}</blockquote>\n"
+            "<i>Усі значення взято з одного знімка системного годинника.</i>"
         ),
         "timezone": (
-            "🌍 <b>Час Hikka:</b> <code>{time}</code>\n"
-            "📍 <b>Таймзона:</b> <code>{zone}</code> (<code>{offset}</code>)"
+            "🌍 <b>Час Hikka</b>\n"
+            "<blockquote>🕰 <code>{time}</code>\n"
+            "📍 <code>{zone}</code> · <code>{offset}</code></blockquote>"
         ),
         "timezone_set": "✅ <b>Таймзону Hikka змінено:</b> <code>{}</code>",
         "bad_timezone": (
@@ -64,10 +65,10 @@ class TimeInfoMod(loader.Module):
             "Приклад: <code>.timezone Europe/Kyiv</code>"
         ),
         "timestamp": (
-            "🔄 <b>Конвертація часу</b>\n\n"
-            "📅 <b>Hikka:</b> <code>{local}</code>\n"
+            "🔄 <b>Конвертація часу</b>\n"
+            "<blockquote>📅 <b>Hikka:</b> <code>{local}</code>\n"
             "🌐 <b>UTC:</b> <code>{utc}</code>\n"
-            "🔢 <b>Unix:</b> <code>{timestamp}</code>"
+            "🔢 <b>Unix:</b> <code>{timestamp}</code></blockquote>"
         ),
         "bad_timestamp": (
             "❌ <b>Не вдалося розпізнати час.</b>\n"
@@ -76,7 +77,7 @@ class TimeInfoMod(loader.Module):
         ),
         "uptime": "⏱ <b>Аптайм модуля TimeInfo:</b> <code>{}</code>",
         "cfg_world_zones": "IANA-таймзони для .worldtime через кому",
-        "worldtime": "🌍 <b>Світовий час</b>\n\n{}",
+        "worldtime": "🌍 <b>Світовий час</b>\n<blockquote>{}</blockquote>",
         "worldtime_bad": "\n\n⚠️ <b>Пропущено невідомі таймзони:</b> <code>{}</code>",
     }
 

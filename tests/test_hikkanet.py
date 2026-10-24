@@ -309,6 +309,14 @@ class HikkaNetCatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "load_failed")
         self.assertEqual(module.storage.get("catalog_installed"), None)
 
+    def test_loaded_version_wins_over_remembered_one(self):
+        instance = type("Loaded", (), {"__version__": (1, 3, 0)})()
+        module = self._module({"hellomod": instance})
+        module.storage["catalog_installed"] = {
+            "hello": {"version": "1.0.0", "class_name": "HelloMod"}
+        }
+        self.assertEqual(module._installed_version("hello"), "1.3.0")
+
     async def test_update_check_skips_unloaded_modules(self):
         module = self._module({"hellomod": object()})
         module.storage["catalog_installed"] = {

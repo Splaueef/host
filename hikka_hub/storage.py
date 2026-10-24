@@ -226,6 +226,12 @@ CREATE INDEX IF NOT EXISTS idx_dm_recipient_id
 CREATE INDEX IF NOT EXISTS idx_dm_expiry ON direct_messages(expires_at);
 """
 
+# Modules imported from the trusted Splaueef/host repository belong to this
+# pseudo-owner, so no Telegram account can publish over them.
+OFFICIAL_OWNER_ID = 0
+OFFICIAL_INSTANCE_ID = "hikka-hub"
+OFFICIAL_PUBLISHER = "Splaueef/host"
+
 CATALOG_SORTS = {
     "popular": "m.installs DESC, m.updated_at DESC",
     "rating": (
@@ -1339,7 +1345,9 @@ class Store:
         count = int(item.get("rating_count") or 0)
         item["rating"] = round(int(item.pop("rating_sum") or 0) / count, 2) if count else 0
         item["rating_count"] = count
-        item.pop("owner_id", None)
+        item["official"] = int(item.pop("owner_id", -1)) == OFFICIAL_OWNER_ID
+        if item["official"] and not item.get("owner_display_name"):
+            item["owner_display_name"] = OFFICIAL_PUBLISHER
         return item
 
     async def catalog_publish(
@@ -1518,6 +1526,7 @@ class Store:
         limit: int = 20,
         offset: int = 0,
         owner_id: Optional[int] = None,
+        official: bool = False,
     ) -> dict[str, Any]:
         order = CATALOG_SORTS.get(sort, CATALOG_SORTS["popular"])
 
@@ -1529,6 +1538,9 @@ class Store:
                 params.append(int(owner_id))
             else:
                 where.append("m.status='published'")
+            if official:
+                where.append("m.owner_id=?")
+                params.append(OFFICIAL_OWNER_ID)
             if query:
                 pattern = "%" + _like_escape(query.lower()) + "%"
                 where.append(
@@ -1813,7 +1825,7 @@ class Store:
             rows = self._db.execute(
                 f"""
                 SELECT m.module_id, m.title, m.class_name, m.latest_version,
-                       v.changelog, v.warnings_json
+                       m.owner_id, v.changelog, v.warnings_json
                 FROM catalog_modules m
                 JOIN catalog_versions v
                     ON v.module_id=m.module_id AND v.version=m.latest_version
@@ -1834,6 +1846,7 @@ class Store:
                             "latest_version": row["latest_version"],
                             "changelog": row["changelog"],
                             "warnings": json.loads(row["warnings_json"] or "[]"),
+                            "official": int(row["owner_id"]) == OFFICIAL_OWNER_ID,
                         }
                     )
             return sorted(result, key=lambda item: item["module_id"])

@@ -99,8 +99,26 @@ python -m hikka_hub.cli --database ./data/hikka-hub.sqlite3 catalog-unblock weat
 python -m hikka_hub.cli --database ./data/hikka-hub.sqlite3 catalog-delete weather
 ```
 
+### Офіційні модулі з Splaueef/host
+
+Hikka Hub сам підтягує в каталог усі модулі репозиторію `Splaueef/host`: під
+час кожної перевірки `module_versions.json` (`HIKKA_HUB_MODULE_UPDATE_INTERVAL`)
+він завантажує з `raw.githubusercontent.com` лише ті файли, версія яких у
+маніфесті змінилася, аналізує їх так само без виконання й публікує з позначкою
+🏛 та тегом `official`. Версією вважається значення з маніфесту. Такі модулі
+належать службовому власнику, тож жоден користувач не може опублікувати модуль
+з тим самим ID. Встановлені з каталогу офіційні модулі отримують оновлення
+через звичну перевірку HikkaNet. Імпорт вимикається `HIKKA_HUB_CATALOG_IMPORT=false`
+і потребує `HIKKA_HUB_MODULE_UPDATES=true`.
+
 Заблокований модуль зникає з пошуку, його не можна встановити чи оновити.
 Каталог вимикається змінною `HIKKA_HUB_CATALOG=false`.
+
+## Оновлення з Hikka Hub 2.1
+
+Достатньо перебудувати сервіс: `/health` має повернути `2.2.0`. Після першої
+перевірки маніфесту офіційні модулі з'являться в `.hkmods official`. Онови
+`hikkanet.py` до 2.3.0, щоб бачити позначку й фільтр офіційних модулів.
 
 ## Оновлення з Hikka Hub 2.0
 
@@ -181,6 +199,7 @@ HIKKA_HUB_DATABASE=./data/hikka-hub.sqlite3 \
 | `HIKKA_HUB_MODULE_UPDATES` | `true` | сервер перевіряє manifest оновлень |
 | `HIKKA_HUB_MODULE_UPDATE_INTERVAL` | `300` | інтервал перевірки manifest, сек |
 | `HIKKA_HUB_CATALOG` | `true` | увімкнути каталог модулів |
+| `HIKKA_HUB_CATALOG_IMPORT` | `true` | підтягувати офіційні модулі з `Splaueef/host` |
 | `HIKKA_HUB_MODULE_SOURCE_LIMIT` | `262144` | максимальний розмір модуля, байт |
 | `HIKKA_HUB_CATALOG_MAX_VERSIONS` | `10` | скільки версій модуля зберігати |
 | `HIKKA_HUB_CATALOG_MAX_MODULES` | `50` | модулів на одного Telegram-власника |
@@ -357,7 +376,7 @@ def modulehub_stats(self):
 | `DELETE /v1/chat/presence/{room}` | вийти з кімнати |
 | `GET /v1/chat/rooms` | активні кімнати й активність за 24 години |
 | `GET /v1/chat/rooms/{room}/members` | online-учасники кімнати |
-| `GET /v1/catalog/modules` | пошук: `q`, `tag`, `sort`, `limit`, `offset`, `mine` |
+| `GET /v1/catalog/modules` | пошук: `q`, `tag`, `sort`, `limit`, `offset`, `mine`, `official` |
 | `POST /v1/catalog/modules` | опублікувати модуль або нову версію |
 | `GET /v1/catalog/modules/{id}` | картка модуля з історією версій |
 | `GET /v1/catalog/modules/{id}/source` | код версії та SHA-256 |

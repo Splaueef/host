@@ -46,6 +46,7 @@ class Settings:
     game_active_ttl_seconds: int = 7 * 86400
     chat_presence_ttl_seconds: int = 120
     catalog_enabled: bool = True
+    catalog_import_enabled: bool = True
     module_source_limit: int = 262144
     catalog_max_versions: int = 10
     catalog_max_modules: int = 50
@@ -91,6 +92,7 @@ class Settings:
                 "HIKKA_HUB_CHAT_PRESENCE_TTL", 120, 30, 3600
             ),
             catalog_enabled=_boolean("HIKKA_HUB_CATALOG", True),
+            catalog_import_enabled=_boolean("HIKKA_HUB_CATALOG_IMPORT", True),
             module_source_limit=_integer(
                 "HIKKA_HUB_MODULE_SOURCE_LIMIT", 262144, 8192, 1024 * 1024
             ),

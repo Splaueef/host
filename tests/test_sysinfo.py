@@ -92,9 +92,15 @@ class SystemInfoTests(unittest.IsolatedAsyncioTestCase):
         text = await self.module._report()
 
         self.assertIn("SystemInfo · Hikka", text)
-        self.assertIn("<b>RAM:</b>", text)
-        self.assertIn("<b>Диск:</b>", text)
-        self.assertIn("<b>Telethon:</b> <code>test</code>", text)
+        self.assertIn("<b>RAM</b>", text)
+        self.assertIn("<b>Диск</b>", text)
+        self.assertIn("<b>Telethon</b> <code>test</code>", text)
+        self.assertEqual(text.count("<blockquote>"), text.count("</blockquote>"))
+
+    def test_usage_bar(self):
+        self.assertEqual(self.module._bar(0), "▱" * 10)
+        self.assertEqual(self.module._bar(55), "▰" * 6 + "▱" * 4)
+        self.assertEqual(self.module._bar(250), "▰" * 10)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,9 @@ from pathlib import Path
 from aiohttp.test_utils import TestClient, TestServer
 
 from hikka_hub.app import (
+    CATALOG_IMPORT_STATE_KEY,
     MODULE_REPOSITORY,
+    _import_official_modules,
     MODULE_STATE_KEY,
     MODULE_UPDATE_TOPIC,
     _process_module_manifest,
@@ -740,6 +742,65 @@ class HikkaHubApiTests(unittest.IsolatedAsyncioTestCase):
             "POST", "/v1/inbox", {"to": "hikka-nobody", "text": "?"}, who="one"
         )
         self.assertEqual(response.status, 404)
+
+
+    async def test_official_modules_are_imported_from_the_manifest(self):
+        sources = {
+            "hello.py": self.MODULE_SOURCE,
+            "broken.py": "x = 1\n",
+        }
+        fetched = []
+
+        async def fetch(filename):
+            fetched.append(filename)
+            if filename == "offline.py":
+                raise RuntimeError("HTTP 503")
+            return sources[filename]
+
+        app = self.client.server.app
+        manifest = {"hello.py": "1.4.0", "broken.py": "1.0.0", "offline.py": "1.0.0"}
+        imported = await _import_official_modules(
+            app, manifest, fetch, {"hello.py": "Нове"}
+        )
+        self.assertEqual([item["module_id"] for item in imported], ["helloworld"])
+        self.assertTrue(imported[0]["official"])
+        # The manifest version wins over __version__ in the file.
+        self.assertEqual(imported[0]["latest_version"], "1.4.0")
+
+        state = (await self.store.get_service_state(CATALOG_IMPORT_STATE_KEY))["value"]
+        self.assertEqual(state["broken.py"]["status"], "not_a_module")
+        self.assertNotIn("offline.py", state)  # retried on the next check
+
+        fetched.clear()
+        await _import_official_modules(app, manifest, fetch)
+        self.assertEqual(fetched, ["offline.py"])
+
+        response = await self._request(
+            "GET", "/v1/catalog/modules?official=1", who="two"
+        )
+        listing = (await response.json())["data"]
+        self.assertEqual(listing["total"], 1)
+        item = listing["modules"][0]
+        self.assertTrue(item["official"])
+        self.assertEqual(item["owner_display_name"], "Splaueef/host")
+        self.assertEqual(item["tags"], ["official"])
+
+        hijack = await self._publish(
+            self.MODULE_SOURCE.replace("(1, 0, 0)", "(9, 0, 0)")
+        )
+        self.assertEqual((await hijack.json())["error"]["code"], "not_module_owner")
+
+        events = await self._request(
+            "GET", "/v1/events?after_id=0&limit=10&topic=system.catalog", who="two"
+        )
+        payload = (await events.json())["data"]["events"][0]["payload"]
+        self.assertTrue(payload["official"])
+        self.assertEqual(payload["changelog"], "Нове")
+
+        imported = await _import_official_modules(
+            app, {"hello.py": "1.5.0"}, fetch
+        )
+        self.assertEqual(imported[0]["previous_version"], "1.4.0")
 
 
 if __name__ == "__main__":

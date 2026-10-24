@@ -37,7 +37,7 @@ from .security import (
     parse_authorization,
     sign_with_key,
 )
-from .storage import Store
+from .storage import OFFICIAL_INSTANCE_ID, OFFICIAL_OWNER_ID, Store
 
 
 logger = logging.getLogger("hikka_hub")
@@ -47,6 +47,9 @@ MODULE_MANIFEST_URL = (
     "https://raw.githubusercontent.com/Splaueef/host/main/module_versions.json"
 )
 MODULE_REPOSITORY = "Splaueef/host"
+MODULE_SOURCE_URL = "https://raw.githubusercontent.com/Splaueef/host/main/{}"
+CATALOG_IMPORT_STATE_KEY = "catalog_imports"
+OFFICIAL_TAG = "official"
 MODULE_STATE_KEY = "module_versions"
 MODULE_UPDATE_TOPIC = "system.module_updates"
 MODULE_MANIFEST_LIMIT = 131072
@@ -69,6 +72,7 @@ SERVER_CAPABILITIES = [
     "game_leaderboard",
     "chat_presence",
     "module_catalog",
+    "official_modules",
     "direct_messages",
 ]
 
@@ -452,6 +456,108 @@ async def _process_module_manifest(
     # idempotent update notification, but cannot silently lose one.
     await store.set_service_state(MODULE_STATE_KEY, state_value)
     return changed
+
+
+async def _fetch_module_source(
+    session: aiohttp.ClientSession, filename: str, limit: int
+) -> str:
+    if not MODULE_FILENAME_RE.fullmatch(filename):
+        raise RuntimeError("invalid module filename")
+    url = MODULE_SOURCE_URL.format(filename) + f"?t={int(time.time()) // 300}"
+    async with session.get(url, allow_redirects=True) as response:
+        final = urlsplit(str(response.url))
+        if (
+            response.status != 200
+            or final.scheme != "https"
+            or (final.hostname or "").lower() != "raw.githubusercontent.com"
+        ):
+            raise RuntimeError(f"{filename} returned HTTP {response.status}")
+        raw = await response.content.read(limit + 1)
+    if len(raw) > limit:
+        raise RuntimeError(f"{filename} is larger than the module source limit")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"{filename} is not UTF-8") from exc
+
+
+async def _import_official_modules(
+    app: web.Application,
+    modules: dict[str, str],
+    fetch_source,
+    changes: Optional[dict[str, str]] = None,
+) -> list[dict[str, Any]]:
+    """Mirror modules of the trusted repository into the catalog.
+
+    Each file is fetched again only when the manifest names a version that was
+    not imported yet, so a steady manifest costs no downloads.
+    """
+    settings = app[SETTINGS_KEY]
+    store = app[STORE_KEY]
+    changes = changes or {}
+    saved = await store.get_service_state(CATALOG_IMPORT_STATE_KEY)
+    state = dict(saved["value"]) if saved and isinstance(saved.get("value"), dict) else {}
+    credential = {"owner_id": OFFICIAL_OWNER_ID, "instance_id": OFFICIAL_INSTANCE_ID}
+    imported = []
+    for filename, version in sorted(modules.items()):
+        previous = state.get(filename)
+        if isinstance(previous, dict) and previous.get("version") == version:
+            continue
+        entry = {"version": version, "checked_at": int(time.time())}
+        try:
+            source = await fetch_source(filename)
+            info = analyse_source(source, settings.module_source_limit)
+            info.version = version
+            result = await store.catalog_publish(
+                info,
+                source,
+                changes.get(filename, ""),
+                [OFFICIAL_TAG],
+                credential,
+                max_versions=settings.catalog_max_versions,
+                max_modules_per_owner=1_000_000,
+                daily_upload_limit=1_000_000,
+            )
+            entry["module_id"] = info.module_id
+            error = result.get("error")
+            # An equal version was imported before the state was saved.
+            entry["status"] = "ok" if error in (None, "version_not_newer") else error
+            if error is None:
+                imported.append(result)
+                await store.add_event(
+                    CATALOG_TOPIC,
+                    "hikka-hub",
+                    {
+                        "schema": 1,
+                        "module_id": result["module_id"],
+                        "title": result["title"],
+                        "version": result["latest_version"],
+                        "previous_version": result["previous_version"],
+                        "developer": result["developer"],
+                        "publisher_instance_id": OFFICIAL_INSTANCE_ID,
+                        "official": True,
+                        "changelog": changes.get(filename, "")[:MODULE_CHANGE_LIMIT],
+                    },
+                    settings.event_retention_hours * 3600,
+                )
+            elif entry["status"] != "ok":
+                logger.warning("Official module %s was not imported: %s", filename, error)
+        except asyncio.CancelledError:
+            raise
+        except SourceError as exc:
+            entry["status"] = exc.code
+            logger.warning("Official module %s was not imported: %s", filename, exc.message)
+        except Exception as exc:  # network errors are retried on the next check
+            logger.warning("Could not fetch official module %s: %s", filename, exc)
+            continue
+        state[filename] = entry
+        await store.set_service_state(CATALOG_IMPORT_STATE_KEY, state)
+    if imported:
+        logger.info(
+            "Imported official modules: %s",
+            ", ".join(f"{item['module_id']} {item['latest_version']}" for item in imported),
+        )
+    return imported
 
 
 async def root(request: web.Request) -> web.Response:
@@ -903,6 +1009,7 @@ async def catalog_list(request: web.Request) -> web.Response:
         raise ApiError(400, "invalid_query", "sort must be popular, rating, new or updated")
     mine = _query_bool(request, "mine")
     result = await request.app[STORE_KEY].catalog_list(
+        official=_query_bool(request, "official"),
         query=query,
         tag=tag,
         sort=sort,
@@ -1216,6 +1323,16 @@ async def _cleanup_context(app: web.Application):
                 try:
                     modules, changes = await _fetch_module_manifest(session)
                     await _process_module_manifest(app, modules, changes=changes)
+                    settings = app[SETTINGS_KEY]
+                    if settings.catalog_enabled and settings.catalog_import_enabled:
+                        await _import_official_modules(
+                            app,
+                            modules,
+                            lambda name: _fetch_module_source(
+                                session, name, settings.module_source_limit
+                            ),
+                            changes,
+                        )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
