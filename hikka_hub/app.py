@@ -20,6 +20,14 @@ import aiohttp
 from aiohttp import web
 
 from . import __version__
+from .catalog import (
+    CATALOG_ID_RE,
+    TAG_RE as CATALOG_TAG_RE,
+    VERSION_RE as CATALOG_VERSION_RE,
+    SourceError,
+    analyse_source,
+    clean_tags,
+)
 from .config import Settings
 from .game_engine import GameRuleError, SUPPORTED_GAMES
 from .security import (
@@ -45,6 +53,8 @@ MODULE_MANIFEST_LIMIT = 131072
 MODULE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_]+\.py$")
 MODULE_VERSION_RE = re.compile(r"^\d+(?:\.\d+){1,3}$")
 MODULE_CHANGE_LIMIT = 300
+CATALOG_TOPIC = "system.catalog"
+DIRECT_TEXT_LIMIT = 2000
 ROOM_RE = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 GAME_ID_RE = re.compile(r"^ng_[0-9a-f]{16}$")
 GAME_STATUSES = {"waiting", "invited", "active", "finished", "cancelled"}
@@ -58,6 +68,8 @@ SERVER_CAPABILITIES = [
     "network_games",
     "game_leaderboard",
     "chat_presence",
+    "module_catalog",
+    "direct_messages",
 ]
 
 
@@ -163,13 +175,15 @@ async def auth_middleware(request: web.Request, handler):
     )
     if not preauth_allowed:
         raise ApiError(429, "rate_limited", f"Retry after {preauth_retry} seconds")
-    if (
-        request.content_length is not None
-        and request.content_length > settings.request_body_limit
-    ):
+    body_limit = (
+        settings.upload_body_limit
+        if request.method == "POST" and request.path == CATALOG_UPLOAD_PATH
+        else settings.request_body_limit
+    )
+    if request.content_length is not None and request.content_length > body_limit:
         raise ApiError(413, "body_too_large", "Request body is too large")
     body = await request.read()
-    if len(body) > settings.request_body_limit:
+    if len(body) > body_limit:
         raise ApiError(413, "body_too_large", "Request body is too large")
 
     try:
@@ -781,6 +795,239 @@ async def list_chat_members(request: web.Request) -> web.Response:
     )
 
 
+CATALOG_UPLOAD_PATH = "/v1/catalog/modules"
+CATALOG_SORT_VALUES = {"popular", "rating", "new", "updated"}
+CATALOG_ERRORS = {
+    "not_module_owner": (403, "Only the publisher of this module may change it"),
+    "module_blocked": (403, "This module was blocked by the Hikka Hub administrator"),
+    "module_limit": (403, "You have reached the module limit of this Hikka Hub"),
+    "publish_rate_limited": (429, "Too many uploads in the last 24 hours"),
+    "module_not_found": (404, "Module was not found in the catalog"),
+    "version_not_found": (404, "Module version was not found"),
+    "last_version": (409, "Delete the whole module instead of its only version"),
+    "own_module": (409, "You cannot rate your own module"),
+}
+
+
+def _catalog_enabled(request: web.Request) -> None:
+    if not request.app[SETTINGS_KEY].catalog_enabled:
+        raise ApiError(404, "catalog_disabled", "Module catalog is disabled on this hub")
+
+
+def _catalog_module_id(value: Any) -> str:
+    module_id = _bounded_text(value, "module_id", 48, allow_empty=False).lower()
+    if not CATALOG_ID_RE.fullmatch(module_id):
+        raise ApiError(400, "invalid_module_id", "Invalid module ID")
+    return module_id
+
+
+def _catalog_version(value: Any, field: str = "version") -> str:
+    version = _bounded_text(value, field, 32, allow_empty=False).lstrip("vV")
+    if not CATALOG_VERSION_RE.fullmatch(version):
+        raise ApiError(400, "invalid_version", f"{field} must look like 1.2.3")
+    return version
+
+
+def _unwrap_catalog_result(result: dict[str, Any]) -> dict[str, Any]:
+    code = result.get("error")
+    if not code:
+        return result
+    if code == "version_not_newer":
+        raise ApiError(
+            409,
+            code,
+            f"Version must be newer than the published {result.get('latest')}",
+        )
+    status, message = CATALOG_ERRORS.get(str(code), (500, "Catalog operation failed"))
+    raise ApiError(status, str(code), message)
+
+
+async def catalog_publish(request: web.Request) -> web.Response:
+    _catalog_enabled(request)
+    settings = request.app[SETTINGS_KEY]
+    payload = await _json_object(request)
+    try:
+        info = analyse_source(payload.get("source"), settings.module_source_limit)
+        tags = clean_tags(payload["tags"]) if "tags" in payload else None
+    except SourceError as error:
+        raise ApiError(400, error.code, error.message) from None
+    if payload.get("version") not in (None, ""):
+        info.version = _catalog_version(payload.get("version"))
+    if not info.version:
+        raise ApiError(
+            400,
+            "version_required",
+            "Add __version__ = (1, 0, 0) to the module or pass version",
+        )
+    changelog = " ".join(
+        _bounded_text(payload.get("changelog", ""), "changelog", 1000).split()
+    )
+    result = _unwrap_catalog_result(
+        await request.app[STORE_KEY].catalog_publish(
+            info,
+            payload["source"],
+            changelog,
+            tags,
+            request["credential"],
+            max_versions=settings.catalog_max_versions,
+            max_modules_per_owner=settings.catalog_max_modules,
+            daily_upload_limit=settings.catalog_daily_uploads,
+        )
+    )
+    await request.app[STORE_KEY].add_event(
+        CATALOG_TOPIC,
+        "hikka-hub",
+        {
+            "schema": 1,
+            "module_id": result["module_id"],
+            "title": result["title"],
+            "version": result["latest_version"],
+            "previous_version": result["previous_version"],
+            "developer": result["developer"],
+            "publisher_instance_id": request["credential"]["instance_id"],
+            "changelog": changelog[:MODULE_CHANGE_LIMIT],
+        },
+        settings.event_retention_hours * 3600,
+    )
+    return _response(result, status=201)
+
+
+async def catalog_list(request: web.Request) -> web.Response:
+    _catalog_enabled(request)
+    query = " ".join(_bounded_text(request.query.get("q", ""), "q", 64).split())
+    tag = str(request.query.get("tag", "")).strip().lower().lstrip("#")
+    if tag and not CATALOG_TAG_RE.fullmatch(tag):
+        raise ApiError(400, "invalid_query", "Invalid tag")
+    sort = str(request.query.get("sort", "popular")).strip().lower()
+    if sort not in CATALOG_SORT_VALUES:
+        raise ApiError(400, "invalid_query", "sort must be popular, rating, new or updated")
+    mine = _query_bool(request, "mine")
+    result = await request.app[STORE_KEY].catalog_list(
+        query=query,
+        tag=tag,
+        sort=sort,
+        limit=_query_int(request, "limit", 20, 1, 50),
+        offset=_query_int(request, "offset", 0, 0, 100000),
+        owner_id=int(request["credential"]["owner_id"]) if mine else None,
+    )
+    return _response(result)
+
+
+async def catalog_tags(request: web.Request) -> web.Response:
+    _catalog_enabled(request)
+    limit = _query_int(request, "limit", 30, 1, 100)
+    return _response({"tags": await request.app[STORE_KEY].catalog_tags(limit)})
+
+
+async def catalog_get(request: web.Request) -> web.Response:
+    _catalog_enabled(request)
+    module_id = _catalog_module_id(request.match_info["module_id"])
+    credential = request["credential"]
+    item = await request.app[STORE_KEY].catalog_get(
+        module_id, credential["instance_id"], int(credential["owner_id"])
+    )
+    if item is None:
+        raise ApiError(404, "module_not_found", "Module was not found in the catalog")
+    return _response(item)
+
+
+async def catalog_source(request: web.Request) -> web.Response:
+    _catalog_enabled(request)
+    module_id = _catalog_module_id(request.match_info["module_id"])
+    version = request.query.get("version")
+    version = _catalog_version(version) if version else None
+    item = await request.app[STORE_KEY].catalog_source(
+        module_id, version, int(request["credential"]["owner_id"])
+    )
+    if item is None:
+        raise ApiError(404, "module_not_found", "Module or version was not found")
+    return _response(item)
+
+
+async def catalog_install(request: web.Request) -> web.Response:
+    _catalog_enabled(request)
+    module_id = _catalog_module_id(request.match_info["module_id"])
+    payload = await _json_object(request)
+    version = _catalog_version(payload.get("version"))
+    result = await request.app[STORE_KEY].catalog_record_install(
+        module_id, request["credential"]["instance_id"], version
+    )
+    if result is None:
+        raise ApiError(404, "module_not_found", "Module or version was not found")
+    return _response(result)
+
+
+async def catalog_rate(request: web.Request) -> web.Response:
+    _catalog_enabled(request)
+    module_id = _catalog_module_id(request.match_info["module_id"])
+    payload = await _json_object(request)
+    stars = payload.get("stars")
+    if isinstance(stars, bool) or not isinstance(stars, int) or not 1 <= stars <= 5:
+        raise ApiError(400, "invalid_field", "stars must be an integer 1..5")
+    result = await request.app[STORE_KEY].catalog_rate(
+        module_id, int(request["credential"]["owner_id"]), stars
+    )
+    return _response(_unwrap_catalog_result(result))
+
+
+async def catalog_delete(request: web.Request) -> web.Response:
+    _catalog_enabled(request)
+    module_id = _catalog_module_id(request.match_info["module_id"])
+    version = request.query.get("version")
+    version = _catalog_version(version) if version else None
+    result = await request.app[STORE_KEY].catalog_delete(
+        module_id, int(request["credential"]["owner_id"]), version
+    )
+    return _response(_unwrap_catalog_result(result))
+
+
+async def catalog_updates(request: web.Request) -> web.Response:
+    _catalog_enabled(request)
+    payload = await _json_object(request)
+    raw = payload.get("modules")
+    if not isinstance(raw, dict) or len(raw) > 200:
+        raise ApiError(400, "invalid_field", "modules must map up to 200 IDs to versions")
+    installed = {
+        _catalog_module_id(module_id): _catalog_version(version, "installed version")
+        for module_id, version in raw.items()
+    }
+    updates = await request.app[STORE_KEY].catalog_updates(installed)
+    return _response({"updates": updates, "checked": len(installed)})
+
+
+async def send_direct_message(request: web.Request) -> web.Response:
+    payload = await _json_object(request)
+    recipient = _instance_id(payload.get("to"), "to")
+    text = _bounded_text(payload.get("text"), "text", DIRECT_TEXT_LIMIT, allow_empty=False)
+    credential = request["credential"]
+    if recipient == credential["instance_id"]:
+        raise ApiError(400, "self_message", "You cannot message your own HikkaNet node")
+    result = await request.app[STORE_KEY].send_direct(
+        credential["instance_id"],
+        recipient,
+        text,
+        request.app[SETTINGS_KEY].direct_message_ttl_seconds,
+    )
+    if result.get("error"):
+        raise ApiError(404, "recipient_not_found", "Recipient HikkaNet node was not found")
+    await request.app[STORE_KEY].record_usage(credential["instance_id"], "events")
+    return _response(result, status=201)
+
+
+async def list_direct_messages(request: web.Request) -> web.Response:
+    after_id = _query_int(request, "after_id", 0, 0, 2**63 - 1)
+    limit = _query_int(request, "limit", 50, 1, 200)
+    messages = await request.app[STORE_KEY].list_direct(
+        request["credential"]["instance_id"], after_id, limit
+    )
+    return _response(
+        {
+            "messages": messages,
+            "next_after_id": messages[-1]["id"] if messages else after_id,
+        }
+    )
+
+
 async def publish_event(request: web.Request) -> web.Response:
     payload = await _json_object(request)
     topic = _identifier(payload.get("topic"), "topic")
@@ -997,7 +1244,7 @@ def create_app(
     settings = settings or Settings.from_env()
     app = web.Application(
         middlewares=[error_middleware, auth_middleware],
-        client_max_size=settings.request_body_limit,
+        client_max_size=settings.upload_body_limit,
     )
     app[SETTINGS_KEY] = settings
     app[STORE_KEY] = store or Store(settings.database)
@@ -1027,6 +1274,17 @@ def create_app(
             web.delete("/v1/chat/presence/{room}", leave_chat_presence),
             web.get("/v1/chat/rooms", list_chat_rooms),
             web.get("/v1/chat/rooms/{room}/members", list_chat_members),
+            web.get("/v1/catalog/tags", catalog_tags),
+            web.post("/v1/catalog/updates", catalog_updates),
+            web.post("/v1/catalog/modules", catalog_publish),
+            web.get("/v1/catalog/modules", catalog_list),
+            web.get("/v1/catalog/modules/{module_id}", catalog_get),
+            web.delete("/v1/catalog/modules/{module_id}", catalog_delete),
+            web.get("/v1/catalog/modules/{module_id}/source", catalog_source),
+            web.post("/v1/catalog/modules/{module_id}/installs", catalog_install),
+            web.post("/v1/catalog/modules/{module_id}/rating", catalog_rate),
+            web.post("/v1/inbox", send_direct_message),
+            web.get("/v1/inbox", list_direct_messages),
             web.post("/v1/events", publish_event),
             web.get("/v1/events", get_events),
             web.put("/v1/kv/{namespace}/{item_key}", put_item),
