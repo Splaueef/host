@@ -1518,6 +1518,40 @@ class Store:
             "size": info.size,
         }
 
+    async def catalog_repair_official(self, info: ModuleInfo, source: str) -> bool:
+        """Replace the stored code of an official version if it differs."""
+
+        def operation():
+            row = self._db.execute(
+                """
+                SELECT v.sha256 FROM catalog_versions v
+                JOIN catalog_modules m ON m.module_id=v.module_id
+                WHERE v.module_id=? AND v.version=? AND m.owner_id=?
+                """,
+                (info.module_id, info.version, OFFICIAL_OWNER_ID),
+            ).fetchone()
+            if not row or row["sha256"] == info.sha256:
+                return False
+            self._db.execute(
+                """
+                UPDATE catalog_versions SET source=?, sha256=?, size=?,
+                    commands_json=?, warnings_json=?
+                WHERE module_id=? AND version=?
+                """,
+                (
+                    source,
+                    info.sha256,
+                    info.size,
+                    json.dumps(info.commands, separators=(",", ":")),
+                    json.dumps(info.warnings, separators=(",", ":")),
+                    info.module_id,
+                    info.version,
+                ),
+            )
+            return True
+
+        return await self._run(operation)
+
     async def catalog_list(
         self,
         query: str = "",

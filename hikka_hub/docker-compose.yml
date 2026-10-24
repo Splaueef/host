@@ -1,7 +1,7 @@
 services:
   hikka-hub:
     build: .
-    image: hikka-hub:2.2.0
+    image: hikka-hub:2.2.1
     container_name: hikka-hub
     restart: unless-stopped
     ports:
