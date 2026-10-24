@@ -1365,14 +1365,28 @@ class OptimizationTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(first_round, 1)
         self.assertEqual(seen, [["android_vr"]])
 
-    def test_lanczos_only_for_big_downscales(self):
+    def test_frames_are_dropped_before_cheap_scaling(self):
         track = voicechat.Track("https://x/v.mp4")
         track.video_url = track.audio_url = "https://x/v.mp4"
         track.width, track.height = 3840, 2160
+        params = self.mod._ffmpeg_parameters(track, frame=(1280, 720, 30))
+        self.assertNotIn("lanczos", params)
+        video = shlex.split(params)[shlex.split(params).index("--video"):]
+        self.assertEqual(
+            video[video.index("-atend"):],
+            ["-atend", "-an", "-sn", "-dn", "-vf",
+             "fps=30,scale=1280:720:flags=bilinear"],
+        )
+        # Without exact frame data py-tgcalls' own filter stays.
+        self.assertNotIn("-vf", self.mod._ffmpeg_parameters(track))
+
+    def test_format_choice_caps_fps_and_prefers_cheap_codec(self):
         self.mod.config["video_quality"] = "1080p"
-        self.assertIn("lanczos", self.mod._ffmpeg_parameters(track))
-        track.width, track.height = 1920, 1080
-        self.assertNotIn("lanczos", self.mod._ffmpeg_parameters(track) or "")
+        self.mod.config["max_fps"] = 30
+        sort = self.mod._ydl_options(False)["format_sort"]
+        self.assertEqual(sort, ["res:1080", "fps:30", "hdr:sdr", "vcodec:h264"])
+        self.mod.config["video_quality"] = "4k"
+        self.assertIn("vcodec:vp9", self.mod._ydl_options(False)["format_sort"])
 
     def test_periodic_saves_are_throttled(self):
         writes = []
@@ -1429,6 +1443,7 @@ class RawStreamTest(unittest.TestCase):
             self.assertNotIn("-reconnect_at_eof", command)
             self.assertIn("-ss 5", command)
         self.assertEqual(screen.args[2].args[:2], (1280, 720))
+        self.assertIn("fps=25,scale=1280:720:flags=bilinear", screen.args[1])
 
     def test_unknown_frame_size_falls_back_to_full_check(self):
         mod = voicechat.VoiceChatMod()
@@ -1521,6 +1536,28 @@ class AutoQualityTest(unittest.IsolatedAsyncioTestCase):
         await self.mod.vcadd(_Message("https://b"))
         await self.mod.vcskip(_Message())
         self.assertEqual(self._player().current.quality_drop, 1)
+
+    async def test_module_cpu_over_limit_steps_down_on_a_big_server(self):
+        # 4 % of the whole server, but Hikka + ffmpeg take two cores.
+        track = await self._play_video()
+        self.mod.config["video_quality"] = "1080p"
+        player = self._player()
+        with mock.patch.dict(sys.modules, {"psutil": _psutil(40, hikka=170.0)}):
+            await self.mod._watch_load(player)
+            await self.mod._watch_load(player)
+        self.assertEqual(track.quality_drop, 1)
+        # The next track does not step back up while the module stays busy.
+        await self.mod.vcadd(_Message("https://b"))
+        await self.mod.vcskip(_Message())
+        self.assertEqual(self._player().current.quality_drop, 1)
+
+    async def test_cpu_limit_zero_watches_only_the_server(self):
+        track = await self._play_video()
+        self.mod.config["cpu_limit"] = 0
+        with mock.patch.dict(sys.modules, {"psutil": _psutil(40, hikka=400.0)}):
+            for _ in range(3):
+                await self.mod._watch_load(self._player())
+        self.assertEqual(track.quality_drop, 0)
 
     async def test_auto_quality_can_be_switched_off(self):
         track = await self._play_video()
