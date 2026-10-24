@@ -1529,13 +1529,45 @@ class AutoQualityTest(unittest.IsolatedAsyncioTestCase):
     async def test_calm_cpu_changes_nothing_and_next_track_steps_back_up(self):
         track = await self._play_video()
         player = self._player()
-        with mock.patch.dict(sys.modules, {"psutil": _psutil(40)}):
+        with mock.patch.dict(
+            sys.modules, {"psutil": _psutil(40, hikka=20.0, ffmpeg=(10.0, 5.0))}
+        ):
             await self.mod._watch_load(player)
         self.assertEqual(track.quality_drop, 0)
         player.quality_drop = 2
         await self.mod.vcadd(_Message("https://b"))
         await self.mod.vcskip(_Message())
         self.assertEqual(self._player().current.quality_drop, 1)
+
+    async def test_no_step_up_when_the_higher_quality_would_overload(self):
+        # 100 % of a core at 360p is ~180 % at 480p, over cpu_limit (150).
+        track = await self._play_video()
+        player = self._player()
+        player.quality_drop = track.quality_drop = 2
+        with mock.patch.dict(
+            sys.modules, {"psutil": _psutil(30, hikka=70.0, ffmpeg=(20.0, 10.0))}
+        ):
+            await self.mod._watch_load(player)
+        await self.mod.vcadd(_Message("https://b"))
+        await self.mod.vcskip(_Message())
+        self.assertEqual(self._player().current.quality_drop, 2)
+
+    async def test_the_quality_that_works_is_remembered_for_the_chat(self):
+        track = await self._play_video()
+        player = self._player()
+        with mock.patch.dict(sys.modules, {"psutil": _psutil(40, hikka=170.0)}):
+            await self.mod._watch_load(player)
+            await self.mod._watch_load(player)
+        self.assertEqual(track.quality_drop, 1)
+        cap = self.mod._video_cap(track)
+        self.assertEqual(self.mod.get("chat_settings")[str(CHAT)]["video_cap"], cap)
+        # A new player (after .vcstop or a restart) starts there right away.
+        del self.mod._players[CHAT]
+        self.assertEqual(self.mod._player(CHAT).quality_drop, 1)
+        # A video_quality at or below the saved one needs no extra steps.
+        del self.mod._players[CHAT]
+        self.mod.config["video_quality"] = "360p"
+        self.assertEqual(self.mod._player(CHAT).quality_drop, 0)
 
     async def test_module_cpu_over_limit_steps_down_on_a_big_server(self):
         # 4 % of the whole server, but Hikka + ffmpeg take two cores.
