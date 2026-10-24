@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 1.2.0
+# meta version: 1.3.0
 # meta description: Планувальник тиші: вимикає сповіщення та/або архівує чати за розкладом.
 
 import datetime
@@ -30,24 +30,24 @@ class QuietScheduleMod(loader.Module):
         "cfg_default_mute": "Типова дія: вимикати сповіщення",
         "cfg_default_archive": "Типова дія: кидати чат в архів",
         "bad_tz": "❌ <b>Невідома таймзона:</b> <code>{}</code>",
-        "now": "🕒 <b>Зараз:</b> <code>{}</code>\n🌍 <b>Таймзона:</b> <code>{}</code>",
+        "now": "🕒 <b>Зараз</b>\n<blockquote>📅 <code>{}</code>\n🌍 <code>{}</code></blockquote>",
         "help": (
-            "<b>QuietSchedule</b>\n\n"
-            "<code>.qnow</code> — точна дата й час.\n"
+            "🌙 <b>QuietSchedule</b>\n"
+            "<blockquote><code>.qnow</code> — точна дата й час.\n"
             "<code>.qadd @user 2026-07-11 22:00 2026-07-12 08:00 mute archive</code> — разово.\n"
             "<code>.qadd @user daily 22:00 08:00 mute archive</code> — щодня.\n"
             "<code>.qadd @user weekly mon,wed,fri 22:00 08:00 mute</code> — щотижня.\n"
             "<code>.qadd @user for 2h30m mute</code> — тиша на певний час від зараз.\n"
             "<code>.qlist</code> — список.\n"
             "<code>.qpause id</code> / <code>.qresume id</code> — призупинити / відновити.\n"
-            "<code>.qdel id</code> — видалити.\n\n"
-            "Дії можна не вказувати — будуть використані значення з конфігу."
+            "<code>.qdel id</code> — видалити.</blockquote>\n"
+            "<i>Дії можна не вказувати — будуть використані значення з конфігу.</i>"
         ),
         "added": "✅ <b>Розклад додано.</b>\n<code>{}</code>",
         "removed": "✅ <b>Розклад видалено:</b> <code>{}</code>",
         "not_found": "❌ <b>Розклад не знайдено:</b> <code>{}</code>",
         "empty": "📭 <b>Розкладів немає.</b>",
-        "list_header": "📋 <b>QuietSchedule:</b>\n\n{}",
+        "list_header": "🌙 <b>QuietSchedule · розклади</b>\n<blockquote>{}</blockquote>",
         "bad_args": "❌ <b>Не можу розібрати аргументи.</b>\n\n{}",
         "paused": "⏸ <b>Розклад призупинено:</b> <code>{}</code>",
         "resumed": "▶️ <b>Розклад відновлено:</b> <code>{}</code>",

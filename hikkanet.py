@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 2.2.0
+# meta version: 2.3.0
 # meta description: 🔐 HikkaNet: вузли, каталог модулів, пошта, глобальні ігри, чат, події та статистика.
 # scope: inline
 # scope: hikka_only
@@ -32,7 +32,7 @@ from .. import loader, utils
 
 
 logger = logging.getLogger(__name__)
-__version__ = (2, 2, 0)
+__version__ = (2, 3, 0)
 _PROTOCOL = "HIKKA-HUB-V1"
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$")
@@ -927,7 +927,14 @@ class HikkaNetMod(loader.Module):
         )
 
     async def api_catalog_search(
-        self, query="", tag="", sort="popular", limit=20, offset=0, mine=False
+        self,
+        query="",
+        tag="",
+        sort="popular",
+        limit=20,
+        offset=0,
+        mine=False,
+        official=False,
     ):
         sort = str(sort or "popular").strip().lower()
         if sort not in _CATALOG_SORTS:
@@ -942,6 +949,7 @@ class HikkaNetMod(loader.Module):
                 "limit": max(1, min(int(limit), 50)),
                 "offset": max(0, int(offset)),
                 "mine": 1 if mine else None,
+                "official": 1 if official else None,
             },
         )
 
@@ -1029,8 +1037,14 @@ class HikkaNetMod(loader.Module):
         if not isinstance(entry, dict):
             return None
         class_name = entry.get("class_name") or ""
-        if class_name and not self.lookup(class_name):
+        instance = self.lookup(class_name) if class_name else None
+        if class_name and not instance:
             return None  # unloaded with .unloadmod since then
+        # ModuleHub or .dlmod may have updated the module since; trust the code.
+        loaded = getattr(instance, "__version__", None)
+        if isinstance(loaded, (tuple, list)) and 2 <= len(loaded) <= 4:
+            if all(isinstance(part, int) for part in loaded):
+                return ".".join(map(str, loaded))
         return entry.get("version")
 
     async def install_from_catalog(self, module_id, version=None, target=None):
@@ -1163,7 +1177,7 @@ class HikkaNetMod(loader.Module):
                 continue
             notified[module_id] = latest
             warnings = [code for code in item.get("warnings", []) if code in _CONFIRM_WARNINGS]
-            if self.config["catalog_auto_update"] and not warnings:
+            if self.config["catalog_auto_update"] and (item.get("official") or not warnings):
                 status = await self._client.send_message(
                     "me",
                     f"🔄 <b>HikkaNet</b> оновлює <code>{_esc(module_id)}</code> "
@@ -1423,23 +1437,35 @@ class HikkaNetMod(loader.Module):
     # ------------------------------------------------------------------
     # Module catalog UI
     # ------------------------------------------------------------------
-    async def _catalog_list_view(self, query="", sort="popular", offset=0, mine=False):
+    async def _catalog_list_view(
+        self, query="", sort="popular", offset=0, mine=False, official=False
+    ):
         data = await self.api_catalog_search(
-            query, sort=sort, limit=_CATALOG_PAGE, offset=offset, mine=mine
+            query,
+            sort=sort,
+            limit=_CATALOG_PAGE,
+            offset=offset,
+            mine=mine,
+            official=official,
         )
         modules = data.get("modules", [])
         total = int(data.get("total", 0))
-        title = "🧩 <b>HikkaNet · мої модулі</b>" if mine else "🧩 <b>HikkaNet · каталог модулів</b>"
+        if mine:
+            title = "🧩 <b>HikkaNet · мої модулі</b>"
+        elif official:
+            title = "🏛 <b>HikkaNet · офіційні модулі</b>"
+        else:
+            title = "🧩 <b>HikkaNet · каталог модулів</b>"
         subtitle = f"{_CATALOG_SORTS[sort]} · знайдено <b>{total}</b>"
         if query:
             subtitle += f" · «{_esc(query)}»"
         lines = [title, subtitle, ""]
-        back = (query, sort, offset, mine)
+        back = (query, sort, offset, mine, official)
         markup = []
         for item in modules:
             module_id = item.get("module_id")
             local = self._installed_version(module_id)
-            mark = "✅ " if local else ""
+            mark = "✅ " if local else ("🏛 " if item.get("official") else "")
             if mine and item.get("status") != "published":
                 mark = "⛔️ "
             lines.append(
@@ -1471,7 +1497,7 @@ class HikkaNetMod(loader.Module):
                 {
                     "text": "◀️",
                     "callback": self._catalog_list_callback,
-                    "args": (query, sort, max(0, offset - _CATALOG_PAGE), mine),
+                    "args": (query, sort, max(0, offset - _CATALOG_PAGE), mine, official),
                 }
             )
         if total > _CATALOG_PAGE:
@@ -1487,7 +1513,7 @@ class HikkaNetMod(loader.Module):
                 {
                     "text": "▶️",
                     "callback": self._catalog_list_callback,
-                    "args": (query, sort, offset + _CATALOG_PAGE, mine),
+                    "args": (query, sort, offset + _CATALOG_PAGE, mine, official),
                 }
             )
         if pages:
@@ -1497,7 +1523,7 @@ class HikkaNetMod(loader.Module):
                 {
                     "text": label,
                     "callback": self._catalog_list_callback,
-                    "args": (query, key, 0, mine),
+                    "args": (query, key, 0, mine, official),
                 }
                 for key, label in _CATALOG_SORTS.items()
                 if key != sort
@@ -1507,10 +1533,19 @@ class HikkaNetMod(loader.Module):
             [
                 {"text": "◀️ Меню", "callback": self._status_callback},
                 {"text": "⬆️ Оновлення", "callback": self._catalog_updates_callback},
+            ]
+        )
+        markup.append(
+            [
+                {
+                    "text": "🌍 Усі" if official else "🏛 Офіційні",
+                    "callback": self._catalog_list_callback,
+                    "args": ("", "popular", 0, False, not official),
+                },
                 {
                     "text": "🌍 Усі" if mine else "👤 Мої",
                     "callback": self._catalog_list_callback,
-                    "args": ("", "updated" if not mine else "popular", 0, not mine),
+                    "args": ("", "updated" if not mine else "popular", 0, not mine, False),
                 },
             ]
         )
@@ -1526,6 +1561,11 @@ class HikkaNetMod(loader.Module):
             + (f" · у тебе v{_esc(local)}" if local else "")
             + f" · {_format_size(item.get('size'))}",
         ]
+        if item.get("official"):
+            lines.append(
+                "🏛 <b>Офіційний модуль</b> · автоматично з репозиторію "
+                "<code>Splaueef/host</code>"
+            )
         if item.get("status") == "blocked":
             lines.append("⛔️ <b>Заблоковано адміністратором Hikka Hub</b>")
         if item.get("description"):
@@ -1561,9 +1601,11 @@ class HikkaNetMod(loader.Module):
             )
         else:
             lines.append("🛡 Перевірка коду: <b>підозрілих викликів не знайдено</b>")
-        lines.append(
-            "<i>Модулі публікують інші користувачі. Встановлюй лише те, чому довіряєш.</i>"
-        )
+        if not item.get("official"):
+            lines.append(
+                "<i>Модулі публікують інші користувачі. "
+                "Встановлюй лише те, чому довіряєш.</i>"
+            )
         return "\n\n".join(lines)
 
     def _catalog_card_markup(self, item, back):
@@ -1617,9 +1659,11 @@ class HikkaNetMod(loader.Module):
         )
         return markup
 
-    async def _catalog_list_callback(self, call, query="", sort="popular", offset=0, mine=False):
+    async def _catalog_list_callback(
+        self, call, query="", sort="popular", offset=0, mine=False, official=False
+    ):
         try:
-            text, markup = await self._catalog_list_view(query, sort, offset, mine)
+            text, markup = await self._catalog_list_view(query, sort, offset, mine, official)
             await call.edit(text, reply_markup=markup)
         except Exception as exc:
             await call.answer(self._safe_error(exc), show_alert=True)
@@ -1646,7 +1690,7 @@ class HikkaNetMod(loader.Module):
                     item,
                 )
                 risky = [c for c in entry.get("warnings", []) if c in _CONFIRM_WARNINGS]
-                if risky:
+                if risky and not item.get("official"):
                     await call.edit(
                         f"⚠️ <b>{_esc(item.get('title'))} v{_esc(version)}</b>\n\n"
                         "Автоматична перевірка знайшла в коді:\n"
@@ -1823,10 +1867,15 @@ class HikkaNetMod(loader.Module):
 
     @loader.command(ru_doc="Каталог модулів HikkaNet: пошук і встановлення")
     async def hkmods(self, message):
-        """🧩 .hkmods [пошук] — каталог модулів HikkaNet"""
+        """🧩 .hkmods [пошук | official] — каталог модулів HikkaNet"""
         query = utils.get_args_raw(message).strip()
         try:
-            text, markup = await self._catalog_list_view(query, "popular" if not query else "rating")
+            if query.lower() in {"official", "офіційні", "host"}:
+                text, markup = await self._catalog_list_view(official=True)
+            else:
+                text, markup = await self._catalog_list_view(
+                    query, "popular" if not query else "rating"
+                )
         except Exception as exc:
             await utils.answer(message, f"❌ <code>{_esc(self._safe_error(exc))}</code>")
             return
@@ -1877,7 +1926,7 @@ class HikkaNetMod(loader.Module):
             if entry is None:
                 raise ValueError(f"Версії v{version} немає в каталозі")
             risky = [c for c in entry.get("warnings", []) if c in _CONFIRM_WARNINGS]
-            if risky and not confirmed:
+            if risky and not confirmed and not item.get("official"):
                 await utils.answer(
                     message,
                     f"⚠️ <b>{_esc(item.get('title'))} v{_esc(version)}</b>\n"
@@ -1972,7 +2021,7 @@ class HikkaNetMod(loader.Module):
         for item in updates:
             module_id = item["module_id"]
             risky = [c for c in item.get("warnings", []) if c in _CONFIRM_WARNINGS]
-            if risky:
+            if risky and not item.get("official"):
                 results.append(
                     f"⚠️ <code>{_esc(module_id)}</code>: нова версія має попередження — "
                     f"<code>.hkinstall {_esc(module_id)} -y</code>"

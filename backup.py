@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 1.0.0
+# meta version: 1.1.0
 # meta description: Повний локальний бекап Hikka та встановлених модулів.
 
 """Create and restore portable Hikka backups in the current Telegram chat."""
@@ -34,10 +34,11 @@ class FullBackupMod(loader.Module):
         "creating": "⏳ <b>Створюю повний бекап…</b>",
         "caption": (
             "📦 <b>Повний бекап Hikka готовий</b>\n"
-            "Модулів у файлі: <b>{}</b>\n\n"
-            "⚠️ Файл містить налаштування та приватні дані. Не пересилайте його "
-            "стороннім. Для відновлення дайте відповідь на файл командою "
-            "<code>{}restoreall</code>."
+            "<blockquote>🧩 Модулів у файлі: <b>{}</b>\n"
+            "♻️ Відновлення: відповідь на файл командою <code>{}restoreall</code>"
+            "</blockquote>\n"
+            "⚠️ <i>Файл містить налаштування та приватні дані — не пересилайте "
+            "його стороннім.</i>"
         ),
         "reply_to_file": (
             "❌ <b>Дайте відповідь командою на файл бекапу, створений "
