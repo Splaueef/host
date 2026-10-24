@@ -64,6 +64,7 @@ def _load_module():
         Integer=_LoaderValidator,
         String=_LoaderValidator,
         Series=_LoaderValidator,
+        Choice=_LoaderValidator,
     )
     utils.escape_html = lambda value: html.escape(str(value), quote=False)
 
@@ -262,6 +263,113 @@ class ModuleHubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["key"] for item in report["updated"]], ["minigames"])
         self.assertEqual(report["current"], 2)
         network.api_module_versions.assert_awaited_once()
+
+    def _network_with_manifest(self, manifest):
+        network = _loaded("HikkaNetMod", {})
+        network.__version__ = (1, 0, 0)
+        network._configured = lambda: True
+        network.api_module_versions = mock.AsyncMock(
+            return_value={"schema": 1, "repository": "Splaueef/host", "modules": manifest}
+        )
+        return network
+
+    def _client(self):
+        sent = []
+
+        class Status:
+            async def delete(self):
+                sent.append("deleted")
+
+        async def send_message(peer, text, parse_mode=None):
+            sent.append((peer, text))
+            return Status()
+
+        self.module._client = types.SimpleNamespace(send_message=send_message)
+        return sent
+
+    async def test_updates_are_installed_from_hikkanet_catalog(self):
+        games = _loaded("MiniGamesMod", {})
+        games.__version__ = (1, 3, 0)
+        manifest = {f: "1.0.0" for f in self.module.REPO_FILES.values()}
+        manifest["minigames.py"] = "1.4.0"
+        network = self._network_with_manifest(manifest)
+        installs = []
+
+        async def install_from_catalog(module_id, version, target):
+            installs.append((module_id, version))
+            games.__version__ = (1, 4, 0)
+
+        network.install_from_catalog = install_from_catalog
+        self.module.allmodules.modules = [network, games]
+        self.module.invoke = mock.AsyncMock()
+        sent = self._client()
+
+        report = await self.module.check_module_updates(peer="me")
+
+        self.assertEqual(installs, [("minigames", "1.4.0")])
+        self.module.invoke.assert_not_awaited()
+        self.assertEqual(report["updated"][0]["via"], "hikkanet")
+        self.assertEqual(sent[0][0], "me")
+
+    async def test_missing_catalog_version_falls_back_to_github(self):
+        games = _loaded("MiniGamesMod", {})
+        games.__version__ = (1, 3, 0)
+        manifest = {f: "1.0.0" for f in self.module.REPO_FILES.values()}
+        manifest["minigames.py"] = "1.4.0"
+        network = self._network_with_manifest(manifest)
+
+        class NotFound(RuntimeError):
+            status = 404
+
+        network.install_from_catalog = mock.AsyncMock(side_effect=NotFound("no"))
+        self.module.allmodules.modules = [network, games]
+
+        async def invoke(command, source, peer=None):
+            games.__version__ = (1, 4, 0)
+
+        self.module.invoke = mock.AsyncMock(side_effect=invoke)
+        sent = self._client()
+
+        report = await self.module.check_module_updates(peer="me")
+
+        self.module.invoke.assert_awaited_once()
+        self.assertTrue(self.module.invoke.await_args.args[1].endswith("/minigames.py"))
+        self.assertEqual(report["updated"][0]["via"], "github")
+        self.assertIn("deleted", sent)
+
+    async def test_bad_catalog_copy_never_falls_back(self):
+        games = _loaded("MiniGamesMod", {})
+        games.__version__ = (1, 3, 0)
+        manifest = {f: "1.0.0" for f in self.module.REPO_FILES.values()}
+        manifest["minigames.py"] = "1.4.0"
+        network = self._network_with_manifest(manifest)
+        network.install_from_catalog = mock.AsyncMock(
+            side_effect=RuntimeError("Контрольна сума модуля не збігається")
+        )
+        self.module.allmodules.modules = [network, games]
+        self.module.invoke = mock.AsyncMock()
+        self._client()
+
+        report = await self.module.check_module_updates(peer="me")
+
+        self.module.invoke.assert_not_awaited()
+        self.assertIn("Контрольна сума", report["failed"][0]["error"])
+
+    async def test_github_fallback_can_be_disabled(self):
+        self.module.config["github_fallback"] = False
+        self.module.invoke = mock.AsyncMock()
+        with self.assertRaises(RuntimeError):
+            await self.module._install_module("minigames", "me")
+        self.module.invoke.assert_not_awaited()
+
+        self.module.config["install_source"] = "github"
+        await self.module._install_module("minigames", "me")
+        self.module.invoke.assert_awaited_once()
+
+    def test_catalog_ids_follow_hikka_hub_naming(self):
+        self.assertEqual(self.module._catalog_module_id("sysinfo"), "info")
+        self.assertEqual(self.module._catalog_module_id("vdlt"), "videodownloader")
+        self.assertEqual(self.module._catalog_module_id("eval"), "evaluator")
 
     async def test_auto_update_respects_excluded_modules(self):
         games = _loaded("MiniGamesMod", {})

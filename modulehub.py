@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 3.6.2
+# meta version: 3.7.0
 # meta description: 🧭 Центр команд, автооновлення та синхронізація статистики Hikka.
 # scope: inline
 # scope: hikka_only
@@ -610,6 +610,20 @@ class ModuleHubMod(loader.Module):
                 "Ключі модулів, які ModuleHub не повинен оновлювати",
                 validator=loader.validators.Series(loader.validators.String()),
             ),
+            loader.ConfigValue(
+                "install_source",
+                "hikkanet",
+                "Звідки встановлювати й оновлювати модулі: hikkanet — каталог "
+                "HikkaNet із перевіркою SHA-256, github — напряму з GitHub",
+                validator=loader.validators.Choice(["hikkanet", "github"]),
+            ),
+            loader.ConfigValue(
+                "github_fallback",
+                True,
+                "Брати модуль із GitHub, якщо HikkaNet не налаштовано або "
+                "в каталозі ще немає потрібної версії",
+                validator=loader.validators.Boolean(),
+            ),
         )
 
     async def client_ready(self, client, db):
@@ -838,8 +852,8 @@ class ModuleHubMod(loader.Module):
                 for candidate in candidates:
                     key = candidate["key"]
                     try:
-                        await self.invoke(
-                            "dlmod", self._catalog_source(key), peer=peer or "me"
+                        candidate["via"] = await self._install_module(
+                            key, peer or "me", candidate["to"]
                         )
                         refreshed = self._find_module(key)
                         if refreshed is None:
@@ -1539,6 +1553,19 @@ class ModuleHubMod(loader.Module):
             "",
             f"Автоматично: <b>{'🟢 увімкнено' if self.config['auto_update'] else '⚫️ вимкнено'}</b>",
             f"Події HikkaNet: кожні <b>{interval_text}</b>",
+            "Джерело модулів: <b>"
+            + (
+                "🌐 каталог HikkaNet"
+                if self._hikkanet_installer()
+                else "🐙 GitHub"
+            )
+            + "</b>"
+            + (
+                " <i>(HikkaNet недоступний)</i>"
+                if str(self.config["install_source"]) == "hikkanet"
+                and not self._hikkanet_installer()
+                else ""
+            ),
             f"Остання перевірка: <code>{checked_text}</code>",
             f"Виключено: <b>{len(excluded)}</b>",
         ]
@@ -1722,6 +1749,67 @@ class ModuleHubMod(loader.Module):
         filename = self.REPO_FILES[key]
         return f"{self.REPO_BASE}/{filename}"
 
+    def _catalog_module_id(self, key):
+        """ID under which Hikka Hub imports this module (see hikka_hub.catalog)."""
+        value = self.MODULES[key]["class"].lower()
+        if value.endswith("mod") and len(value) > 5:
+            value = value[:-3]
+        return value
+
+    def _hikkanet_installer(self):
+        if str(self.config["install_source"]) != "hikkanet":
+            return None
+        network = self._network_module()
+        install = getattr(network, "install_from_catalog", None) if network else None
+        return install if callable(install) else None
+
+    def _install_source_text(self, key):
+        if self._hikkanet_installer():
+            return (
+                "HikkaNet · офіційний каталог "
+                f"<code>{utils.escape_html(self._catalog_module_id(key))}</code>"
+            )
+        return f"<code>{utils.escape_html(self._catalog_source(key))}</code>"
+
+    async def _install_module(self, key, peer, version=None):
+        """Install or update a catalog module; return "hikkanet" or "github".
+
+        HikkaNet serves the official copy imported by Hikka Hub and checks its
+        SHA-256. GitHub is used only when HikkaNet cannot serve the module and
+        ``github_fallback`` allows it.
+        """
+        install = self._hikkanet_installer()
+        if install is not None:
+            spec = self.MODULES[key]
+            status = await self._client.send_message(
+                peer,
+                f"⏳ <b>HikkaNet</b> · встановлюю {spec['icon']} <b>{spec['name']}</b>"
+                + (f" v{utils.escape_html(version)}" if version else "")
+                + "…",
+                parse_mode="html",
+            )
+            try:
+                await install(self._catalog_module_id(key), version, status)
+                return "hikkanet"
+            except Exception as error:
+                # A missing module or version (the hub has not imported it yet)
+                # may fall back; a bad checksum or a load error must not.
+                missing = getattr(error, "status", 0) == 404
+                if not (missing and self.config["github_fallback"]):
+                    raise
+                logger.info("ModuleHub: %s is not in HikkaNet yet, using GitHub", key)
+                with contextlib.suppress(Exception):
+                    await status.delete()
+        elif str(self.config["install_source"]) == "hikkanet" and not self.config[
+            "github_fallback"
+        ]:
+            raise RuntimeError(
+                "HikkaNet не налаштовано або застарий (потрібен 2.2+), "
+                "а github_fallback вимкнено"
+            )
+        await self.invoke("dlmod", self._catalog_source(key), peer=peer)
+        return "github"
+
     async def _catalog_page(self, call, page=0, reply_id=None, note=None):
         keys = list(self.MODULES)
         page_count = max(1, (len(keys) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
@@ -1838,12 +1926,11 @@ class ModuleHubMod(loader.Module):
             return
         spec = self.MODULES[key]
         verb = "оновити" if action == "update" else "встановити"
-        source = self._catalog_source(key)
         await call.edit(
             "⚠️ <b>Підтвердження завантаження коду</b>\n\n"
             f"Ви справді хочете <b>{verb}</b> {spec['icon']} "
             f"<b>{spec['name']}</b>?\n\n"
-            f"Джерело: <code>{utils.escape_html(source)}</code>\n"
+            f"Джерело: {self._install_source_text(key)}\n"
             "<i>Модулі мають доступ до акаунта Hikka. Встановлюйте код "
             "лише з джерел, яким довіряєте.</i>",
             reply_markup=[
@@ -1873,7 +1960,7 @@ class ModuleHubMod(loader.Module):
             f"{spec['name']}…"
         )
         try:
-            await self.invoke("dlmod", self._catalog_source(key), peer=chat_id)
+            await self._install_module(key, chat_id)
         except Exception as error:
             logger.exception("ModuleHub: catalog action failed for %s", key)
             await self._missing_module_page(
