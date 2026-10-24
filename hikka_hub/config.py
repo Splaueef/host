@@ -45,6 +45,17 @@ class Settings:
     game_wait_ttl_seconds: int = 3600
     game_active_ttl_seconds: int = 7 * 86400
     chat_presence_ttl_seconds: int = 120
+    catalog_enabled: bool = True
+    module_source_limit: int = 262144
+    catalog_max_versions: int = 10
+    catalog_max_modules: int = 50
+    catalog_daily_uploads: int = 30
+    direct_message_ttl_seconds: int = 7 * 86400
+
+    @property
+    def upload_body_limit(self) -> int:
+        """Body limit for module uploads: escaped JSON source plus metadata."""
+        return max(self.request_body_limit, self.module_source_limit * 2 + 65536)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -78,5 +89,21 @@ class Settings:
             ),
             chat_presence_ttl_seconds=_integer(
                 "HIKKA_HUB_CHAT_PRESENCE_TTL", 120, 30, 3600
+            ),
+            catalog_enabled=_boolean("HIKKA_HUB_CATALOG", True),
+            module_source_limit=_integer(
+                "HIKKA_HUB_MODULE_SOURCE_LIMIT", 262144, 8192, 1024 * 1024
+            ),
+            catalog_max_versions=_integer(
+                "HIKKA_HUB_CATALOG_MAX_VERSIONS", 10, 1, 100
+            ),
+            catalog_max_modules=_integer(
+                "HIKKA_HUB_CATALOG_MAX_MODULES", 50, 1, 1000
+            ),
+            catalog_daily_uploads=_integer(
+                "HIKKA_HUB_CATALOG_DAILY_UPLOADS", 30, 1, 1000
+            ),
+            direct_message_ttl_seconds=_integer(
+                "HIKKA_HUB_DIRECT_TTL", 7 * 86400, 3600, 90 * 86400
             ),
         )

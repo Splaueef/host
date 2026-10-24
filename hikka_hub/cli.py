@@ -157,6 +157,64 @@ def rotate(args: argparse.Namespace) -> int:
     return 0
 
 
+def catalog_list(args: argparse.Namespace) -> int:
+    db = _connect(args.database)
+    try:
+        rows = db.execute(
+            """
+            SELECT module_id, title, latest_version, status, owner_id,
+                   owner_instance_id, installs, updated_at
+            FROM catalog_modules ORDER BY updated_at DESC
+            """
+        ).fetchall()
+    finally:
+        db.close()
+    if not rows:
+        print("Catalog is empty.")
+        return 0
+    for row in rows:
+        print(
+            f"{row['module_id']}  v{row['latest_version']}  {row['status']}  "
+            f"installs={row['installs']}  owner={row['owner_id']}  "
+            f"from={row['owner_instance_id']}  {row['title']}"
+        )
+    return 0
+
+
+def catalog_set_status(args: argparse.Namespace, status: str) -> int:
+    db = _connect(args.database)
+    try:
+        cursor = db.execute(
+            "UPDATE catalog_modules SET status=?, updated_at=? WHERE module_id=?",
+            (status, int(time.time()), args.module_id.lower()),
+        )
+        if not cursor.rowcount:
+            raise SystemExit("Module not found")
+        _audit(db, f"catalog_{status}", None, {"module_id": args.module_id.lower()})
+        db.commit()
+    finally:
+        db.close()
+    print(f"{args.module_id.lower()}: {status}")
+    return 0
+
+
+def catalog_delete(args: argparse.Namespace) -> int:
+    db = _connect(args.database)
+    try:
+        db.execute("PRAGMA foreign_keys=ON")
+        cursor = db.execute(
+            "DELETE FROM catalog_modules WHERE module_id=?", (args.module_id.lower(),)
+        )
+        if not cursor.rowcount:
+            raise SystemExit("Module not found")
+        _audit(db, "catalog_deleted", None, {"module_id": args.module_id.lower()})
+        db.commit()
+    finally:
+        db.close()
+    print(f"{args.module_id.lower()}: deleted")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage Hikka Hub credentials")
     parser.add_argument(
@@ -185,6 +243,24 @@ def build_parser() -> argparse.ArgumentParser:
     rotate_parser = subparsers.add_parser("rotate", help="Replace a credential secret")
     rotate_parser.add_argument("credential", help="instance_id or key_id")
     rotate_parser.set_defaults(func=rotate)
+
+    catalog_parser = subparsers.add_parser(
+        "catalog-list", help="List modules uploaded to the HikkaNet catalog"
+    )
+    catalog_parser.set_defaults(func=catalog_list)
+    for command, status in (("catalog-block", "blocked"), ("catalog-unblock", "published")):
+        command_parser = subparsers.add_parser(
+            command, help=f"Mark a catalog module as {status}"
+        )
+        command_parser.add_argument("module_id")
+        command_parser.set_defaults(
+            func=lambda args, value=status: catalog_set_status(args, value)
+        )
+    delete_parser = subparsers.add_parser(
+        "catalog-delete", help="Remove a module and all its versions"
+    )
+    delete_parser.add_argument("module_id")
+    delete_parser.set_defaults(func=catalog_delete)
     return parser
 
 
