@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 2.3.1
+# meta version: 2.3.2
 # meta description: 🔐 HikkaNet: вузли, каталог модулів, пошта, глобальні ігри, чат, події та статистика.
 # scope: inline
 # scope: hikka_only
@@ -32,7 +32,7 @@ from .. import loader, utils
 
 
 logger = logging.getLogger(__name__)
-__version__ = (2, 3, 1)
+__version__ = (2, 3, 2)
 _PROTOCOL = "HIKKA-HUB-V1"
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$")
@@ -607,8 +607,14 @@ class HikkaNetMod(loader.Module):
                 try:
                     envelope = json.loads(raw.decode("utf-8")) if raw else {}
                 except (UnicodeDecodeError, json.JSONDecodeError):
+                    # Say what arrived: a cut body, an HTML page of a proxy, etc.
+                    expected = response.headers.get("Content-Length") or "?"
+                    kind = response.headers.get("Content-Type") or "?"
+                    start = raw[:60].decode("utf-8", "replace").replace("\n", " ")
                     raise HubClientError(
-                        f"Сервер повернув не JSON (HTTP {response.status})",
+                        f"Сервер повернув не JSON (HTTP {response.status}, "
+                        f"HikkaNet {'.'.join(map(str, __version__))}, "
+                        f"отримано {len(raw)} з {expected} байт, {kind}): {start}",
                         status=response.status,
                         code="invalid_response",
                     ) from None
