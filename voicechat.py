@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 2.6.0
+# meta version: 2.6.1
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -100,6 +100,11 @@ PANEL_REFRESH = 15.0
 # edits in a row, the panel becomes a text message the account edits itself.
 PANEL_TIMEOUT = 20.0
 PANEL_FAILURES = 3
+# When Hikka cannot post the panel at all (e.g. "No query results": the
+# bot's answer to the inline query never came), it posts the traceback to
+# the chat itself.  That message is removed and the text panel is used;
+# the inline one is tried again after this long (or on the next vcnow).
+PANEL_RETRY = 5 * 60
 # Rich panel: Bot API rich messages (editMessageText with ``rich_message``),
 # the same format MiniGames uses.  Buttons live inside the message.
 BOT_API = "https://api.telegram.org/bot{token}/{method}"
@@ -1866,6 +1871,7 @@ class VoiceChatMod(loader.Module):
         self._health_task = None
         self._inline_broken = False
         self._inline_hint_sent = False
+        self._panel_retry_at = 0.0
         self._rich_broken = False
 
     async def client_ready(self, client, db):
@@ -4201,6 +4207,8 @@ class VoiceChatMod(loader.Module):
         """Post a fresh control panel (replacing ``status`` if given)."""
         if player.current is None or self._inline_broken:
             return False
+        if time.monotonic() < self._panel_retry_at:
+            return False
         old = player.panel
         text = self._panel_text(player)
         posted_at = time.time()
@@ -4221,8 +4229,12 @@ class VoiceChatMod(loader.Module):
             return False
         except Exception as error:
             logger.info("VoiceChat panel unavailable: %s", error)
+            self._panel_retry_at = time.monotonic() + PANEL_RETRY
             return False
         if not panel:
+            logger.info("VoiceChat: Hikka could not post the panel, using text")
+            self._panel_retry_at = time.monotonic() + PANEL_RETRY
+            await self._delete_invoke_error(player.chat_id, posted_at, status)
             return False
         player.panel = panel
         player.last_panel_text = text
@@ -4251,6 +4263,40 @@ class VoiceChatMod(loader.Module):
                 if date is not None and date.timestamp() < since - 10:
                     break
                 if message.out and getattr(message, "via_bot_id", None) == bot_id:
+                    await message.delete()
+
+    def _invoke_error_marks(self):
+        """Texts that identify Hikka's "unit invoke failed" message."""
+        marks = ["inline/form.py", "_invoke_unit"]
+        translator = getattr(self.inline, "translator", None)
+        for key in ("inline.invoke_failed", "inline.invoke_failed_logs"):
+            try:
+                text = translator.getkey(key)
+            except Exception:
+                continue
+            if isinstance(text, str):
+                first = re.sub(r"<[^>]+>", "", text).split("\n")[0].strip()
+                if len(first) > 3:
+                    marks.append(first)
+        return marks
+
+    async def _delete_invoke_error(self, chat_id, since, status=None):
+        """Remove the traceback Hikka posted when the panel failed.
+
+        ``status`` is skipped: Hikka edits it into the error when it is the
+        account's own message, and the text panel replaces it next.
+        """
+        keep = getattr(status, "id", None)
+        marks = self._invoke_error_marks()
+        with contextlib.suppress(Exception):
+            async for message in self._client.iter_messages(chat_id, limit=15):
+                date = getattr(message, "date", None)
+                if date is not None and date.timestamp() < since - 10:
+                    break
+                if not message.out or message.id == keep:
+                    continue
+                text = getattr(message, "raw_text", None) or ""
+                if any(mark in text for mark in marks):
                     await message.delete()
 
     async def _inline_failed(self, player, reason):
@@ -5065,6 +5111,7 @@ class VoiceChatMod(loader.Module):
         if player is None:
             return
         self._inline_broken = False  # e.g. inline feedback was switched on
+        self._panel_retry_at = 0.0
         if self._panel_enabled() and await self._show_panel(player, message):
             return
         if self._panel_enabled() and player.now_message is not None:
