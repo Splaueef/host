@@ -1,16 +1,18 @@
 # meta developer: @Huai_Baike
-# meta version: 3.5.0
+# meta version: 3.6.0
 # meta description: 🟢 Inline-панель, watchlist, графіки та експорт online-статистики.
 # requires: matplotlib
 # scope: inline
 
 import asyncio
+import contextlib
 import datetime
 import html as html_lib
 import io
 import json
 import logging
 import statistics
+import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import matplotlib
@@ -25,6 +27,9 @@ from telethon.tl.types import UpdateUserStatus, UserStatusOnline
 from .. import loader, utils
 
 logger = logging.getLogger(__name__)
+
+BOT_API = "https://api.telegram.org/bot{token}/{method}"
+EPHEMERAL_RETRY = 10 * 60
 
 
 @loader.tds
@@ -120,6 +125,10 @@ class ContactStatusMod(loader.Module):
             "⚠️ <b>Inline-панель тимчасово недоступна.</b>\n"
             "<i>Показую звичайний текстовий звіт.</i>"
         ),
+        "cfg_ephemeral": (
+            "У групах показувати звіти, графіки й експорт лише вам — "
+            "ефемерними повідомленнями inline-бота (бот має бути в групі)"
+        ),
     }
 
     RETENTION_DAYS = 31
@@ -131,6 +140,17 @@ class ContactStatusMod(loader.Module):
     MESSAGE_LIMIT = 3800
     CHART_MAX_USERS = 10
     INLINE_LIST_PAGE_SIZE = 8
+
+    def __init__(self):
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue(
+                "ephemeral",
+                True,
+                lambda: self.strings["cfg_ephemeral"],
+                validator=loader.validators.Boolean(),
+            ),
+        )
+        self._ephemeral_blocked = {}
 
     async def client_ready(self, client, db):
         self._client = client
@@ -2330,7 +2350,112 @@ class ContactStatusMod(loader.Module):
             blocks.append(block.rstrip())
         return self._paginate_report(text, blocks)
 
+    def _bot_token(self):
+        inline = getattr(self, "inline", None)
+        return getattr(inline, "_token", None) or getattr(
+            getattr(inline, "bot", None), "token", None
+        )
+
+    async def _answer(self, message, text):
+        """Answer a command; in a group only its sender sees the reply."""
+        if not await self._send_ephemeral(message, text):
+            await utils.answer(message, text)
+
+    async def _send_ephemeral(self, message, text, file=None):
+        """Send ``text`` (or ``file`` with ``text`` as its caption) as an
+        ephemeral message of the inline bot.
+
+        Telegram shows such a message only to ``receiver_user_id``; it works
+        in groups where the bot is a member.  False when it cannot be sent
+        here, so the caller answers as usual.
+        """
+        chat_id = getattr(message, "chat_id", None)
+        receiver = getattr(message, "sender_id", None)
+        token = self._bot_token()
+        if (
+            not self.config["ephemeral"]
+            or not getattr(message, "is_group", False)
+            or not chat_id
+            or not receiver
+            or not token
+            or self._ephemeral_blocked.get(chat_id, 0) > time.monotonic()
+        ):
+            return False
+        try:
+            import aiohttp
+
+            fields = {
+                "chat_id": str(chat_id),
+                "parse_mode": "HTML",
+                "ephemeral_message_parameters": json.dumps(
+                    {"receiver_user_id": receiver}
+                ),
+            }
+            if file is None:
+                method = "sendMessage"
+                fields["text"] = text
+                fields["link_preview_options"] = json.dumps({"is_disabled": True})
+                body = {"data": fields}
+            else:
+                name = getattr(file, "name", None) or "contactstatus"
+                field = "photo" if name.endswith(".png") else "document"
+                method = "sendPhoto" if field == "photo" else "sendDocument"
+                fields["caption"] = text
+                form = aiohttp.FormData()
+                for key, value in fields.items():
+                    form.add_field(key, value)
+                form.add_field(field, file.getvalue(), filename=name)
+                body = {"data": form}
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=60)
+            ) as session:
+                async with session.post(
+                    BOT_API.format(token=token, method=method), **body
+                ) as response:
+                    data = await response.json(content_type=None)
+        except Exception as error:
+            logger.debug("ContactStatus ephemeral answer failed: %s", error)
+            return False
+        if not isinstance(data, dict) or not data.get("ok"):
+            data = data if isinstance(data, dict) else {"description": str(data)}
+            description = str(data.get("description", ""))
+            if data.get("error_code") == 403 or "chat not found" in description.lower():
+                # The bot is not in this group: do not ask again for a while.
+                self._ephemeral_blocked[chat_id] = time.monotonic() + EPHEMERAL_RETRY
+            logger.info("ContactStatus: no ephemeral answer here (%s)", description)
+            return False
+        if getattr(message, "out", False):
+            with contextlib.suppress(Exception):
+                await message.delete()
+        return True
+
+    async def _send_ephemeral_pages(self, message, pages):
+        if not await self._send_ephemeral(message, pages[0]):
+            return False
+        for page in pages[1:]:
+            await self._send_ephemeral(message, page)
+        return True
+
+    async def _send_private_file(self, message, file, caption):
+        """The report file only for the sender in a group, else to the chat."""
+        if await self._send_ephemeral(message, caption, file):
+            return
+        file.seek(0)
+        await self._client.send_file(
+            message.peer_id,
+            file,
+            caption=caption,
+            parse_mode="html",
+            reply_to=getattr(message, "reply_to_msg_id", None),
+        )
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
     async def _send_report_pages(self, message, pages):
+        if await self._send_ephemeral_pages(message, pages):
+            return
         await utils.answer(message, pages[0])
         for page in pages[1:]:
             if hasattr(message, "respond"):
@@ -2405,7 +2530,7 @@ class ContactStatusMod(loader.Module):
             lowered = token.lower()
             if lowered in aliases:
                 if period_token is not None:
-                    await utils.answer(message, usage)
+                    await self._answer(message, usage)
                     return None
                 period_token = lowered
             elif lowered.isdigit():
@@ -2413,13 +2538,13 @@ class ContactStatusMod(loader.Module):
                     period_token is not None
                     or not 1 <= int(lowered) <= self.RETENTION_DAYS
                 ):
-                    await utils.answer(message, usage)
+                    await self._answer(message, usage)
                     return None
                 period_token = lowered
             elif not target_token:
                 target_token = token
             else:
-                await utils.answer(message, usage)
+                await self._answer(message, usage)
                 return None
 
         period_token = period_token or "today"
@@ -2447,7 +2572,7 @@ class ContactStatusMod(loader.Module):
                 )
 
         if user_id is False:
-            await utils.answer(
+            await self._answer(
                 message,
                 self.strings["user_not_found"].format(
                     utils.escape_html(target_token or "reply")
@@ -2457,7 +2582,7 @@ class ContactStatusMod(loader.Module):
         if user_id is not None:
             user_id = str(user_id)
             if user_id not in self._watched():
-                await utils.answer(message, self.strings["not_watched"])
+                await self._answer(message, self.strings["not_watched"])
                 return None
         return days_count, offset, user_id
 
@@ -3166,6 +3291,8 @@ class ContactStatusMod(loader.Module):
     @loader.command(ru_doc="Відкрити inline-панель ContactStatus")
     async def contactstatus(self, message):
         """🎛 Зручна inline-панель модуля"""
+        if await self._send_ephemeral(message, self._dashboard_text()):
+            return
         inline = getattr(self, "inline", None)
         if inline is not None and hasattr(inline, "form"):
             try:
@@ -3193,7 +3320,7 @@ class ContactStatusMod(loader.Module):
             elif item.isdigit():
                 page = max(1, int(item))
             else:
-                await utils.answer(message, self.strings["bad_list"])
+                await self._answer(message, self.strings["bad_list"])
                 return
 
         profiles = self.get("contacts", {})
@@ -3267,7 +3394,7 @@ class ContactStatusMod(loader.Module):
                 f"\n<i>Інша сторінка: <code>.contactlist {category} "
                 "N</code></i>"
             )
-        await utils.answer(message, text)
+        await self._answer(message, text)
 
     @loader.command(ru_doc="Додати користувача до списку спостереження")
     async def contactadd(self, message):
@@ -3275,10 +3402,10 @@ class ContactStatusMod(loader.Module):
         raw = utils.get_args_raw(message).strip()
         user = await self._resolve_user(message, raw)
         if user is None:
-            await utils.answer(message, self.strings["user_required"])
+            await self._answer(message, self.strings["user_required"])
             return
         if user is False:
-            await utils.answer(
+            await self._answer(
                 message,
                 self.strings["user_not_found"].format(
                     utils.escape_html(raw or "reply")
@@ -3316,7 +3443,7 @@ class ContactStatusMod(loader.Module):
             if was_watched
             else self.strings["watch_added"]
         )
-        await utils.answer(message, template.format(name))
+        await self._answer(message, template.format(name))
 
     @loader.command(ru_doc="Прибрати користувача зі списку спостереження")
     async def contactremove(self, message):
@@ -3324,10 +3451,10 @@ class ContactStatusMod(loader.Module):
         raw = utils.get_args_raw(message).strip()
         key = await self._resolve_target_id(message, raw)
         if key is None:
-            await utils.answer(message, self.strings["user_required"])
+            await self._answer(message, self.strings["user_required"])
             return
         if key is False:
-            await utils.answer(
+            await self._answer(
                 message,
                 self.strings["user_not_found"].format(
                     utils.escape_html(raw or "reply")
@@ -3336,7 +3463,7 @@ class ContactStatusMod(loader.Module):
             return
         key = str(key)
         if key not in self._watched():
-            await utils.answer(message, self.strings["not_watched"])
+            await self._answer(message, self.strings["not_watched"])
             return
 
         self._close_user_session(key)
@@ -3354,7 +3481,7 @@ class ContactStatusMod(loader.Module):
         profile["manual"] = False
         profiles[key] = profile
         self.set("contacts", profiles)
-        await utils.answer(
+        await self._answer(
             message,
             self.strings["watch_removed"].format(
                 self._profile_link(key, profile)
@@ -3368,15 +3495,15 @@ class ContactStatusMod(loader.Module):
             result = await self._sync_contacts()
         except Exception:
             logger.exception(self.strings["load_failed"])
-            await utils.answer(message, self.strings["sync_failed"])
+            await self._answer(message, self.strings["sync_failed"])
             return
         if result is None:
-            await utils.answer(
+            await self._answer(
                 message,
                 "⏳ <b>Синхронізація вже виконується.</b>",
             )
             return
-        await utils.answer(
+        await self._answer(
             message,
             self.strings["sync_done"].format(**result),
         )
@@ -3391,13 +3518,13 @@ class ContactStatusMod(loader.Module):
                 if self.get("auto_watch_contacts", True)
                 else "вимкнено"
             )
-            await utils.answer(
+            await self._answer(
                 message,
                 self.strings["autowatch_state"].format(state),
             )
             return
         if raw not in {"on", "off", "1", "0", "так", "ні"}:
-            await utils.answer(message, self.strings["bad_autowatch"])
+            await self._answer(message, self.strings["bad_autowatch"])
             return
         enabled = raw in {"on", "1", "так"}
         self.set("auto_watch_contacts", enabled)
@@ -3406,7 +3533,7 @@ class ContactStatusMod(loader.Module):
                 await self._sync_contacts()
             except Exception:
                 logger.exception(self.strings["load_failed"])
-        await utils.answer(
+        await self._answer(
             message,
             self.strings["autowatch_state"].format(
                 "увімкнено" if enabled else "вимкнено"
@@ -3424,7 +3551,7 @@ class ContactStatusMod(loader.Module):
                 if timezone_name == "local"
                 else timezone_name
             )
-            await utils.answer(
+            await self._answer(
                 message,
                 self.strings["timezone_state"].format(
                     utils.escape_html(label)
@@ -3439,7 +3566,7 @@ class ContactStatusMod(loader.Module):
             try:
                 new_tz = ZoneInfo(normalized)
             except (ZoneInfoNotFoundError, ValueError):
-                await utils.answer(
+                await self._answer(
                     message,
                     self.strings["timezone_invalid"],
                 )
@@ -3458,7 +3585,7 @@ class ContactStatusMod(loader.Module):
             {user_id: instant.timestamp() for user_id in active_ids},
         )
         self._prune(instant.astimezone(new_tz).date())
-        await utils.answer(
+        await self._answer(
             message,
             self.strings["timezone_changed"].format(
                 utils.escape_html(normalized)
@@ -3482,6 +3609,8 @@ class ContactStatusMod(loader.Module):
             offset,
             user_id,
         )
+        if await self._send_ephemeral_pages(message, pages):
+            return
         inline = getattr(self, "inline", None)
         if inline is not None and hasattr(inline, "form"):
             try:
@@ -3523,7 +3652,7 @@ class ContactStatusMod(loader.Module):
             elif not is_period and not target_token:
                 target_token = token
             else:
-                await utils.answer(message, self.strings["bad_period"])
+                await self._answer(message, self.strings["bad_period"])
                 return
 
         period_token = period_token or "today"
@@ -3554,7 +3683,7 @@ class ContactStatusMod(loader.Module):
                 )
 
         if user_id is False:
-            await utils.answer(
+            await self._answer(
                 message,
                 self.strings["user_not_found"].format(
                     utils.escape_html(target_token)
@@ -3564,7 +3693,7 @@ class ContactStatusMod(loader.Module):
         if user_id is not None:
             user_id = str(user_id)
             if user_id not in self._watched():
-                await utils.answer(message, self.strings["not_watched"])
+                await self._answer(message, self.strings["not_watched"])
                 return
 
         now = self._now()
@@ -3580,7 +3709,7 @@ class ContactStatusMod(loader.Module):
                 else {}
             )
         if not intervals:
-            await utils.answer(message, self.strings["empty"])
+            await self._answer(message, self.strings["empty"])
             return
 
         await utils.answer(message, self.strings["chart_building"])
@@ -3622,20 +3751,10 @@ class ContactStatusMod(loader.Module):
                         contacts.get(user_id, {}),
                     )
                 )
-            await self._client.send_file(
-                message.peer_id,
-                chart,
-                caption=caption,
-                parse_mode="html",
-                reply_to=getattr(message, "reply_to_msg_id", None),
-            )
-            try:
-                await message.delete()
-            except Exception:
-                pass
+            await self._send_private_file(message, chart, caption)
         except Exception:
             logger.exception("ContactStatus: chart rendering failed")
-            await utils.answer(message, self.strings["chart_failed"])
+            await self._answer(message, self.strings["chart_failed"])
         finally:
             if chart is not None:
                 chart.close()
@@ -3651,7 +3770,7 @@ class ContactStatusMod(loader.Module):
             if token.lower() in {"html", "json"}
         ]
         if len(format_tokens) > 1:
-            await utils.answer(message, self.strings["export_usage"])
+            await self._answer(message, self.strings["export_usage"])
             return
         if format_tokens:
             export_format = format_tokens[0]
@@ -3680,7 +3799,7 @@ class ContactStatusMod(loader.Module):
             user_id,
         )
         if not payload["users"]:
-            await utils.answer(message, self.strings["empty"])
+            await self._answer(message, self.strings["empty"])
             return
 
         await utils.answer(
@@ -3704,20 +3823,10 @@ class ContactStatusMod(loader.Module):
                 f"сеансів: <b>{payload['summary']['session_count']}</b>\n"
                 "⚠️ <i>У файлі є чутлива статистика присутності.</i>"
             )
-            await self._client.send_file(
-                message.peer_id,
-                export_file,
-                caption=caption,
-                parse_mode="html",
-                reply_to=getattr(message, "reply_to_msg_id", None),
-            )
-            try:
-                await message.delete()
-            except Exception:
-                pass
+            await self._send_private_file(message, export_file, caption)
         except Exception:
             logger.exception("ContactStatus: export rendering failed")
-            await utils.answer(message, self.strings["export_failed"])
+            await self._answer(message, self.strings["export_failed"])
         finally:
             if export_file is not None:
                 export_file.close()
@@ -3733,7 +3842,7 @@ class ContactStatusMod(loader.Module):
         if parsed is None:
             return
         days_count, offset, user_id = parsed
-        await utils.answer(
+        await self._answer(
             message,
             self._insights_report(
                 self._now(),
@@ -3764,7 +3873,7 @@ class ContactStatusMod(loader.Module):
             elif not is_period:
                 targets.append(token)
             else:
-                await utils.answer(message, self.strings["compare_usage"])
+                await self._answer(message, self.strings["compare_usage"])
                 return
 
         period_token = period_token or "today"
@@ -3778,7 +3887,7 @@ class ContactStatusMod(loader.Module):
         ):
             days_count, offset = int(period_token), 0
         else:
-            await utils.answer(message, self.strings["compare_usage"])
+            await self._answer(message, self.strings["compare_usage"])
             return
 
         if len(targets) == 2:
@@ -3797,19 +3906,19 @@ class ContactStatusMod(loader.Module):
                 targets[0],
             )
         else:
-            await utils.answer(message, self.strings["compare_usage"])
+            await self._answer(message, self.strings["compare_usage"])
             return
 
         if first_id in (None, False) or second_id in (None, False):
-            await utils.answer(message, self.strings["compare_usage"])
+            await self._answer(message, self.strings["compare_usage"])
             return
         first_id, second_id = str(first_id), str(second_id)
         if first_id == second_id:
-            await utils.answer(message, self.strings["same_user"])
+            await self._answer(message, self.strings["same_user"])
             return
         watched = self._watched()
         if first_id not in watched or second_id not in watched:
-            await utils.answer(message, self.strings["not_watched"])
+            await self._answer(message, self.strings["not_watched"])
             return
         await self._send_report_pages(
             message,
@@ -3837,7 +3946,7 @@ class ContactStatusMod(loader.Module):
                     if key in self._watched()
                 },
             )
-            await utils.answer(message, self.strings["cleared_all"])
+            await self._answer(message, self.strings["cleared_all"])
             return
 
         if not raw:
@@ -3846,11 +3955,11 @@ class ContactStatusMod(loader.Module):
             except Exception:
                 reply = None
             if not reply:
-                await utils.answer(message, self.strings["clear_usage"])
+                await self._answer(message, self.strings["clear_usage"])
                 return
         key = await self._resolve_target_id(message, raw)
         if key in (None, False):
-            await utils.answer(
+            await self._answer(
                 message,
                 self.strings["user_not_found"].format(
                     utils.escape_html(raw or "reply")
@@ -3874,7 +3983,7 @@ class ContactStatusMod(loader.Module):
             active[key] = self._now().timestamp()
             self.set("active", active)
         profile = self.get("contacts", {}).get(key, {"name": key})
-        await utils.answer(
+        await self._answer(
             message,
             self.strings["cleared_user"].format(
                 self._profile_link(key, profile)

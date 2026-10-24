@@ -1,10 +1,10 @@
 # meta developer: @Huai_Baike
-# meta version: 1.0.0
+# meta version: 1.1.0
 # meta description: Панель адміністрування груп і каналів з попередженнями та кнопками
 # scope: inline
 # scope: hikka_only
 
-__version__ = (1, 0, 0)
+__version__ = (1, 1, 0)
 
 import asyncio
 import contextlib
@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 SESSION_TTL = 15 * 60
 SLOWMODE_VALUES = (0, 10, 30, 60, 300, 900, 3600)
 DURATION_RE = re.compile(r"^(\d{1,5})([smhdw])$", re.IGNORECASE)
+BOT_API = "https://api.telegram.org/bot{token}/{method}"
+EPHEMERAL_RETRY = 10 * 60
 
 
 @loader.tds
@@ -131,11 +133,21 @@ class GroupAdminMod(loader.Module):
                 lambda: "ID чату для журналу модерації; 0 — вимкнено",
                 validator=loader.validators.Integer(),
             ),
+            loader.ConfigValue(
+                "ephemeral",
+                True,
+                lambda: (
+                    "Показувати список попереджень (.gwarns) лише вам — "
+                    "ефемерним повідомленням inline-бота (бот має бути в групі)"
+                ),
+                validator=loader.validators.Boolean(),
+            ),
         )
         self._client = None
         self._me_id = None
         self._sessions = {}
         self._locks = {}
+        self._ephemeral_blocked = {}
 
     async def client_ready(self, client, db):
         self._client = client
@@ -809,12 +821,71 @@ class GroupAdminMod(loader.Module):
                 f"{index}. {html.escape(str(item.get('reason') or 'Без причини'))}"
                 for index, item in enumerate(items, 1)
             )
-        await utils.answer(
-            message,
+        text = (
             "⚠️ <b>Попередження</b> · "
             f"{html.escape(self._display_name(user))}\n\n{body}\n\n"
-            f"Ліміт: <b>{len(items)}/{int(self.config['warn_limit'])}</b>",
+            f"Ліміт: <b>{len(items)}/{int(self.config['warn_limit'])}</b>"
         )
+        if not await self._send_ephemeral(message, text):
+            await utils.answer(message, text)
+
+    def _bot_token(self):
+        inline = getattr(self, "inline", None)
+        return getattr(inline, "_token", None) or getattr(
+            getattr(inline, "bot", None), "token", None
+        )
+
+    async def _send_ephemeral(self, message, text):
+        """Send ``text`` as an ephemeral message of the inline bot.
+
+        Telegram shows such a message only to ``receiver_user_id``; it works
+        in groups where the bot is a member.  False when it cannot be sent
+        here, so the caller answers as usual.
+        """
+        chat_id = getattr(message, "chat_id", None)
+        receiver = getattr(message, "sender_id", None)
+        token = self._bot_token()
+        if (
+            not self.config["ephemeral"]
+            or not getattr(message, "is_group", False)
+            or not chat_id
+            or not receiver
+            or not token
+            or self._ephemeral_blocked.get(chat_id, 0) > time.monotonic()
+        ):
+            return False
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True},
+            "ephemeral_message_parameters": {"receiver_user_id": receiver},
+        }
+        try:
+            import aiohttp
+
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as session:
+                async with session.post(
+                    BOT_API.format(token=token, method="sendMessage"), json=payload
+                ) as response:
+                    data = await response.json(content_type=None)
+        except Exception as error:
+            logger.debug("GroupAdmin ephemeral answer failed: %s", error)
+            return False
+        if not isinstance(data, dict) or not data.get("ok"):
+            data = data if isinstance(data, dict) else {"description": str(data)}
+            description = str(data.get("description", ""))
+            if data.get("error_code") == 403 or "chat not found" in description.lower():
+                # The bot is not in this group: do not ask again for a while.
+                self._ephemeral_blocked[chat_id] = time.monotonic() + EPHEMERAL_RETRY
+            logger.info("GroupAdmin: no ephemeral answer here (%s)", description)
+            return False
+        if getattr(message, "out", False):
+            with contextlib.suppress(Exception):
+                await message.delete()
+        return True
 
     @loader.command(ru_doc="Закріпити повідомлення, на яке дана відповідь")
     async def gpin(self, message):

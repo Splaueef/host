@@ -5,6 +5,7 @@ import pathlib
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 class _Module:
@@ -83,6 +84,7 @@ def _load_module():
     loader.validators = types.SimpleNamespace(
         Integer=lambda **kwargs: object(),
         Choice=lambda *args, **kwargs: object(),
+        Boolean=lambda: object(),
     )
     utils.get_chat_id = lambda message: message.chat_id
     utils.get_args_raw = lambda message: getattr(message, "args", "")
@@ -213,6 +215,91 @@ class GroupAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rights.send_media)
         self.assertTrue(rights.send_photos)
         self.assertIs(self.module._client.requests[-1].args[1], rights)
+
+
+class _BotResponse:
+    def __init__(self, data):
+        self.data = data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def json(self, content_type=None):
+        return self.data
+
+
+class _BotSession:
+    def __init__(self, calls):
+        self.calls = calls
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _BotResponse({"ok": True, "result": {"message_id": 0}})
+
+
+class _WarnsMessage:
+    def __init__(self, is_group=True):
+        self.args = "42"
+        self.chat_id = -100
+        self.sender_id = 1
+        self.is_group = is_group
+        self.is_channel = not is_group
+        self.out = True
+        self.answers = []
+        self.deleted = False
+
+    async def get_reply_message(self):
+        return None
+
+    async def delete(self):
+        self.deleted = True
+
+
+class GroupAdminEphemeralTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.module = group_admin.GroupAdminMod()
+        self.module._client = _Client()
+        self.module._me_id = 1
+        self.module.inline = types.SimpleNamespace(_token="123:abc")
+        self.calls = []
+
+    def _bot(self):
+        return mock.patch(
+            "aiohttp.ClientSession",
+            lambda *args, **kwargs: _BotSession(self.calls),
+        )
+
+    async def test_warnings_list_is_shown_only_to_the_admin(self):
+        await self.module._apply_action(-100, self.module._client.user, "warn", reason="spam")
+        message = _WarnsMessage()
+
+        with self._bot():
+            await self.module.gwarns(message)
+
+        self.assertEqual(message.answers, [])
+        self.assertTrue(message.deleted)
+        payload = self.calls[0][1]["json"]
+        self.assertIn("spam", payload["text"])
+        self.assertEqual(payload["chat_id"], -100)
+        self.assertEqual(payload["ephemeral_message_parameters"], {"receiver_user_id": 1})
+
+    async def test_channels_keep_the_regular_answer(self):
+        message = _WarnsMessage(is_group=False)
+
+        with self._bot():
+            await self.module.gwarns(message)
+
+        self.assertEqual(self.calls, [])
+        self.assertEqual(len(message.answers), 1)
 
 
 if __name__ == "__main__":
