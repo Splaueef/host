@@ -2139,3 +2139,65 @@ class RichPanelTest(unittest.IsolatedAsyncioTestCase):
         await self.mod.vcadd(_Message("https://b"))
         self.assertEqual(self.sent, [])
         self.assertIn("https://b", self._player().panel.text)
+
+
+class _FailingInline(_Inline):
+    """Hikka's form() when the inline query brings no results: it posts the
+    traceback to the chat itself and returns False."""
+
+    def __init__(self, chat):
+        super().__init__()
+        self.calls = 0
+        self.chat = chat
+
+    async def form(self, text, message=None, reply_markup=None, **kwargs):
+        self.calls += 1
+        self.chat.append(
+            types.SimpleNamespace(
+                id=900 + self.calls,
+                out=True,
+                date=None,
+                raw_text=(
+                    "🚫 Виклик юніта завершився невдачею!\n\n📖 Логи:\n"
+                    '  File "/hikka/inline/core.py", line 262, in _invoke_unit\n'
+                    "Exception: No query results"
+                ),
+                delete=mock.AsyncMock(),
+            )
+        )
+        return False
+
+
+class FailedPanelTest(unittest.IsolatedAsyncioTestCase):
+    _player = PlaybackTest._player
+
+    def setUp(self):
+        PlaybackTest.setUp(self)
+        self.chat = []
+        self.mod.inline = _FailingInline(self.chat)
+        self.mod._client.edit_message = mock.AsyncMock()
+        self.mod._client.delete_messages = mock.AsyncMock()
+
+        async def iter_messages(chat_id, limit=None):
+            for message in reversed(self.chat):
+                yield message
+
+        self.mod._client.iter_messages = iter_messages
+
+    async def test_vcnow_tries_once_and_removes_hikkas_traceback(self):
+        await self.mod.vcplay(_Message("https://a"))
+        self.mod.inline.calls = 0
+        self.chat.clear()
+        self._player().now_message = 77
+        await self.mod.vcnow(_Message())
+        self.assertEqual(self.mod.inline.calls, 1)
+        self.assertEqual(len(self.chat), 1)
+        self.chat[0].delete.assert_awaited()
+        self.assertIsNone(self._player().panel)
+        self.assertIn("https://a", vc_utils.answer.call_args.args[1])
+
+    async def test_failed_panel_is_not_retried_on_every_track(self):
+        await self.mod.vcplay(_Message("https://a"))
+        calls = self.mod.inline.calls
+        await self.mod._show_panel(self._player())
+        self.assertEqual(self.mod.inline.calls, calls)
