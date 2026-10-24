@@ -1,5 +1,5 @@
 #             █ █ ▀ █▄▀ ▄▀█ █▀█ ▀
-# meta version: 1.1.0
+# meta version: 1.2.0
 #             █▀█ █ █ █ █▀█ █▀▄ █
 #              © Copyright 2022
 #           https://t.me/hikariatama
@@ -33,12 +33,13 @@ logger = logging.getLogger(__name__)
 
 def get_message(i: dict) -> str:
     return (
-        f"🔧 <a href=\"https://tl.telethon.dev/{i['link']}\">{i['result']}</a>\n\n"
-        "🍙 <b>Parameters:</b>\n\n"
-        f"ℹ️ <i>{utils.escape_html(re.sub(r'<.*?>', '', i['description'][0]))}</i>\n\n"
-        f"{i['description'][1]}\n\n"
-        "🦀 <b>Example:</b>\n\n"
-        f"<pre>{utils.escape_html(i['example'])}</pre>"
+        f"🔧 <a href=\"https://tl.telethon.dev/{i['link']}\">{i['result']}</a>\n"
+        f"<blockquote>ℹ️ <i>{utils.escape_html(re.sub(r'<.*?>', '', i['description'][0]))}</i>"
+        "</blockquote>\n"
+        "🍙 <b>Parameters</b>\n"
+        f"<blockquote expandable>{i['description'][1]}</blockquote>\n"
+        "🦀 <b>Example</b>\n"
+        f"<pre><code class=\"language-python\">{utils.escape_html(i['example'])}</code></pre>"
     )
 
 

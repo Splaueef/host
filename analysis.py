@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 1.2.0
+# meta version: 1.3.0
 # meta description: 📈 Повний аналіз повідомлень у поточному чаті за командою !аналіз.
 
 import time
@@ -185,14 +185,20 @@ class ChatAnalysisMod(loader.Module):
 
     def _format_report(self, stats, chat_title, chat_type):
         total = stats["all"]["total"]
-        lines = [
-            self.strings["done"],
-            f"💬 <b>Чат:</b> {chat_title}",
-            f"📌 <b>Тип:</b> {chat_type}",
-            f"🧮 <b>Усього повідомлень:</b> {total}",
-            f"🗓 <b>Період:</b> {self._range(stats['all'])}",
-            self._format_daily(stats["all"]),
-            "",
+        overview = "\n".join(
+            filter(
+                None,
+                [
+                    f"💬 <b>Чат:</b> {chat_title}",
+                    f"📌 <b>Тип:</b> {chat_type}",
+                    f"🧮 <b>Усього повідомлень:</b> {total}",
+                    f"🗓 <b>Період:</b> {self._range(stats['all'])}",
+                    self._format_daily(stats["all"]),
+                ],
+            )
+        )
+        sections = [
+            overview,
             self._format_side("🙋 Мої повідомлення", stats["me"], total),
             self._format_side("👥 Повідомлення інших", stats["others"], total),
             self._format_participants(stats),
@@ -200,11 +206,25 @@ class ChatAnalysisMod(loader.Module):
             self._format_top_map("📅 Найактивніші тижні", stats),
             self._format_top_map("🗓 Найактивніші місяці", stats, key="months"),
         ]
-        text = "\n".join(filter(None, lines))
+        text = self.strings["done"] + "\n".join(
+            self._quote(section) for section in sections if section
+        )
         limit = self.config["answer_limit"]
         if len(text) > limit:
-            text = text[: limit - 80].rsplit("\n", 1)[0] + "\n\n… <i>Звіт обрізано через ліміт Telegram.</i>"
+            # Cut at a section boundary so no quote is left unclosed.
+            cut = text.rfind("</blockquote>", 0, limit - 80)
+            text = (
+                text[: cut + len("</blockquote>")] if cut != -1 else text[: limit - 80]
+            ) + "\n… <i>Звіт обрізано через ліміт Telegram.</i>"
         return text
+
+    @staticmethod
+    def _quote(section):
+        """Bold title line stays above the quote, the details go inside."""
+        title, newline, body = section.partition("\n")
+        if newline and title.startswith("<b>"):
+            return f"{title}\n<blockquote>{body}</blockquote>"
+        return f"<blockquote>{section}</blockquote>"
 
     def _format_side(self, title, bucket, total):
         percent = bucket["total"] / total * 100 if total else 0

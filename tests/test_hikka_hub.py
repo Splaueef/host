@@ -8,7 +8,9 @@ from pathlib import Path
 from aiohttp.test_utils import TestClient, TestServer
 
 from hikka_hub.app import (
+    CATALOG_IMPORT_STATE_KEY,
     MODULE_REPOSITORY,
+    _import_official_modules,
     MODULE_STATE_KEY,
     MODULE_UPDATE_TOPIC,
     _process_module_manifest,
@@ -17,6 +19,10 @@ from hikka_hub.app import (
 from hikka_hub.config import Settings
 from hikka_hub.security import derive_hmac_key, sign_with_secret
 from hikka_hub.storage import Store
+
+
+async def _raise():
+    raise RuntimeError("offline")
 
 
 class HikkaHubApiTests(unittest.IsolatedAsyncioTestCase):
@@ -528,6 +534,331 @@ class HikkaHubApiTests(unittest.IsolatedAsyncioTestCase):
             "DELETE", "/v1/chat/presence/lobby", who="one"
         )
         self.assertTrue((await response.json())["data"]["left"])
+
+
+    MODULE_SOURCE = (
+        "# meta developer: @tester\n"
+        "# meta description: Says hello\n"
+        "from .. import loader, utils\n"
+        "__version__ = (1, 0, 0)\n\n"
+        "@loader.tds\n"
+        "class HelloWorldMod(loader.Module):\n"
+        "    \"\"\"Docstring\"\"\"\n"
+        "    strings = {\"name\": \"HelloWorld\"}\n\n"
+        "    @loader.command()\n"
+        "    async def hello(self, message):\n"
+        "        await utils.answer(message, \"hi\")\n\n"
+        "    async def byecmd(self, message):\n"
+        "        pass\n"
+    )
+
+    async def _publish(self, source, who="one", **extra):
+        return await self._request(
+            "POST", "/v1/catalog/modules", {"source": source, **extra}, who=who
+        )
+
+    async def test_catalog_publish_list_install_and_rate(self):
+        response = await self._publish(
+            self.MODULE_SOURCE, tags=["fun", "#Text"], changelog="First"
+        )
+        self.assertEqual(response.status, 201, await response.text())
+        module = (await response.json())["data"]
+        self.assertEqual(module["module_id"], "helloworld")
+        self.assertEqual(module["title"], "HelloWorld")
+        self.assertEqual(module["latest_version"], "1.0.0")
+        self.assertEqual(module["developer"], "@tester")
+        self.assertEqual(module["description"], "Says hello")
+        self.assertEqual(module["tags"], ["fun", "text"])
+        self.assertEqual(module["commands"], ["hello", "bye"])
+        self.assertTrue(module["created"])
+        self.assertNotIn("owner_id", module)
+
+        response = await self._request(
+            "GET", "/v1/catalog/modules?q=hello&sort=new", who="two"
+        )
+        listing = (await response.json())["data"]
+        self.assertEqual(listing["total"], 1)
+        self.assertEqual(listing["modules"][0]["owner_display_name"], "One")
+
+        response = await self._request(
+            "GET", "/v1/catalog/modules?tag=fun", who="two"
+        )
+        self.assertEqual((await response.json())["data"]["total"], 1)
+        response = await self._request("GET", "/v1/catalog/tags", who="two")
+        self.assertEqual(
+            (await response.json())["data"]["tags"][0], {"tag": "fun", "modules": 1}
+        )
+
+        response = await self._request(
+            "GET", "/v1/catalog/modules/helloworld/source", who="two"
+        )
+        source = (await response.json())["data"]
+        self.assertEqual(source["source"], self.MODULE_SOURCE)
+        self.assertEqual(
+            source["sha256"], hashlib.sha256(self.MODULE_SOURCE.encode()).hexdigest()
+        )
+        self.assertEqual(source["class_name"], "HelloWorldMod")
+
+        response = await self._request(
+            "POST",
+            "/v1/catalog/modules/helloworld/installs",
+            {"version": "1.0.0"},
+            who="two",
+        )
+        self.assertEqual((await response.json())["data"]["installs"], 1)
+
+        response = await self._request(
+            "POST", "/v1/catalog/modules/helloworld/rating", {"stars": 4}, who="two"
+        )
+        self.assertEqual((await response.json())["data"]["rating"], 4)
+        response = await self._request(
+            "POST", "/v1/catalog/modules/helloworld/rating", {"stars": 5}, who="one"
+        )
+        self.assertEqual((await response.json())["error"]["code"], "own_module")
+
+        response = await self._request(
+            "GET", "/v1/catalog/modules/helloworld", who="two"
+        )
+        detail = (await response.json())["data"]
+        self.assertEqual(detail["my_rating"], 4)
+        self.assertEqual(detail["installed_version"], "1.0.0")
+        self.assertFalse(detail["is_owner"])
+        self.assertEqual(detail["changelog"], "First")
+
+        response = await self._request("GET", "/v1/stats", who="two")
+        self.assertEqual(
+            (await response.json())["data"]["catalog"], {"modules": 1, "installs": 1}
+        )
+
+    async def test_catalog_versions_ownership_and_updates(self):
+        await self._publish(self.MODULE_SOURCE)
+        same = await self._publish(self.MODULE_SOURCE)
+        self.assertEqual(same.status, 409)
+        self.assertEqual((await same.json())["error"]["code"], "version_not_newer")
+
+        stolen = await self._publish(
+            self.MODULE_SOURCE.replace("(1, 0, 0)", "(9, 0, 0)"), who="two"
+        )
+        self.assertEqual(stolen.status, 403)
+        self.assertEqual((await stolen.json())["error"]["code"], "not_module_owner")
+
+        newer = self.MODULE_SOURCE.replace("(1, 0, 0)", "(1, 1, 0)")
+        response = await self._publish(newer, changelog="Faster")
+        self.assertEqual(response.status, 201)
+        self.assertEqual((await response.json())["data"]["previous_version"], "1.0.0")
+
+        response = await self._request(
+            "POST",
+            "/v1/catalog/updates",
+            {"modules": {"helloworld": "1.0.0", "missing": "1.0.0"}},
+            who="two",
+        )
+        updates = (await response.json())["data"]["updates"]
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0]["latest_version"], "1.1.0")
+        self.assertEqual(updates[0]["changelog"], "Faster")
+
+        response = await self._request(
+            "GET", "/v1/catalog/modules/helloworld/source?version=1.0.0", who="two"
+        )
+        self.assertEqual(response.status, 200)
+
+        events = await self._request(
+            "GET", "/v1/events?after_id=0&limit=10&topic=system.catalog", who="two"
+        )
+        self.assertEqual(
+            [e["payload"]["version"] for e in (await events.json())["data"]["events"]],
+            ["1.0.0", "1.1.0"],
+        )
+
+        response = await self._request(
+            "DELETE", "/v1/catalog/modules/helloworld?version=1.1.0", who="one"
+        )
+        self.assertEqual((await response.json())["data"]["latest_version"], "1.0.0")
+        response = await self._request(
+            "DELETE", "/v1/catalog/modules/helloworld", who="two"
+        )
+        self.assertEqual(response.status, 403)
+        response = await self._request(
+            "DELETE", "/v1/catalog/modules/helloworld", who="one"
+        )
+        self.assertEqual(response.status, 200)
+        response = await self._request(
+            "GET", "/v1/catalog/modules/helloworld", who="two"
+        )
+        self.assertEqual(response.status, 404)
+
+    async def test_catalog_rejects_bad_sources_and_flags_risky_code(self):
+        response = await self._publish("def broken(:\n")
+        self.assertEqual((await response.json())["error"]["code"], "syntax_error")
+        response = await self._publish("x = 1\n")
+        self.assertEqual((await response.json())["error"]["code"], "not_a_module")
+        response = await self._publish(
+            self.MODULE_SOURCE.replace("__version__ = (1, 0, 0)\n", "")
+        )
+        self.assertEqual((await response.json())["error"]["code"], "version_required")
+
+        risky = self.MODULE_SOURCE + (
+            "\nimport subprocess\n"
+            "from telethon.sessions import StringSession\n"
+            "def run(x):\n"
+            "    return eval(x)\n"
+        )
+        response = await self._publish(risky)
+        warnings = (await response.json())["data"]["warnings"]
+        self.assertEqual(warnings, ["dynamic_code", "shell", "session_access"])
+
+    async def test_catalog_upload_may_exceed_regular_body_limit(self):
+        filler = "# " + "x" * 78 + "\n"
+        source = self.MODULE_SOURCE + filler * 2000
+        self.assertGreater(len(source), self.settings.request_body_limit)
+        response = await self._publish(source)
+        self.assertEqual(response.status, 201, await response.text())
+
+        response = await self._request(
+            "POST",
+            "/v1/events",
+            {"topic": "big", "payload": "x" * 140000, "ttl_seconds": 600},
+        )
+        self.assertEqual(response.status, 413)
+
+    async def test_direct_messages_reach_only_the_recipient(self):
+        response = await self._request(
+            "POST", "/v1/inbox", {"to": "hikka-two", "text": "Привіт"}, who="one"
+        )
+        self.assertEqual(response.status, 201)
+        message_id = (await response.json())["data"]["id"]
+
+        response = await self._request("GET", "/v1/inbox?after_id=0", who="two")
+        data = (await response.json())["data"]
+        self.assertEqual(data["messages"][0]["text"], "Привіт")
+        self.assertEqual(data["messages"][0]["sender_display_name"], "One")
+        self.assertEqual(data["next_after_id"], message_id)
+
+        response = await self._request("GET", "/v1/inbox?after_id=0", who="one")
+        self.assertEqual((await response.json())["data"]["messages"], [])
+
+        response = await self._request(
+            "POST", "/v1/inbox", {"to": "hikka-one", "text": "me"}, who="one"
+        )
+        self.assertEqual((await response.json())["error"]["code"], "self_message")
+        response = await self._request(
+            "POST", "/v1/inbox", {"to": "hikka-nobody", "text": "?"}, who="one"
+        )
+        self.assertEqual(response.status, 404)
+
+
+    async def test_official_modules_are_imported_from_the_manifest(self):
+        sources = {
+            "hello.py": self.MODULE_SOURCE,
+            "broken.py": "x = 1\n",
+        }
+        fetched = []
+
+        async def fetch(filename):
+            fetched.append(filename)
+            if filename == "offline.py":
+                raise RuntimeError("HTTP 503")
+            return sources[filename]
+
+        app = self.client.server.app
+        manifest = {"hello.py": "1.4.0", "broken.py": "1.0.0", "offline.py": "1.0.0"}
+        imported = await _import_official_modules(
+            app, manifest, fetch, {"hello.py": "Нове"}
+        )
+        self.assertEqual([item["module_id"] for item in imported], ["helloworld"])
+        self.assertTrue(imported[0]["official"])
+        # The manifest version wins over __version__ in the file.
+        self.assertEqual(imported[0]["latest_version"], "1.4.0")
+
+        state = (await self.store.get_service_state(CATALOG_IMPORT_STATE_KEY))["value"]
+        self.assertEqual(state["broken.py"]["status"], "not_a_module")
+        self.assertNotIn("offline.py", state)  # retried on the next check
+
+        fetched.clear()
+        await _import_official_modules(app, manifest, fetch)
+        self.assertEqual(fetched, ["offline.py"])
+
+        response = await self._request(
+            "GET", "/v1/catalog/modules?official=1", who="two"
+        )
+        listing = (await response.json())["data"]
+        self.assertEqual(listing["total"], 1)
+        item = listing["modules"][0]
+        self.assertTrue(item["official"])
+        self.assertEqual(item["owner_display_name"], "Splaueef/host")
+        self.assertEqual(item["tags"], ["official"])
+
+        hijack = await self._publish(
+            self.MODULE_SOURCE.replace("(1, 0, 0)", "(9, 0, 0)")
+        )
+        self.assertEqual((await hijack.json())["error"]["code"], "not_module_owner")
+
+        events = await self._request(
+            "GET", "/v1/events?after_id=0&limit=10&topic=system.catalog", who="two"
+        )
+        payload = (await events.json())["data"]["events"][0]["payload"]
+        self.assertTrue(payload["official"])
+        self.assertEqual(payload["changelog"], "Нове")
+
+        imported = await _import_official_modules(
+            app, {"hello.py": "1.5.0"}, fetch
+        )
+        self.assertEqual(imported[0]["previous_version"], "1.4.0")
+
+
+    async def test_import_retries_and_repairs_entries_of_the_old_reader(self):
+        app = self.client.server.app
+        truncated = self.MODULE_SOURCE.split("    async def byecmd")[0]
+        full = self.MODULE_SOURCE
+        current = {"source": truncated}
+
+        async def fetch(filename):
+            return current["source"]
+
+        await _import_official_modules(app, {"hello.py": "1.0.0"}, fetch)
+        await _import_official_modules(app, {"broken.py": "1.0.0"}, lambda name: _raise())
+        state = (await self.store.get_service_state(CATALOG_IMPORT_STATE_KEY))["value"]
+        for entry in state.values():  # what Hikka Hub 2.2.0 stored
+            entry.pop("reader", None)
+        state["broken.py"] = {"version": "1.0.0", "status": "syntax_error"}
+        await self.store.set_service_state(CATALOG_IMPORT_STATE_KEY, state)
+
+        current["source"] = full
+        fetched = []
+
+        async def fetch_full(filename):
+            fetched.append(filename)
+            return full
+
+        await _import_official_modules(
+            app, {"hello.py": "1.0.0", "broken.py": "1.0.0"}, fetch_full
+        )
+        self.assertEqual(sorted(fetched), ["broken.py", "hello.py"])
+        response = await self._request(
+            "GET", "/v1/catalog/modules/helloworld/source", who="two"
+        )
+        self.assertEqual((await response.json())["data"]["source"], full)
+
+        fetched.clear()
+        await _import_official_modules(
+            app, {"hello.py": "1.0.0", "broken.py": "1.0.0"}, fetch_full
+        )
+        self.assertEqual(fetched, [])
+
+    async def test_large_bodies_are_read_completely(self):
+        from hikka_hub.app import _read_limited
+
+        class Content:
+            def __init__(self, data):
+                self.data = data
+
+            async def read(self, size):
+                chunk, self.data = self.data[: min(size, 1000)], self.data[min(size, 1000):]
+                return chunk
+
+        self.assertEqual(len(await _read_limited(Content(b"x" * 5000), 10000)), 5000)
+        self.assertEqual(len(await _read_limited(Content(b"x" * 5000), 3000)), 3001)
 
 
 if __name__ == "__main__":

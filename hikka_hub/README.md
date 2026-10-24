@@ -20,6 +20,12 @@
 - авторитетна перевірка ходів у хрестиках-нуликах, шашках, шахах і ґо 9×9/13×13;
 - глобальні wins/losses/draws, окремий Elo для кожної гри та профіль гравця;
 - короткожива присутність у HikkaNetChat, список кімнат і online-учасників;
+- **каталог модулів**: користувачі завантажують свої модулі прямо в HikkaNet, а
+  інші знаходять і встановлюють їх однією кнопкою — з версіями, тегами, пошуком,
+  оцінками, лічильником встановлень і перевіркою оновлень;
+- статичний аналіз коду модулів без виконання: сервер показує, чи модуль
+  запускає системні команди, звертається до сесії Telegram, виконує `eval` тощо;
+- особисті повідомлення між вузлами (видно лише адресату);
 - автоматична статистика запитів, heartbeat, подій і записів;
 - локальна CLI для створення, відкликання, повторного ввімкнення й ротації ключів;
 - SQLite WAL, очищення прострочених даних, ліміти запитів і розміру body.
@@ -70,6 +76,56 @@ HIKKA_HUB_LISTEN_IP=0.0.0.0 HIKKA_HUB_PUBLIC_PORT=8765 docker compose up -d
 
 Не відкривай порт у весь Інтернет без firewall та TLS/VPN.
 
+## Каталог модулів
+
+Будь-яка авторизована Hikka може опублікувати модуль: сервер **ніколи не
+імпортує і не виконує** отриманий код, лише розбирає його через `ast`, щоб
+дізнатися клас, назву, версію (`__version__` або `# meta version`), опис,
+розробника, команди та знайти ризиковані виклики. Модуль належить Telegram-
+акаунту, який опублікував його першим: нові версії може завантажувати лише він
+(з будь-якої своєї Hikka), і кожна нова версія має бути більшою за попередню.
+
+На сервері зберігаються останні `HIKKA_HUB_CATALOG_MAX_VERSIONS` версій,
+SHA-256 кожної з них перевіряється клієнтом перед встановленням. Після
+публікації сервер пише подію `system.catalog`, а клієнти раз на кілька годин
+перевіряють оновлення встановлених модулів.
+
+Модерація з CLI (для Docker додай префікс, як у розділі про ключі):
+
+```bash
+python -m hikka_hub.cli --database ./data/hikka-hub.sqlite3 catalog-list
+python -m hikka_hub.cli --database ./data/hikka-hub.sqlite3 catalog-block weather
+python -m hikka_hub.cli --database ./data/hikka-hub.sqlite3 catalog-unblock weather
+python -m hikka_hub.cli --database ./data/hikka-hub.sqlite3 catalog-delete weather
+```
+
+### Офіційні модулі з Splaueef/host
+
+Hikka Hub сам підтягує в каталог усі модулі репозиторію `Splaueef/host`: під
+час кожної перевірки `module_versions.json` (`HIKKA_HUB_MODULE_UPDATE_INTERVAL`)
+він завантажує з `raw.githubusercontent.com` лише ті файли, версія яких у
+маніфесті змінилася, аналізує їх так само без виконання й публікує з позначкою
+🏛 та тегом `official`. Версією вважається значення з маніфесту. Такі модулі
+належать службовому власнику, тож жоден користувач не може опублікувати модуль
+з тим самим ID. Встановлені з каталогу офіційні модулі отримують оновлення
+через звичну перевірку HikkaNet. Імпорт вимикається `HIKKA_HUB_CATALOG_IMPORT=false`
+і потребує `HIKKA_HUB_MODULE_UPDATES=true`.
+
+Заблокований модуль зникає з пошуку, його не можна встановити чи оновити.
+Каталог вимикається змінною `HIKKA_HUB_CATALOG=false`.
+
+## Оновлення з Hikka Hub 2.1
+
+Достатньо перебудувати сервіс: `/health` має повернути `2.2.0`. Після першої
+перевірки маніфесту офіційні модулі з'являться в `.hkmods official`. Онови
+`hikkanet.py` до 2.3.0, щоб бачити позначку й фільтр офіційних модулів.
+
+## Оновлення з Hikka Hub 2.0
+
+Нові таблиці каталогу та пошти створюються автоматично, наявні дані не
+змінюються. Перебудуй сервіс і переконайся, що `/health` повертає `2.1.0`,
+потім онови `hikkanet.py` до 2.2.0. Старі клієнти продовжують працювати.
+
 ## Оновлення з Hikka Hub 1.x
 
 Схема SQLite доповнюється автоматично й наявні ключі, події та метрики не
@@ -81,7 +137,7 @@ docker compose up -d --build
 curl http://127.0.0.1:8765/health
 ```
 
-У відповіді `/health` має бути версія `2.0.0`. Далі один раз онови в Hikka
+У відповіді `/health` має бути версія `2.1.0`. Далі один раз онови в Hikka
 `hikkanet.py`, потім `minigames.py`, `hikkanetchat.py` і `modulehub.py`.
 Клієнтські модулі показують зрозумілу помилку, якщо сервер або HikkaNet ще старі.
 
@@ -142,6 +198,13 @@ HIKKA_HUB_DATABASE=./data/hikka-hub.sqlite3 \
 | `HIKKA_HUB_CHAT_PRESENCE_TTL` | `120` | TTL online-присутності в кімнаті, сек |
 | `HIKKA_HUB_MODULE_UPDATES` | `true` | сервер перевіряє manifest оновлень |
 | `HIKKA_HUB_MODULE_UPDATE_INTERVAL` | `300` | інтервал перевірки manifest, сек |
+| `HIKKA_HUB_CATALOG` | `true` | увімкнути каталог модулів |
+| `HIKKA_HUB_CATALOG_IMPORT` | `true` | підтягувати офіційні модулі з `Splaueef/host` |
+| `HIKKA_HUB_MODULE_SOURCE_LIMIT` | `262144` | максимальний розмір модуля, байт |
+| `HIKKA_HUB_CATALOG_MAX_VERSIONS` | `10` | скільки версій модуля зберігати |
+| `HIKKA_HUB_CATALOG_MAX_MODULES` | `50` | модулів на одного Telegram-власника |
+| `HIKKA_HUB_CATALOG_DAILY_UPLOADS` | `30` | публікацій на власника за 24 год |
+| `HIKKA_HUB_DIRECT_TTL` | `604800` | скільки зберігати особисті повідомлення, сек |
 
 ## Випуск ключа для окремої Hikka
 
@@ -223,6 +286,13 @@ python -m hikka_hub.cli --database ./data/hikka-hub.sqlite3 rotate hikka-main
 | `.hknetdel namespace key` | видалити власний ключ |
 | `.hknetinc metric [delta]` | збільшити власну метрику |
 | `.hknetstats [metric]` | огляд або рейтинг метрики |
+| `.hkmods [пошук]` | каталог модулів із кнопками встановлення та оцінки |
+| `.hkmod id` | картка модуля |
+| `.hkinstall id [версія] [-y]` | встановити модуль прямо з HikkaNet |
+| `.hkpublish [#теги] [\| що нового]` | опублікувати `.py` файл (у підписі або відповіддю) |
+| `.hkmymods` / `.hkunpublish id [версія]` | свої модулі / зняти модуль чи версію |
+| `.hkupdates` / `.hkupdate id\|all` | перевірити й встановити оновлення |
+| `.hkdm instance_id текст` / `.hkinbox` | особисті повідомлення між вузлами |
 
 JSON із полями на кшталт `token`, `password`, `secret`, `api_key`, `session`
 клієнтський модуль відмовиться публікувати, щоб випадково не винести секрет.
@@ -262,7 +332,8 @@ members = await hub.api_chat_members("lobby")
 
 Доступні методи: `api_publish`, `api_events`, `api_instances`, `api_get`,
 `api_put`, `api_delete`, `api_increment`, `api_increment_many`, `api_stats`,
-`api_game_*` та `api_chat_*`.
+`api_game_*`, `api_chat_*`, `api_catalog_*`, `api_send_direct`, `api_inbox`
+та `install_from_catalog(module_id, version=None, target=message)`.
 Вони проходять ту саму валідацію, перевірку чутливих полів і захищений підпис,
 що й команди модуля.
 
@@ -305,6 +376,16 @@ def modulehub_stats(self):
 | `DELETE /v1/chat/presence/{room}` | вийти з кімнати |
 | `GET /v1/chat/rooms` | активні кімнати й активність за 24 години |
 | `GET /v1/chat/rooms/{room}/members` | online-учасники кімнати |
+| `GET /v1/catalog/modules` | пошук: `q`, `tag`, `sort`, `limit`, `offset`, `mine`, `official` |
+| `POST /v1/catalog/modules` | опублікувати модуль або нову версію |
+| `GET /v1/catalog/modules/{id}` | картка модуля з історією версій |
+| `GET /v1/catalog/modules/{id}/source` | код версії та SHA-256 |
+| `POST /v1/catalog/modules/{id}/installs` | зарахувати встановлення |
+| `POST /v1/catalog/modules/{id}/rating` | оцінка 1–5 |
+| `DELETE /v1/catalog/modules/{id}` | зняти модуль або `?version=` |
+| `POST /v1/catalog/updates` | які з встановлених модулів мають оновлення |
+| `GET /v1/catalog/tags` | популярні теги |
+| `POST /v1/inbox` / `GET /v1/inbox` | особисті повідомлення вузлу / вхідні |
 | `POST /v1/events` | опублікувати подію |
 | `GET /v1/events` | події після cursor або останні з `latest=1` |
 | `PUT/GET/DELETE /v1/kv/{namespace}/{key}` | спільний запис |

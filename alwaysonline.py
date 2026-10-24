@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 1.1.0
+# meta version: 1.2.0
 # meta description: Постійно підтримує статус акаунта Telegram «онлайн».
 
 import asyncio
@@ -36,9 +36,9 @@ class AlwaysOnlineMod(loader.Module):
             "Надіслати статус «офлайн» під час вимкнення або видалення модуля"
         ),
         "enabled": (
-            "🟢 <b>AlwaysOnline увімкнено.</b>\n"
-            "Резервне оновлення кожні <code>{interval}</code> с.; відновлення "
-            "після статусу «офлайн» — через <code>{delay}</code> с."
+            "🟢 <b>AlwaysOnline увімкнено</b>\n"
+            "<blockquote>🔁 Резервне оновлення: кожні <code>{interval}</code> с\n"
+            "⏳ Відновлення після «офлайн»: через <code>{delay}</code> с</blockquote>"
         ),
         "enabled_with_error": (
             "⚠️ <b>AlwaysOnline увімкнено, але перший запит не виконано.</b>\n"
@@ -51,13 +51,12 @@ class AlwaysOnlineMod(loader.Module):
             "<code>{}</code>"
         ),
         "status": (
-            "👤 <b>AlwaysOnline</b>\n\n"
-            "Стан: {state}\n"
-            "Резервний інтервал: <code>{interval}</code> с.\n"
-            "Затримка відновлення: <code>{delay}</code> с.\n"
-            "Автовідновлень: <code>{reassertions}</code>\n"
-            "Останнє успішне оновлення: <code>{last_success}</code>\n"
-            "Остання помилка: <code>{last_error}</code>"
+            "👤 <b>AlwaysOnline</b> · {state}\n"
+            "<blockquote>🔁 Резервний інтервал: <code>{interval}</code> с\n"
+            "⏳ Затримка відновлення: <code>{delay}</code> с\n"
+            "♻️ Автовідновлень: <code>{reassertions}</code></blockquote>\n"
+            "<blockquote>✅ Останнє оновлення: <code>{last_success}</code>\n"
+            "❗️ Остання помилка: <code>{last_error}</code></blockquote>"
         ),
     }
 

@@ -154,6 +154,16 @@ class HikkaNetHelperTests(unittest.TestCase):
             "api_increment",
             "api_increment_many",
             "api_stats",
+            "api_catalog_search",
+            "api_catalog_get",
+            "api_catalog_source",
+            "api_catalog_publish",
+            "api_catalog_delete",
+            "api_catalog_rate",
+            "api_catalog_updates",
+            "api_send_direct",
+            "api_inbox",
+            "install_from_catalog",
         ):
             self.assertTrue(callable(getattr(module, method)))
 
@@ -190,6 +200,138 @@ class HikkaNetApiWrapperTests(unittest.IsolatedAsyncioTestCase):
             calls[3][0:2],
             ("GET", "/v1/chat/rooms/lobby/members"),
         )
+
+
+class HikkaNetCatalogTests(unittest.IsolatedAsyncioTestCase):
+    SOURCE = "class HelloMod(loader.Module):\n    pass\n"
+
+    def _module(self, loaded):
+        module = hikkanet.HikkaNetMod()
+        storage = {}
+        module.get = lambda key, default=None: storage.get(key, default)
+        module.set = lambda key, value: storage.__setitem__(key, value)
+        module.lookup = lambda name: loaded.get(str(name).lower())
+        module.storage = storage
+        return module
+
+    def test_catalog_helpers(self):
+        self.assertEqual(hikkanet._catalog_id(" HelloWorld "), "helloworld")
+        self.assertEqual(hikkanet._version("v1.2.3"), "1.2.3")
+        self.assertGreater(
+            hikkanet._version_tuple("1.10.0"), hikkanet._version_tuple("1.9.9")
+        )
+        self.assertEqual(
+            hikkanet._parse_publish_args("#Fun text, fun | Нові команди  тут"),
+            (["fun", "text"], "Нові команди тут"),
+        )
+        self.assertEqual(hikkanet._parse_publish_args(""), ([], ""))
+        for invalid in ("a", "has-dash", "1abc"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                hikkanet._catalog_id(invalid)
+        self.assertNotIn("network", hikkanet._CONFIRM_WARNINGS)
+        self.assertIn("session_access", hikkanet._CONFIRM_WARNINGS)
+
+    async def test_install_uses_hikka_loader_and_remembers_version(self):
+        import hashlib
+
+        loaded = {}
+        loads = []
+
+        class Loader:
+            async def load_module(self, doc, message, origin="<string>", save_fs=False):
+                loads.append((doc, message, origin, save_fs))
+                loaded["hellomod"] = object()
+
+        loaded["loader"] = Loader()
+        module = self._module(loaded)
+        calls = []
+
+        async def request(method, path, params=None, payload=None, max_bytes=0):
+            calls.append((method, path, params, payload))
+            if path.endswith("/source"):
+                return {
+                    "module_id": "hello",
+                    "version": "1.2.0",
+                    "class_name": "HelloMod",
+                    "source": self.SOURCE,
+                    "sha256": hashlib.sha256(self.SOURCE.encode()).hexdigest(),
+                }
+            return {}
+
+        module._request = request
+        await module.install_from_catalog("hello", "1.2.0", "target")
+
+        self.assertEqual(loads, [(self.SOURCE, "target", "<string>", True)])
+        self.assertEqual(module._installed_version("hello"), "1.2.0")
+        self.assertEqual(
+            calls[-1][0:2], ("POST", "/v1/catalog/modules/hello/installs")
+        )
+        self.assertEqual(calls[0][2], {"version": "1.2.0"})
+
+    async def test_install_refuses_tampered_source(self):
+        loaded = {}
+
+        class Loader:
+            async def load_module(self, *args, **kwargs):
+                raise AssertionError("must not load")
+
+        loaded["loader"] = Loader()
+        module = self._module(loaded)
+
+        async def request(method, path, params=None, payload=None, max_bytes=0):
+            return {"source": self.SOURCE, "sha256": "0" * 64, "class_name": "HelloMod"}
+
+        module._request = request
+        with self.assertRaises(hikkanet.HubClientError) as raised:
+            await module.install_from_catalog("hello")
+        self.assertEqual(raised.exception.code, "checksum_mismatch")
+
+    async def test_failed_load_is_reported(self):
+        import hashlib
+
+        class Loader:
+            async def load_module(self, *args, **kwargs):
+                return None  # Hikka reports errors itself and loads nothing
+
+        module = self._module({"loader": Loader()})
+
+        async def request(method, path, params=None, payload=None, max_bytes=0):
+            return {
+                "version": "1.0.0",
+                "class_name": "HelloMod",
+                "source": self.SOURCE,
+                "sha256": hashlib.sha256(self.SOURCE.encode()).hexdigest(),
+            }
+
+        module._request = request
+        with self.assertRaises(hikkanet.HubClientError) as raised:
+            await module.install_from_catalog("hello")
+        self.assertEqual(raised.exception.code, "load_failed")
+        self.assertEqual(module.storage.get("catalog_installed"), None)
+
+    def test_loaded_version_wins_over_remembered_one(self):
+        instance = type("Loaded", (), {"__version__": (1, 3, 0)})()
+        module = self._module({"hellomod": instance})
+        module.storage["catalog_installed"] = {
+            "hello": {"version": "1.0.0", "class_name": "HelloMod"}
+        }
+        self.assertEqual(module._installed_version("hello"), "1.3.0")
+
+    async def test_update_check_skips_unloaded_modules(self):
+        module = self._module({"hellomod": object()})
+        module.storage["catalog_installed"] = {
+            "hello": {"version": "1.0.0", "class_name": "HelloMod"},
+            "gone": {"version": "1.0.0", "class_name": "GoneMod"},
+        }
+        sent = {}
+
+        async def request(method, path, params=None, payload=None, max_bytes=0):
+            sent["payload"] = payload
+            return {"updates": []}
+
+        module._request = request
+        await module._check_catalog_updates(notify=False)
+        self.assertEqual(sent["payload"], {"modules": {"hello": "1.0.0"}})
 
 
 if __name__ == "__main__":

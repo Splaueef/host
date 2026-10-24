@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 2.0.0
+# meta version: 2.1.0
 # meta description: Безпечна системна інформація без конфлікту з вбудованою .info.
 
 """Show compact runtime and host information for Hikka."""
@@ -35,6 +35,11 @@ class InfoMod(loader.Module):
                 return f"{amount:.0f} {unit}" if unit == "Б" else f"{amount:.1f} {unit}"
             amount /= 1024
         return f"{amount:.1f} ТіБ"
+
+    @staticmethod
+    def _bar(percent, width=10):
+        filled = max(0, min(width, round(float(percent or 0) / 100 * width)))
+        return "▰" * filled + "▱" * (width - filled)
 
     @staticmethod
     def _duration(seconds):
@@ -141,38 +146,38 @@ class InfoMod(loader.Module):
             load = os.getloadavg()
         git_revision = await self._git_revision()
         esc = utils.escape_html
-        lines = [
-            "🖥 <b>SystemInfo · Hikka</b>",
-            "",
+        system = [
             f"🐧 <b>Система:</b> <code>{esc(self._os_name())}</code>",
-            f"🧩 <b>Ядро:</b> <code>{esc(platform.release())}</code>",
-            f"🏗 <b>Архітектура:</b> <code>{esc(platform.machine())}</code>",
-            f"📦 <b>Середовище:</b> <code>{esc(self._environment())}</code>",
-            "",
+            f"🧩 <b>Ядро:</b> <code>{esc(platform.release())}</code> · "
+            f"<code>{esc(platform.machine())}</code>",
+            f"📦 <b>Середовище:</b> {esc(self._environment())}",
+            f"⏱ <b>Uptime:</b> {self._duration(self._uptime())}",
+        ]
+        cpu = [
             f"⚙️ <b>CPU:</b> <code>{esc(self._cpu_name())}</code>",
-            f"🧵 <b>Потоків:</b> <code>{os.cpu_count() or self.strings['unavailable']}</code>",
+            f"🧵 <b>Потоків:</b> {os.cpu_count() or self.strings['unavailable']}",
         ]
         if load is not None:
-            lines.append(
-                "📈 <b>Load average:</b> "
-                f"<code>{load[0]:.2f} · {load[1]:.2f} · {load[2]:.2f}</code>"
+            cpu.append(
+                f"📈 <b>Load:</b> <code>{load[0]:.2f} · {load[1]:.2f} · {load[2]:.2f}</code>"
             )
         memory_percent = used_memory / total_memory * 100 if total_memory else 0
         disk_percent = disk.used / disk.total * 100 if disk.total else 0
-        lines.extend(
-            [
-                f"🧠 <b>RAM:</b> <code>{self._human_bytes(used_memory)} / "
-                f"{self._human_bytes(total_memory)} · {memory_percent:.1f}%</code>",
-                f"💽 <b>Диск:</b> <code>{self._human_bytes(disk.used)} / "
-                f"{self._human_bytes(disk.total)} · {disk_percent:.1f}%</code>",
-                f"⏱ <b>Uptime:</b> <code>{self._duration(self._uptime())}</code>",
-                "",
-                f"🐍 <b>Python:</b> <code>{esc(platform.python_version())}</code>",
-                f"✈️ <b>Telethon:</b> <code>{esc(telethon.__version__)}</code>",
-            ]
-        )
+        resources = [
+            f"🧠 <b>RAM</b> {self._bar(memory_percent)} {memory_percent:.0f}%\n"
+            f"<code>{self._human_bytes(used_memory)} / {self._human_bytes(total_memory)}</code>",
+            f"💽 <b>Диск</b> {self._bar(disk_percent)} {disk_percent:.0f}%\n"
+            f"<code>{self._human_bytes(disk.used)} / {self._human_bytes(disk.total)}</code>",
+        ]
+        runtime = [
+            f"🐍 <b>Python</b> <code>{esc(platform.python_version())}</code> · "
+            f"✈️ <b>Telethon</b> <code>{esc(telethon.__version__)}</code>",
+        ]
         if git_revision:
-            lines.append(f"🌿 <b>Hikka git:</b> <code>{esc(git_revision)}</code>")
+            runtime.append(f"🌿 <b>Hikka git:</b> <code>{esc(git_revision)}</code>")
+        lines = ["🖥 <b>SystemInfo · Hikka</b>"]
+        for block in (system, cpu, resources, runtime):
+            lines.append("<blockquote>" + "\n".join(block) + "</blockquote>")
         return "\n".join(lines)
 
     @loader.command(ru_doc="Показати інформацію про систему та Hikka")

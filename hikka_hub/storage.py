@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from .catalog import ModuleInfo, version_tuple
 from .game_engine import apply_action, new_state, resign_state
 
 
@@ -158,7 +159,89 @@ CREATE TABLE IF NOT EXISTS chat_presence (
 CREATE INDEX IF NOT EXISTS idx_chat_presence_expiry ON chat_presence(expires_at);
 CREATE INDEX IF NOT EXISTS idx_chat_presence_room_seen
     ON chat_presence(room, last_seen DESC);
+
+CREATE TABLE IF NOT EXISTS catalog_modules (
+    module_id TEXT PRIMARY KEY,
+    class_name TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    developer TEXT NOT NULL DEFAULT '',
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    owner_id INTEGER NOT NULL,
+    owner_instance_id TEXT NOT NULL,
+    latest_version TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'published',
+    installs INTEGER NOT NULL DEFAULT 0,
+    rating_sum INTEGER NOT NULL DEFAULT 0,
+    rating_count INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_owner ON catalog_modules(owner_id);
+CREATE INDEX IF NOT EXISTS idx_catalog_updated ON catalog_modules(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS catalog_versions (
+    module_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    source TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    changelog TEXT NOT NULL DEFAULT '',
+    commands_json TEXT NOT NULL DEFAULT '[]',
+    warnings_json TEXT NOT NULL DEFAULT '[]',
+    uploader_instance_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (module_id, version),
+    FOREIGN KEY (module_id) REFERENCES catalog_modules(module_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS catalog_installs (
+    module_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    installed_at INTEGER NOT NULL,
+    PRIMARY KEY (module_id, instance_id),
+    FOREIGN KEY (module_id) REFERENCES catalog_modules(module_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS catalog_ratings (
+    module_id TEXT NOT NULL,
+    owner_id INTEGER NOT NULL,
+    stars INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (module_id, owner_id),
+    FOREIGN KEY (module_id) REFERENCES catalog_modules(module_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS direct_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_instance_id TEXT NOT NULL,
+    recipient_instance_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dm_recipient_id
+    ON direct_messages(recipient_instance_id, id);
+CREATE INDEX IF NOT EXISTS idx_dm_expiry ON direct_messages(expires_at);
 """
+
+# Modules imported from the trusted Splaueef/host repository belong to this
+# pseudo-owner, so no Telegram account can publish over them.
+OFFICIAL_OWNER_ID = 0
+OFFICIAL_INSTANCE_ID = "hikka-hub"
+OFFICIAL_PUBLISHER = "Splaueef/host"
+
+CATALOG_SORTS = {
+    "popular": "m.installs DESC, m.updated_at DESC",
+    "rating": (
+        "CASE WHEN m.rating_count=0 THEN 0 "
+        "ELSE CAST(m.rating_sum AS REAL)/m.rating_count END DESC, "
+        "m.rating_count DESC, m.installs DESC"
+    ),
+    "new": "m.created_at DESC",
+    "updated": "m.updated_at DESC",
+}
 
 
 class Store:
@@ -1252,6 +1335,634 @@ class Store:
 
         return await self._run(operation)
 
+    # ------------------------------------------------------------------
+    # Module catalog
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _catalog_payload(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["tags"] = json.loads(item.pop("tags_json") or "[]")
+        count = int(item.get("rating_count") or 0)
+        item["rating"] = round(int(item.pop("rating_sum") or 0) / count, 2) if count else 0
+        item["rating_count"] = count
+        item["official"] = int(item.pop("owner_id", -1)) == OFFICIAL_OWNER_ID
+        if item["official"] and not item.get("owner_display_name"):
+            item["owner_display_name"] = OFFICIAL_PUBLISHER
+        return item
+
+    async def catalog_publish(
+        self,
+        info: ModuleInfo,
+        source: str,
+        changelog: str,
+        tags: Optional[list[str]],
+        credential: dict[str, Any],
+        *,
+        max_versions: int,
+        max_modules_per_owner: int,
+        daily_upload_limit: int,
+    ) -> dict[str, Any]:
+        now = int(time.time())
+        owner_id = int(credential["owner_id"])
+
+        def operation():
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                result = self._catalog_publish_sync(
+                    info,
+                    source,
+                    changelog,
+                    tags,
+                    credential,
+                    owner_id,
+                    now,
+                    max_versions,
+                    max_modules_per_owner,
+                    daily_upload_limit,
+                )
+                self._db.execute("COMMIT" if "error" not in result else "ROLLBACK")
+                return result
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+
+        return await self._run(operation)
+
+    def _catalog_publish_sync(
+        self,
+        info,
+        source,
+        changelog,
+        tags,
+        credential,
+        owner_id,
+        now,
+        max_versions,
+        max_modules_per_owner,
+        daily_upload_limit,
+    ) -> dict[str, Any]:
+        existing = self._db.execute(
+            "SELECT * FROM catalog_modules WHERE module_id=?", (info.module_id,)
+        ).fetchone()
+        if existing and int(existing["owner_id"]) != owner_id:
+            return {"error": "not_module_owner"}
+        if existing and existing["status"] == "blocked":
+            return {"error": "module_blocked"}
+        if not existing:
+            owned = self._db.execute(
+                "SELECT COUNT(*) FROM catalog_modules WHERE owner_id=?", (owner_id,)
+            ).fetchone()[0]
+            if owned >= max_modules_per_owner:
+                return {"error": "module_limit"}
+        uploads = self._db.execute(
+            """
+            SELECT COUNT(*) FROM catalog_versions v
+            JOIN catalog_modules m ON m.module_id=v.module_id
+            WHERE m.owner_id=? AND v.created_at>=?
+            """,
+            (owner_id, now - 86400),
+        ).fetchone()[0]
+        if uploads >= daily_upload_limit:
+            return {"error": "publish_rate_limited"}
+        if existing and version_tuple(info.version) <= version_tuple(
+            existing["latest_version"]
+        ):
+            return {"error": "version_not_newer", "latest": existing["latest_version"]}
+
+        tags_json = json.dumps(
+            tags if tags is not None else json.loads(existing["tags_json"] if existing else "[]"),
+            separators=(",", ":"),
+        )
+        if existing:
+            self._db.execute(
+                """
+                UPDATE catalog_modules SET class_name=?, title=?, description=?,
+                    developer=?, tags_json=?, owner_instance_id=?, latest_version=?,
+                    status='published', updated_at=?
+                WHERE module_id=?
+                """,
+                (
+                    info.class_name,
+                    info.title,
+                    info.description,
+                    info.developer,
+                    tags_json,
+                    credential["instance_id"],
+                    info.version,
+                    now,
+                    info.module_id,
+                ),
+            )
+        else:
+            self._db.execute(
+                """
+                INSERT INTO catalog_modules(module_id, class_name, title, description,
+                    developer, tags_json, owner_id, owner_instance_id, latest_version,
+                    status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'published', ?, ?)
+                """,
+                (
+                    info.module_id,
+                    info.class_name,
+                    info.title,
+                    info.description,
+                    info.developer,
+                    tags_json,
+                    owner_id,
+                    credential["instance_id"],
+                    info.version,
+                    now,
+                    now,
+                ),
+            )
+        self._db.execute(
+            """
+            INSERT INTO catalog_versions(module_id, version, source, sha256, size,
+                changelog, commands_json, warnings_json, uploader_instance_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                info.module_id,
+                info.version,
+                source,
+                info.sha256,
+                info.size,
+                changelog,
+                json.dumps(info.commands, separators=(",", ":")),
+                json.dumps(info.warnings, separators=(",", ":")),
+                credential["instance_id"],
+                now,
+            ),
+        )
+        versions = self._db.execute(
+            "SELECT version FROM catalog_versions WHERE module_id=?", (info.module_id,)
+        ).fetchall()
+        stale = sorted(
+            (row["version"] for row in versions), key=version_tuple, reverse=True
+        )[max_versions:]
+        for version in stale:
+            self._db.execute(
+                "DELETE FROM catalog_versions WHERE module_id=? AND version=?",
+                (info.module_id, version),
+            )
+        row = self._db.execute(
+            "SELECT * FROM catalog_modules WHERE module_id=?", (info.module_id,)
+        ).fetchone()
+        return {
+            **self._catalog_payload(row),
+            "created": existing is None,
+            "previous_version": existing["latest_version"] if existing else None,
+            "warnings": list(info.warnings),
+            "commands": list(info.commands),
+            "sha256": info.sha256,
+            "size": info.size,
+        }
+
+    async def catalog_repair_official(self, info: ModuleInfo, source: str) -> bool:
+        """Replace the stored code of an official version if it differs."""
+
+        def operation():
+            row = self._db.execute(
+                """
+                SELECT v.sha256 FROM catalog_versions v
+                JOIN catalog_modules m ON m.module_id=v.module_id
+                WHERE v.module_id=? AND v.version=? AND m.owner_id=?
+                """,
+                (info.module_id, info.version, OFFICIAL_OWNER_ID),
+            ).fetchone()
+            if not row or row["sha256"] == info.sha256:
+                return False
+            self._db.execute(
+                """
+                UPDATE catalog_versions SET source=?, sha256=?, size=?,
+                    commands_json=?, warnings_json=?
+                WHERE module_id=? AND version=?
+                """,
+                (
+                    source,
+                    info.sha256,
+                    info.size,
+                    json.dumps(info.commands, separators=(",", ":")),
+                    json.dumps(info.warnings, separators=(",", ":")),
+                    info.module_id,
+                    info.version,
+                ),
+            )
+            return True
+
+        return await self._run(operation)
+
+    async def catalog_list(
+        self,
+        query: str = "",
+        tag: str = "",
+        sort: str = "popular",
+        limit: int = 20,
+        offset: int = 0,
+        owner_id: Optional[int] = None,
+        official: bool = False,
+    ) -> dict[str, Any]:
+        order = CATALOG_SORTS.get(sort, CATALOG_SORTS["popular"])
+
+        def operation():
+            where = []
+            params: list[Any] = []
+            if owner_id is not None:
+                where.append("m.owner_id=?")
+                params.append(int(owner_id))
+            else:
+                where.append("m.status='published'")
+            if official:
+                where.append("m.owner_id=?")
+                params.append(OFFICIAL_OWNER_ID)
+            if query:
+                pattern = "%" + _like_escape(query.lower()) + "%"
+                where.append(
+                    "(m.module_id LIKE ? ESCAPE '\\' OR LOWER(m.title) LIKE ? ESCAPE '\\' "
+                    "OR LOWER(m.description) LIKE ? ESCAPE '\\' "
+                    "OR LOWER(m.developer) LIKE ? ESCAPE '\\' "
+                    "OR m.tags_json LIKE ? ESCAPE '\\')"
+                )
+                params.extend([pattern] * 5)
+            if tag:
+                where.append("m.tags_json LIKE ? ESCAPE '\\'")
+                params.append('%"' + _like_escape(tag) + '"%')
+            clause = " AND ".join(where) or "1=1"
+            total = self._db.execute(
+                f"SELECT COUNT(*) FROM catalog_modules m WHERE {clause}", params
+            ).fetchone()[0]
+            rows = self._db.execute(
+                f"""
+                SELECT m.*, i.display_name AS owner_display_name
+                FROM catalog_modules m
+                LEFT JOIN instances i ON i.instance_id=m.owner_instance_id
+                WHERE {clause} ORDER BY {order}, m.module_id LIMIT ? OFFSET ?
+                """,
+                [*params, int(limit), int(offset)],
+            ).fetchall()
+            return {
+                "modules": [self._catalog_payload(row) for row in rows],
+                "total": int(total),
+                "offset": int(offset),
+                "limit": int(limit),
+            }
+
+        return await self._run(operation)
+
+    async def catalog_get(
+        self, module_id: str, viewer_instance_id: str, viewer_owner_id: int
+    ) -> Optional[dict[str, Any]]:
+        def operation():
+            row = self._db.execute(
+                """
+                SELECT m.*, i.display_name AS owner_display_name
+                FROM catalog_modules m
+                LEFT JOIN instances i ON i.instance_id=m.owner_instance_id
+                WHERE m.module_id=?
+                """,
+                (module_id,),
+            ).fetchone()
+            if not row:
+                return None
+            is_owner = int(row["owner_id"]) == int(viewer_owner_id)
+            if row["status"] != "published" and not is_owner:
+                return None
+            item = self._catalog_payload(row)
+            versions = self._db.execute(
+                """
+                SELECT version, sha256, size, changelog, commands_json, warnings_json,
+                       created_at
+                FROM catalog_versions WHERE module_id=?
+                """,
+                (module_id,),
+            ).fetchall()
+            history = []
+            for version in versions:
+                entry = dict(version)
+                entry["commands"] = json.loads(entry.pop("commands_json") or "[]")
+                entry["warnings"] = json.loads(entry.pop("warnings_json") or "[]")
+                history.append(entry)
+            history.sort(key=lambda entry: version_tuple(entry["version"]), reverse=True)
+            latest = next(
+                (entry for entry in history if entry["version"] == item["latest_version"]),
+                history[0] if history else {},
+            )
+            rating = self._db.execute(
+                "SELECT stars FROM catalog_ratings WHERE module_id=? AND owner_id=?",
+                (module_id, int(viewer_owner_id)),
+            ).fetchone()
+            installed = self._db.execute(
+                "SELECT version FROM catalog_installs WHERE module_id=? AND instance_id=?",
+                (module_id, viewer_instance_id),
+            ).fetchone()
+            item.update(
+                {
+                    "versions": history,
+                    "commands": latest.get("commands", []),
+                    "warnings": latest.get("warnings", []),
+                    "sha256": latest.get("sha256", ""),
+                    "size": latest.get("size", 0),
+                    "changelog": latest.get("changelog", ""),
+                    "is_owner": is_owner,
+                    "my_rating": int(rating["stars"]) if rating else 0,
+                    "installed_version": installed["version"] if installed else None,
+                }
+            )
+            return item
+
+        return await self._run(operation)
+
+    async def catalog_source(
+        self, module_id: str, version: Optional[str], viewer_owner_id: int
+    ) -> Optional[dict[str, Any]]:
+        def operation():
+            module = self._db.execute(
+                "SELECT * FROM catalog_modules WHERE module_id=?", (module_id,)
+            ).fetchone()
+            if not module or (
+                module["status"] != "published"
+                and int(module["owner_id"]) != int(viewer_owner_id)
+            ):
+                return None
+            row = self._db.execute(
+                """
+                SELECT version, source, sha256, size, warnings_json, changelog
+                FROM catalog_versions WHERE module_id=? AND version=?
+                """,
+                (module_id, version or module["latest_version"]),
+            ).fetchone()
+            if not row:
+                return None
+            item = dict(row)
+            item["warnings"] = json.loads(item.pop("warnings_json") or "[]")
+            item["module_id"] = module_id
+            item["class_name"] = module["class_name"]
+            item["title"] = module["title"]
+            return item
+
+        return await self._run(operation)
+
+    async def catalog_record_install(
+        self, module_id: str, instance_id: str, version: str
+    ) -> Optional[dict[str, Any]]:
+        now = int(time.time())
+
+        def operation():
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                exists = self._db.execute(
+                    """
+                    SELECT 1 FROM catalog_versions v
+                    JOIN catalog_modules m ON m.module_id=v.module_id
+                    WHERE v.module_id=? AND v.version=? AND m.status='published'
+                    """,
+                    (module_id, version),
+                ).fetchone()
+                if not exists:
+                    self._db.execute("ROLLBACK")
+                    return None
+                self._db.execute(
+                    """
+                    INSERT INTO catalog_installs(module_id, instance_id, version, installed_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(module_id, instance_id) DO UPDATE SET
+                        version=excluded.version, installed_at=excluded.installed_at
+                    """,
+                    (module_id, instance_id, version, now),
+                )
+                installs = self._db.execute(
+                    "SELECT COUNT(*) FROM catalog_installs WHERE module_id=?", (module_id,)
+                ).fetchone()[0]
+                self._db.execute(
+                    "UPDATE catalog_modules SET installs=? WHERE module_id=?",
+                    (installs, module_id),
+                )
+                self._db.execute("COMMIT")
+                return {"module_id": module_id, "version": version, "installs": installs}
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+
+        return await self._run(operation)
+
+    async def catalog_rate(
+        self, module_id: str, owner_id: int, stars: int
+    ) -> dict[str, Any]:
+        now = int(time.time())
+
+        def operation():
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                module = self._db.execute(
+                    "SELECT owner_id, status FROM catalog_modules WHERE module_id=?",
+                    (module_id,),
+                ).fetchone()
+                if not module or module["status"] != "published":
+                    result = {"error": "module_not_found"}
+                elif int(module["owner_id"]) == int(owner_id):
+                    result = {"error": "own_module"}
+                else:
+                    self._db.execute(
+                        """
+                        INSERT INTO catalog_ratings(module_id, owner_id, stars, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(module_id, owner_id) DO UPDATE SET
+                            stars=excluded.stars, updated_at=excluded.updated_at
+                        """,
+                        (module_id, int(owner_id), int(stars), now),
+                    )
+                    total, count = self._db.execute(
+                        """
+                        SELECT COALESCE(SUM(stars), 0), COUNT(*)
+                        FROM catalog_ratings WHERE module_id=?
+                        """,
+                        (module_id,),
+                    ).fetchone()
+                    self._db.execute(
+                        "UPDATE catalog_modules SET rating_sum=?, rating_count=? WHERE module_id=?",
+                        (int(total), int(count), module_id),
+                    )
+                    result = {
+                        "module_id": module_id,
+                        "my_rating": int(stars),
+                        "rating": round(int(total) / int(count), 2) if count else 0,
+                        "rating_count": int(count),
+                    }
+                self._db.execute("COMMIT")
+                return result
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+
+        return await self._run(operation)
+
+    async def catalog_delete(
+        self, module_id: str, owner_id: int, version: Optional[str] = None
+    ) -> dict[str, Any]:
+        def operation():
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                module = self._db.execute(
+                    "SELECT * FROM catalog_modules WHERE module_id=?", (module_id,)
+                ).fetchone()
+                if not module:
+                    result = {"error": "module_not_found"}
+                elif int(module["owner_id"]) != int(owner_id):
+                    result = {"error": "not_module_owner"}
+                elif version is None:
+                    self._db.execute(
+                        "DELETE FROM catalog_modules WHERE module_id=?", (module_id,)
+                    )
+                    result = {"module_id": module_id, "deleted": "module"}
+                else:
+                    result = self._catalog_delete_version_sync(module, version)
+                self._db.execute("COMMIT")
+                return result
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+
+        return await self._run(operation)
+
+    def _catalog_delete_version_sync(self, module, version: str) -> dict[str, Any]:
+        module_id = module["module_id"]
+        remaining = [
+            row["version"]
+            for row in self._db.execute(
+                "SELECT version FROM catalog_versions WHERE module_id=?", (module_id,)
+            ).fetchall()
+        ]
+        if version not in remaining:
+            return {"error": "version_not_found"}
+        if len(remaining) == 1:
+            return {"error": "last_version"}
+        self._db.execute(
+            "DELETE FROM catalog_versions WHERE module_id=? AND version=?",
+            (module_id, version),
+        )
+        remaining.remove(version)
+        latest = max(remaining, key=version_tuple)
+        self._db.execute(
+            "UPDATE catalog_modules SET latest_version=?, updated_at=? WHERE module_id=?",
+            (latest, int(time.time()), module_id),
+        )
+        return {"module_id": module_id, "deleted": "version", "latest_version": latest}
+
+    async def catalog_updates(
+        self, installed: dict[str, str]
+    ) -> list[dict[str, Any]]:
+        if not installed:
+            return []
+
+        def operation():
+            marks = ",".join("?" for _ in installed)
+            rows = self._db.execute(
+                f"""
+                SELECT m.module_id, m.title, m.class_name, m.latest_version,
+                       m.owner_id, v.changelog, v.warnings_json
+                FROM catalog_modules m
+                JOIN catalog_versions v
+                    ON v.module_id=m.module_id AND v.version=m.latest_version
+                WHERE m.status='published' AND m.module_id IN ({marks})
+                """,
+                list(installed),
+            ).fetchall()
+            result = []
+            for row in rows:
+                current = installed[row["module_id"]]
+                if version_tuple(row["latest_version"]) > version_tuple(current):
+                    result.append(
+                        {
+                            "module_id": row["module_id"],
+                            "title": row["title"],
+                            "class_name": row["class_name"],
+                            "installed_version": current,
+                            "latest_version": row["latest_version"],
+                            "changelog": row["changelog"],
+                            "warnings": json.loads(row["warnings_json"] or "[]"),
+                            "official": int(row["owner_id"]) == OFFICIAL_OWNER_ID,
+                        }
+                    )
+            return sorted(result, key=lambda item: item["module_id"])
+
+        return await self._run(operation)
+
+    async def catalog_tags(self, limit: int = 30) -> list[dict[str, Any]]:
+        def operation():
+            counts: dict[str, int] = {}
+            for row in self._db.execute(
+                "SELECT tags_json FROM catalog_modules WHERE status='published'"
+            ).fetchall():
+                for tag in json.loads(row["tags_json"] or "[]"):
+                    counts[tag] = counts.get(tag, 0) + 1
+            ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+            return [{"tag": tag, "modules": count} for tag, count in ranked[:limit]]
+
+        return await self._run(operation)
+
+    # ------------------------------------------------------------------
+    # Direct messages between nodes
+    # ------------------------------------------------------------------
+    async def send_direct(
+        self,
+        sender_instance_id: str,
+        recipient_instance_id: str,
+        text: str,
+        ttl_seconds: int,
+    ) -> dict[str, Any]:
+        now = int(time.time())
+
+        def operation():
+            recipient = self._db.execute(
+                "SELECT enabled FROM instances WHERE instance_id=?",
+                (recipient_instance_id,),
+            ).fetchone()
+            if not recipient or not recipient["enabled"]:
+                return {"error": "recipient_not_found"}
+            cursor = self._db.execute(
+                """
+                INSERT INTO direct_messages(sender_instance_id, recipient_instance_id,
+                    text, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    sender_instance_id,
+                    recipient_instance_id,
+                    text,
+                    now,
+                    now + int(ttl_seconds),
+                ),
+            )
+            return {
+                "id": cursor.lastrowid,
+                "to": recipient_instance_id,
+                "created_at": now,
+                "expires_at": now + int(ttl_seconds),
+            }
+
+        return await self._run(operation)
+
+    async def list_direct(
+        self, recipient_instance_id: str, after_id: int, limit: int
+    ) -> list[dict[str, Any]]:
+        now = int(time.time())
+
+        def operation():
+            rows = self._db.execute(
+                """
+                SELECT d.id, d.sender_instance_id, d.text, d.created_at,
+                       i.display_name AS sender_display_name
+                FROM direct_messages d
+                LEFT JOIN instances i ON i.instance_id=d.sender_instance_id
+                WHERE d.recipient_instance_id=? AND d.id>? AND d.expires_at>=?
+                ORDER BY d.id ASC LIMIT ?
+                """,
+                (recipient_instance_id, int(after_id), now, int(limit)),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+        return await self._run(operation)
+
     async def record_usage(self, instance_id: str, field: str) -> None:
         if field not in {"requests", "heartbeats", "events", "kv_writes"}:
             raise ValueError("unsupported usage field")
@@ -1311,6 +2022,12 @@ class Store:
                 """,
                 (now, now - offline_after),
             ).fetchone()[0]
+            catalog = self._db.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(installs), 0)
+                FROM catalog_modules WHERE status='published'
+                """
+            ).fetchone()
             return {
                 "instances": {"total": enabled, "online": online},
                 "events_24h": events_24h,
@@ -1327,6 +2044,10 @@ class Store:
                     "players": int(game_players or 0),
                 },
                 "chat": {"active_rooms": int(chat_rooms or 0)},
+                "catalog": {
+                    "modules": int(catalog[0] or 0),
+                    "installs": int(catalog[1] or 0),
+                },
                 "server_time": now,
             }
 
@@ -1349,12 +2070,16 @@ class Store:
             presence_cursor = self._db.execute(
                 "DELETE FROM chat_presence WHERE expires_at < ?", (now,)
             )
+            direct_cursor = self._db.execute(
+                "DELETE FROM direct_messages WHERE expires_at < ?", (now,)
+            )
             return {
                 "nonces": nonce_cursor.rowcount,
                 "events": event_cursor.rowcount,
                 "kv_items": kv_cursor.rowcount,
                 "games": game_cursor.rowcount,
                 "chat_presence": presence_cursor.rowcount,
+                "direct_messages": direct_cursor.rowcount,
             }
 
         return await self._run(operation)
@@ -1363,3 +2088,7 @@ class Store:
 def _like_prefix(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return escaped + "%"
+
+
+def _like_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
