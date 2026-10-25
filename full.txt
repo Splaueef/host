@@ -27,6 +27,7 @@ sysinfo
 systemd
 teledocs
 timeinfo
+tonwallet
 vdlt
 voicechat
 walletp2p
