@@ -1,5 +1,5 @@
 # meta developer: @Huai_Baike
-# meta version: 3.7.1
+# meta version: 3.7.2
 # meta description: 🧭 Центр команд, автооновлення та синхронізація статистики Hikka.
 # scope: inline
 # scope: hikka_only
@@ -76,6 +76,7 @@ class ModuleHubMod(loader.Module):
         "alwaysonline": "alwaysonline.py",
         "giftmonitor": "gift_monitor.py",
         "walletp2p": "walletp2p.py",
+        "tonwallet": "tonwallet.py",
         "hiddengifts": "hidden_gifts.py",
         "sysinfo": "sysinfo.py",
         "timeinfo": "timeinfo.py",
@@ -215,6 +216,12 @@ class ModuleHubMod(loader.Module):
             "icon": "💱",
             "description": "Ціни та оголошення Wallet P2P; перехід до угоди в Wallet.",
         },
+        "tonwallet": {
+            "class": "TonWalletMod",
+            "name": "TonWallet",
+            "icon": "💎",
+            "description": "Гаманець TON (Gram): Telegram або W5; GRAM, джетони, NFT.",
+        },
         "giftmonitor": {
             "class": "GiftMonitorMod",
             "name": "GiftMonitor",
@@ -289,6 +296,7 @@ class ModuleHubMod(loader.Module):
         ("🎮 Розваги", ("minigames",)),
         ("🎁 Подарунки", ("giftmonitor", "hiddengifts")),
         ("💱 P2P", ("walletp2p",)),
+        ("💎 TON", ("tonwallet",)),
         (
             "🛠 Система",
             (
