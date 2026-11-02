@@ -32,7 +32,7 @@
     "timeinfo.py": "1.2.0",
     "tonwallet.py": "1.0.0",
     "vdlt.py": "7.3.0",
-    "voicechat.py": "2.8.0",
+    "voicechat.py": "2.8.1",
     "walletp2p.py": "1.1.0"
   },
   "changes": {

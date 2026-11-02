@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 2.8.0
+# meta version: 2.8.1
 # meta description: 🎙 Відтворення відео й музики з YouTube та будь-яких сайтів у груповому дзвінку.
 # requires: py-tgcalls yt-dlp
 
@@ -2809,6 +2809,12 @@ class VoiceChatMod(loader.Module):
 
     @staticmethod
     def _is_media(reply):
+        # A link preview is not an attachment.  Telethon still hands out the
+        # preview's document as ``file`` / ``video``: YouTube previews now
+        # carry a short video clip that is not the real video and that the
+        # player cannot read ("ffprobe could not read the file").
+        if type(getattr(reply, "media", None)).__name__ == "MessageMediaWebPage":
+            return False
         file = getattr(reply, "file", None)
         if file is None:
             return False

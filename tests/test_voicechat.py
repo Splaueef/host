@@ -976,6 +976,18 @@ class PlaybackTest(unittest.IsolatedAsyncioTestCase):
         await self.mod.vcplay(_Message("", reply=reply))
         self.assertEqual(self.calls.played[-1][1], "https://r/x")
 
+    async def test_reply_with_link_preview_video_plays_the_link(self):
+        # Telethon exposes a YouTube preview's clip as ``file`` / ``video``.
+        MessageMediaWebPage = type("MessageMediaWebPage", (), {})
+        reply = types.SimpleNamespace(
+            media=MessageMediaWebPage(),
+            file=types.SimpleNamespace(mime_type="video/mp4", size=10),
+            video=True,
+            raw_text="https://youtu.be/abc",
+        )
+        await self.mod.vcplay(_Message("", reply=reply))
+        self.assertEqual(self.calls.played[-1][1], "https://youtu.be/abc")
+
     async def test_queue_listing_and_clear(self):
         await self.mod.vcplay(_Message("https://a"))
         await self.mod.vcadd(_Message("https://b"))
