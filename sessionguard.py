@@ -1,5 +1,5 @@
 # meta developer: @Huang_Baike
-# meta version: 1.1.0
+# meta version: 1.2.0
 # meta description: Автоматично завершує всі нові невідомі сесії Telegram.
 
 """Protect a Telegram account from newly-created, untrusted sessions."""
@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 
 BOT_API = "https://api.telegram.org/bot{token}/{method}"
 EPHEMERAL_RETRY = 10 * 60
+HISTORY_LIMIT = 20
+SHORT_ID_LENGTH = 6
+FRESH_SESSION_RETRY = 15 * 60
+ALLOW_DEFAULT_MINUTES = 5
+ALLOW_MAX_MINUTES = 30
 
 
 @loader.tds
@@ -66,6 +71,19 @@ class SessionGuardMod(loader.Module):
             "Помилка: <code>{error}</code>\n\n"
             "Модуль автоматично повторить спробу."
         ),
+        "fresh_session_hint": (
+            "Telegram не дозволяє завершувати інші сесії з авторизації, якій "
+            "менше 24 годин. Завершіть сесію вручну з основного пристрою — "
+            "SessionGuard повторить спробу за 15 хвилин."
+        ),
+        "allowed_new": (
+            "✅ <b>SessionGuard додав нову сесію до довірених</b> "
+            "(було відкрито вікно <code>allow</code>).\n\n"
+            "Пристрій: <code>{device}</code>\n"
+            "Застосунок: <code>{app}</code>\n"
+            "Місце: <code>{location}</code>\n"
+            "IP: <code>{ip}</code>"
+        ),
         "status": (
             "🛡 <b>SessionGuard</b>\n\n"
             "Захист: {state}\n"
@@ -74,11 +92,12 @@ class SessionGuardMod(loader.Module):
             "Завершено невідомих сесій: <b>{revoked}</b>\n"
             "Створено базовий список: <code>{baseline}</code>\n"
             "Остання перевірка: <code>{last_check}</code>\n"
-            "Остання помилка: <code>{last_error}</code>\n\n"
+            "Остання помилка: <code>{last_error}</code>\n"
+            "Вікно для нового входу: {allow}\n\n"
             "Команди: <code>{prefix}sessionguard list</code>, "
-            "<code>{prefix}sessionguard check</code>, "
-            "<code>{prefix}sessionguard on</code>, "
-            "<code>{prefix}sessionguard off</code>."
+            "<code>check</code>, <code>on</code>, <code>off</code>, "
+            "<code>allow [хв]</code>, <code>trust ID</code>, "
+            "<code>kill ID</code>, <code>history</code>."
         ),
         "enabled": "🟢 <b>SessionGuard увімкнено.</b>",
         "disabled": (
@@ -89,7 +108,7 @@ class SessionGuardMod(loader.Module):
         "check_failed": "❌ <b>Не вдалося перевірити сесії:</b> <code>{}</code>",
         "sessions_title": "📱 <b>Активні сесії Telegram</b>\n\n{}",
         "session_item": (
-            "{icon} <b>{device}</b>{current}\n"
+            "{icon} <b>{device}</b>{current} <code>#{short_id}</code>\n"
             "   <code>{app}</code> · <code>{system}</code>\n"
             "   <code>{location}</code> · <code>{ip}</code>\n"
         ),
@@ -103,9 +122,42 @@ class SessionGuardMod(loader.Module):
             "✅ <b>Базовий список оновлено.</b> Тепер довірених сесій: "
             "<b>{}</b>."
         ),
+        "allow_opened": (
+            "🔓 <b>Вікно для нового входу відкрито на {} хв.</b>\n"
+            "Перша нова сесія за цей час стане довіреною, решта — як завжди "
+            "завершуватимуться. Скасувати: "
+            "<code>{}sessionguard allow off</code>"
+        ),
+        "allow_closed": "🔒 <b>Вікно для нового входу закрито.</b>",
+        "allow_bad": (
+            "Вкажіть кількість хвилин від 1 до {}, наприклад "
+            "<code>{}sessionguard allow 5</code>."
+        ),
+        "allow_state_open": "🔓 <b>відкрито</b> ще <code>{}</code> с",
+        "allow_state_closed": "закрито",
+        "id_required": (
+            "Вкажіть ID сесії з <code>{}sessionguard list</code> "
+            "(наприклад <code>#123456</code>)."
+        ),
+        "id_not_found": "❌ Сесію <code>{}</code> не знайдено серед активних.",
+        "id_ambiguous": (
+            "❌ ID <code>{}</code> підходить кільком сесіям — вкажіть довший."
+        ),
+        "trusted_one": "🛡 Сесію <b>{}</b> додано до довірених.",
+        "current_protected": "🟢 Це поточна сесія Hikka, її не можна завершити.",
+        "killed": "✅ Сесію <b>{}</b> завершено.",
+        "kill_failed": "❌ Не вдалося завершити сесію: <code>{}</code>",
+        "history_title": "📜 <b>Останні завершені SessionGuard сесії</b>\n\n{}",
+        "history_item": (
+            "• <code>{time}</code> — <b>{device}</b> · <code>{app}</code>\n"
+            "   <code>{location}</code> · <code>{ip}</code> · {source}\n"
+        ),
+        "history_empty": "Ще жодної сесії не було завершено.",
         "help": (
             "Невідомий параметр. Доступно: <code>list</code>, "
             "<code>check</code>, <code>on</code>, <code>off</code>, "
+            "<code>allow [хв|off]</code>, <code>trust ID</code>, "
+            "<code>kill ID</code>, <code>history</code>, "
             "<code>trustall CONFIRM</code>."
         ),
     }
@@ -147,6 +199,7 @@ class SessionGuardMod(loader.Module):
         self._reported_failures = set()
         self._completed_hashes = set()
         self._ephemeral_blocked = {}
+        self._allow_until = 0.0
 
     async def client_ready(self, client, db):
         self._client = client
@@ -189,6 +242,59 @@ class SessionGuardMod(loader.Module):
     def _save_trusted_hashes(self, hashes):
         self.set("trusted_hashes", sorted(hashes, key=lambda value: int(value)))
 
+    @staticmethod
+    def _error_text(error):
+        return " ".join(
+            str(part)
+            for part in (
+                type(error).__name__,
+                getattr(error, "message", "") or "",
+                error,
+            )
+        ).upper()
+
+    @classmethod
+    def _is_hash_invalid(cls, error):
+        text = cls._error_text(error)
+        return "HASH_INVALID" in text or "HASHINVALID" in text
+
+    @classmethod
+    def _is_fresh_forbidden(cls, error):
+        text = cls._error_text(error)
+        return "FRESH_RESET_AUTHORISATION_FORBIDDEN" in text or (
+            "FRESHRESETAUTHORISATIONFORBIDDEN" in text
+        )
+
+    @staticmethod
+    def _short_id(key):
+        return str(key).lstrip("-")[-SHORT_ID_LENGTH:]
+
+    def _allow_remaining(self):
+        return max(0, int(self._allow_until - time.monotonic()))
+
+    def _escaped_details(self, session):
+        return {
+            name: utils.escape_html(value)
+            for name, value in self._details(session).items()
+        }
+
+    def _add_history(self, session, source):
+        history = self.get("revoked_history", [])
+        history = list(history) if isinstance(history, list) else []
+        record = self._details(session)
+        record["time"] = self._now_iso()
+        record["source"] = str(source)
+        history.append(record)
+        self.set("revoked_history", history[-HISTORY_LIMIT:])
+
+    def _record_revoked(self, key, session, source):
+        self._completed_hashes.add(key)
+        self._retry_after.pop(key, None)
+        self._reported_failures.discard(key)
+        self._last_error = None
+        self.set("revoked_count", int(self.get("revoked_count", 0)) + 1)
+        self._add_history(session, source)
+
     def _session_metadata(self, session):
         return {
             "device_model": str(self._field(session, "device_model", "") or ""),
@@ -219,6 +325,14 @@ class SessionGuardMod(loader.Module):
 
         if changed:
             self.set("trusted_devices", saved)
+
+    def _forget_metadata(self, trusted):
+        saved = self.get("trusted_devices", {})
+        if isinstance(saved, dict) and any(key not in trusted for key in saved):
+            self.set(
+                "trusted_devices",
+                {key: value for key, value in saved.items() if key in trusted},
+            )
 
     async def _fetch_authorizations(self):
         result = await self._client(GetAuthorizationsRequest())
@@ -306,10 +420,7 @@ class SessionGuardMod(loader.Module):
         if key in self._reported_failures:
             return
         self._reported_failures.add(key)
-        details = {
-            name: utils.escape_html(value)
-            for name, value in self._details(session).items()
-        }
+        details = self._escaped_details(session)
         details["error"] = utils.escape_html(str(error))
         await self._notify(self.strings("revoke_failed").format(**details))
 
@@ -319,6 +430,20 @@ class SessionGuardMod(loader.Module):
             return False
 
         now = time.monotonic()
+        if now < self._allow_until:
+            # The user opened a one-time window for a planned login: trust the
+            # first new session instead of revoking it, then close the window.
+            self._allow_until = 0.0
+            trusted.add(key)
+            self._save_trusted_hashes(trusted)
+            self._remember_metadata([session], trusted)
+            self._retry_after.pop(key, None)
+            self._reported_failures.discard(key)
+            await self._notify(
+                self.strings("allowed_new").format(**self._escaped_details(session))
+            )
+            return True
+
         if now < self._retry_after.get(key, 0.0):
             return False
 
@@ -334,7 +459,23 @@ class SessionGuardMod(loader.Module):
             await self._notify_revoke_failure(key, session, self._last_error)
             return False
         except (RPCError, ConnectionError, OSError, RuntimeError) as error:
+            if self._is_hash_invalid(error):
+                # The session is already gone (ended by the user or by an
+                # earlier request): nothing left to protect against.
+                self._completed_hashes.add(key)
+                self._retry_after.pop(key, None)
+                self._reported_failures.discard(key)
+                return True
             self._last_error = f"{type(error).__name__}: {error}"
+            if self._is_fresh_forbidden(error):
+                self._retry_after[key] = now + FRESH_SESSION_RETRY
+                await self._notify_revoke_failure(
+                    key,
+                    session,
+                    f"{self._last_error}\n{self.strings('fresh_session_hint')}",
+                )
+                logger.warning("SessionGuard: Hikka session is too fresh to revoke")
+                return False
             self._retry_after[key] = now + 60
             await self._notify_revoke_failure(key, session, self._last_error)
             logger.warning("Unable to revoke unknown Telegram session: %s", error)
@@ -346,16 +487,9 @@ class SessionGuardMod(loader.Module):
             logger.exception("Unexpected SessionGuard revoke failure")
             return False
 
-        self._completed_hashes.add(key)
-        self._retry_after.pop(key, None)
-        self._reported_failures.discard(key)
-        self._last_error = None
-        self.set("revoked_count", int(self.get("revoked_count", 0)) + 1)
+        self._record_revoked(key, session, source)
 
-        details = {
-            name: utils.escape_html(value)
-            for name, value in self._details(session).items()
-        }
+        details = self._escaped_details(session)
         details["source"] = utils.escape_html(source)
         await self._notify(self.strings("revoked").format(**details))
         return True
@@ -397,6 +531,24 @@ class SessionGuardMod(loader.Module):
                     if key not in trusted:
                         trusted.add(key)
                         changed = True
+
+            # Authorization hashes are never reused, so trusted entries of
+            # sessions that no longer exist only inflate the list: drop them.
+            active = {
+                key
+                for authorization in authorizations
+                if (key := self._hash_key(self._field(authorization, "hash")))
+                is not None
+            }
+            if active and not trusted <= active:
+                trusted &= active
+                changed = True
+                self._forget_metadata(trusted)
+            self._completed_hashes &= active
+            for key in list(self._retry_after):
+                if key not in active:
+                    self._retry_after.pop(key, None)
+                    self._reported_failures.discard(key)
 
             if changed:
                 self._save_trusted_hashes(trusted)
@@ -506,21 +658,163 @@ class SessionGuardMod(loader.Module):
                 await message.delete()
         return True
 
-    async def _list_sessions(self, message):
+    async def _fetch_for_command(self, message):
+        """Fetch authorizations for a command; ``None`` after answering an error."""
         try:
-            authorizations = await self._fetch_authorizations()
+            return await self._fetch_authorizations()
         except (RPCError, ConnectionError, OSError) as error:
+            text = str(error)
+        except Exception as error:
+            logger.exception("Unable to fetch Telegram sessions")
+            text = str(error)
+        await self._answer(
+            message, self.strings("check_failed").format(utils.escape_html(text))
+        )
+        return None
+
+    async def _resolve_session(self, message, raw_id):
+        """Find one active session by its full hash or the ``#ID`` from list."""
+        wanted = (raw_id or "").strip().lstrip("#")
+        if not wanted.lstrip("-").isdigit():
             await self._answer(
                 message,
-                self.strings("check_failed").format(utils.escape_html(str(error))),
+                self.strings("id_required").format(
+                    utils.escape_html(self.get_prefix())
+                ),
+            )
+            return None
+        authorizations = await self._fetch_for_command(message)
+        if authorizations is None:
+            return None
+        exact, partial = [], []
+        for authorization in authorizations:
+            key = self._hash_key(self._field(authorization, "hash"))
+            if key is None:
+                continue
+            if key == wanted:
+                exact.append((key, authorization))
+            elif key.lstrip("-").endswith(wanted.lstrip("-")):
+                partial.append((key, authorization))
+        matches = exact or partial
+        if len(matches) == 1:
+            return matches[0]
+        name = "id_ambiguous" if matches else "id_not_found"
+        await self._answer(
+            message, self.strings(name).format(utils.escape_html("#" + wanted))
+        )
+        return None
+
+    async def _trust_one(self, message, raw_id):
+        found = await self._resolve_session(message, raw_id)
+        if not found:
+            return
+        key, authorization = found
+        async with self._guard_lock:
+            trusted = self._trusted_hashes()
+            trusted.add(key)
+            self._save_trusted_hashes(trusted)
+            self._remember_metadata([authorization], trusted)
+            self._retry_after.pop(key, None)
+            self._reported_failures.discard(key)
+        await self._answer(
+            message,
+            self.strings("trusted_one").format(
+                self._escaped_details(authorization)["device"]
+            ),
+        )
+
+    async def _kill_one(self, message, raw_id):
+        found = await self._resolve_session(message, raw_id)
+        if not found:
+            return
+        key, authorization = found
+        if self._field(authorization, "current", False):
+            await self._answer(message, self.strings("current_protected"))
+            return
+        async with self._guard_lock:
+            try:
+                result = await self._client(ResetAuthorizationRequest(hash=int(key)))
+                if not result:
+                    raise RuntimeError("Telegram повернув негативну відповідь")
+            except Exception as error:
+                if not self._is_hash_invalid(error):
+                    text = f"{type(error).__name__}: {error}"
+                    if self._is_fresh_forbidden(error):
+                        text += "\n" + self.strings("fresh_session_hint")
+                    if not isinstance(
+                        error,
+                        (RPCError, ConnectionError, OSError, RuntimeError),
+                    ):
+                        logger.exception("Unexpected SessionGuard kill failure")
+                    await self._answer(
+                        message,
+                        self.strings("kill_failed").format(utils.escape_html(text)),
+                    )
+                    return
+            else:
+                self._record_revoked(key, authorization, "команда kill")
+            trusted = self._trusted_hashes()
+            if key in trusted:
+                trusted.discard(key)
+                self._save_trusted_hashes(trusted)
+                self._forget_metadata(trusted)
+        await self._answer(
+            message,
+            self.strings("killed").format(
+                self._escaped_details(authorization)["device"]
+            ),
+        )
+
+    async def _allow(self, message, raw_value):
+        value = (raw_value or "").strip().lower()
+        prefix = utils.escape_html(self.get_prefix())
+        if value in {"off", "close", "0"}:
+            self._allow_until = 0.0
+            await self._answer(message, self.strings("allow_closed"))
+            return
+        try:
+            minutes = int(value) if value else ALLOW_DEFAULT_MINUTES
+        except ValueError:
+            minutes = 0
+        if not 1 <= minutes <= ALLOW_MAX_MINUTES:
+            await self._answer(
+                message,
+                self.strings("allow_bad").format(ALLOW_MAX_MINUTES, prefix),
             )
             return
-        except Exception as error:
-            logger.exception("Unable to list Telegram sessions")
-            await self._answer(
-                message,
-                self.strings("check_failed").format(utils.escape_html(str(error))),
+        self._allow_until = time.monotonic() + minutes * 60
+        await self._answer(
+            message, self.strings("allow_opened").format(minutes, prefix)
+        )
+
+    async def _history(self, message):
+        history = self.get("revoked_history", [])
+        history = history if isinstance(history, list) else []
+        lines = []
+        for record in reversed(history):
+            if not isinstance(record, dict):
+                continue
+            lines.append(
+                self.strings("history_item").format(
+                    **{
+                        name: utils.escape_html(record.get(name, "невідомо"))
+                        for name in (
+                            "time",
+                            "device",
+                            "app",
+                            "location",
+                            "ip",
+                            "source",
+                        )
+                    }
+                )
             )
+        body = "\n".join(lines) if lines else self.strings("history_empty")
+        await self._answer(message, self.strings("history_title").format(body))
+
+    async def _list_sessions(self, message):
+        authorizations = await self._fetch_for_command(message)
+        if authorizations is None:
             return
 
         trusted = self._trusted_hashes()
@@ -534,14 +828,12 @@ class SessionGuardMod(loader.Module):
                 icon = "🛡"
             else:
                 icon = "⚠️"
-            details = {
-                name: utils.escape_html(value)
-                for name, value in self._details(authorization).items()
-            }
+            details = self._escaped_details(authorization)
             lines.append(
                 self.strings("session_item").format(
                     icon=icon,
                     current=" <i>(ця Hikka)</i>" if current else "",
+                    short_id=utils.escape_html(self._short_id(key or "")),
                     **details,
                 )
             )
@@ -552,20 +844,8 @@ class SessionGuardMod(loader.Module):
         await self._answer(message, self.strings("sessions_title").format(body))
 
     async def _trust_all(self, message):
-        try:
-            authorizations = await self._fetch_authorizations()
-        except (RPCError, ConnectionError, OSError) as error:
-            await self._answer(
-                message,
-                self.strings("check_failed").format(utils.escape_html(str(error))),
-            )
-            return
-        except Exception as error:
-            logger.exception("Unable to replace SessionGuard baseline")
-            await self._answer(
-                message,
-                self.strings("check_failed").format(utils.escape_html(str(error))),
-            )
+        authorizations = await self._fetch_for_command(message)
+        if authorizations is None:
             return
 
         hashes = {
@@ -589,9 +869,10 @@ class SessionGuardMod(loader.Module):
 
     @loader.command()
     async def sessionguard(self, message):
-        """[list|check|on|off|trustall CONFIRM] — керувати захистом сесій"""
+        """[list|check|on|off|allow [хв]|trust ID|kill ID|history|trustall CONFIRM] — керувати захистом сесій"""
         args = (utils.get_args_raw(message) or "").strip()
         command = args.split(maxsplit=1)[0].lower() if args else ""
+        rest = args.split(maxsplit=1)[1].strip() if " " in args else ""
 
         if not command or command == "status":
             await self._answer(
@@ -610,9 +891,30 @@ class SessionGuardMod(loader.Module):
                     ),
                     last_check=utils.escape_html(self._last_check or "ще не було"),
                     last_error=utils.escape_html(self._last_error or "немає"),
+                    allow=(
+                        self.strings("allow_state_open").format(remaining)
+                        if (remaining := self._allow_remaining())
+                        else self.strings("allow_state_closed")
+                    ),
                     prefix=utils.escape_html(self.get_prefix()),
                 ),
             )
+            return
+
+        if command == "allow":
+            await self._allow(message, rest)
+            return
+
+        if command == "trust":
+            await self._trust_one(message, rest)
+            return
+
+        if command in {"kill", "revoke"}:
+            await self._kill_one(message, rest)
+            return
+
+        if command == "history":
+            await self._history(message)
             return
 
         if command == "list":
@@ -650,8 +952,7 @@ class SessionGuardMod(loader.Module):
             return
 
         if command == "trustall":
-            confirmation = args.split(maxsplit=1)[1] if " " in args else ""
-            if confirmation.strip() != "CONFIRM":
+            if rest != "CONFIRM":
                 await self._answer(
                     message,
                     self.strings("trust_warning").format(

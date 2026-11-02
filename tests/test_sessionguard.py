@@ -203,8 +203,141 @@ class SessionGuardTests(unittest.IsolatedAsyncioTestCase):
 
         await self.module.client_ready(client, None)
 
-        self.assertEqual(self.module._trusted_hashes(), {"20", "99"})
+        # "20" no longer exists, so it is pruned; the current session is kept.
+        self.assertEqual(self.module._trusted_hashes(), {"99"})
         self.assertEqual(client.reset_calls, [])
+
+    async def test_stale_trusted_sessions_and_metadata_are_pruned(self):
+        self.module.set("baseline_initialized", True)
+        self.module.set("trusted_hashes", ["10", "20", "30"])
+        self.module.set("trusted_devices", {"20": {}, "30": {}})
+        client = _Client([_Authorization(10, current=True), _Authorization(20)])
+        self.module._client = client
+
+        self.assertTrue(await self.module._audit_sessions())
+
+        self.assertEqual(self.module._trusted_hashes(), {"10", "20"})
+        self.assertNotIn("30", self.module.get("trusted_devices"))
+
+    async def test_already_ended_session_is_not_reported_as_failure(self):
+        self.module.set("baseline_initialized", True)
+        self.module.set("trusted_hashes", ["10"])
+        client = _Client(
+            [_Authorization(10, current=True), _Authorization(30)],
+            reset_error=_RPCError("HASH_INVALID"),
+        )
+        self.module._client = client
+
+        self.assertTrue(await self.module._audit_sessions())
+
+        self.assertNotIn("30", self.module._retry_after)
+        self.assertEqual(self.module.get("revoked_count", 0), 0)
+        client.send_message.assert_not_awaited()
+
+    async def test_fresh_hikka_session_waits_longer_and_explains_why(self):
+        self.module.set("baseline_initialized", True)
+        self.module.set("trusted_hashes", ["10"])
+        client = _Client(
+            [_Authorization(10, current=True), _Authorization(30)],
+            reset_error=_RPCError("FRESH_RESET_AUTHORISATION_FORBIDDEN"),
+        )
+        self.module._client = client
+
+        await self.module._audit_sessions()
+
+        delay = self.module._retry_after["30"] - sessionguard.time.monotonic()
+        self.assertGreater(delay, 10 * 60)
+        self.assertIn("24 годин", client.send_message.await_args.args[1])
+
+    async def test_allow_window_trusts_only_the_first_new_session(self):
+        self.module.set("baseline_initialized", True)
+        self.module.set("trusted_hashes", ["10"])
+        client = _Client([_Authorization(10, current=True)])
+        self.module._client = client
+
+        await self.module.sessionguard(types.SimpleNamespace(args="allow 5"))
+        self.assertIn("5 хв", sessionguard.utils.answer.await_args.args[1])
+
+        await self.module.new_authorization_handler(_UpdateNewAuthorization(42))
+        await self.module.new_authorization_handler(_UpdateNewAuthorization(43))
+
+        self.assertIn("42", self.module._trusted_hashes())
+        self.assertEqual(client.reset_calls, [43])
+        self.assertEqual(self.module._allow_remaining(), 0)
+
+    async def test_allow_rejects_bad_values_and_can_be_closed(self):
+        await self.module.sessionguard(types.SimpleNamespace(args="allow 999"))
+        self.assertEqual(self.module._allow_remaining(), 0)
+
+        await self.module.sessionguard(types.SimpleNamespace(args="allow"))
+        self.assertGreater(self.module._allow_remaining(), 0)
+
+        await self.module.sessionguard(types.SimpleNamespace(args="allow off"))
+        self.assertEqual(self.module._allow_remaining(), 0)
+
+    async def test_list_shows_short_ids_and_trust_accepts_them(self):
+        self.module.set("baseline_initialized", True)
+        self.module.set("trusted_hashes", ["10"])
+        client = _Client(
+            [_Authorization(10, current=True), _Authorization(9876543210123)]
+        )
+        self.module._client = client
+
+        await self.module.sessionguard(types.SimpleNamespace(args="list"))
+        self.assertIn("#210123", sessionguard.utils.answer.await_args.args[1])
+
+        await self.module.sessionguard(types.SimpleNamespace(args="trust #210123"))
+
+        self.assertIn("9876543210123", self.module._trusted_hashes())
+        self.assertEqual(client.reset_calls, [])
+
+    async def test_ambiguous_or_unknown_ids_change_nothing(self):
+        self.module.set("trusted_hashes", ["10"])
+        client = _Client([_Authorization(1123), _Authorization(2123)])
+        self.module._client = client
+
+        await self.module.sessionguard(types.SimpleNamespace(args="trust 123"))
+        self.assertIn("кільком", sessionguard.utils.answer.await_args.args[1])
+        await self.module.sessionguard(types.SimpleNamespace(args="kill 777"))
+        self.assertIn("не знайдено", sessionguard.utils.answer.await_args.args[1])
+        await self.module.sessionguard(types.SimpleNamespace(args="kill"))
+
+        self.assertEqual(self.module._trusted_hashes(), {"10"})
+        self.assertEqual(client.reset_calls, [])
+
+    async def test_kill_ends_a_trusted_session_but_protects_hikka(self):
+        self.module.set("baseline_initialized", True)
+        self.module.set("trusted_hashes", ["10", "20"])
+        client = _Client([_Authorization(10, current=True), _Authorization(20)])
+        self.module._client = client
+
+        await self.module.sessionguard(types.SimpleNamespace(args="kill 10"))
+        self.assertEqual(client.reset_calls, [])
+
+        await self.module.sessionguard(types.SimpleNamespace(args="kill 20"))
+
+        self.assertEqual(client.reset_calls, [20])
+        self.assertEqual(self.module._trusted_hashes(), {"10"})
+        self.assertEqual(self.module.get("revoked_count"), 1)
+
+    async def test_history_keeps_latest_revoked_sessions(self):
+        self.module.set("baseline_initialized", True)
+        self.module.set("trusted_hashes", ["10"])
+        client = _Client([_Authorization(10, current=True)])
+        self.module._client = client
+
+        for value in range(100, 100 + sessionguard.HISTORY_LIMIT + 5):
+            await self.module.new_authorization_handler(
+                _UpdateNewAuthorization(value, device=f"Dev{value}")
+            )
+        await self.module.sessionguard(types.SimpleNamespace(args="history"))
+
+        history = self.module.get("revoked_history")
+        self.assertEqual(len(history), sessionguard.HISTORY_LIMIT)
+        self.assertEqual(history[-1]["device"], "Dev124")
+        text = sessionguard.utils.answer.await_args.args[1]
+        self.assertLess(text.index("Dev124"), text.index("Dev123"))
+        self.assertNotIn("Dev104", text)
 
     async def test_raw_update_is_revoked_immediately(self):
         self.module.set("baseline_initialized", True)
