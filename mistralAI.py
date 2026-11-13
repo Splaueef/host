@@ -1,7 +1,7 @@
 # meta developer: @RotKranz 
-# meta syntax: .mistral | .mistralimg | .mistralagent | .mistralagentadd
+# meta syntax: .mistral | .mistraldebug | .mistralimg | .mistralagent | .mistralagentadd
 
-__version__ = (4, 6, 0)
+__version__ = (4, 7, 0)
 
 import asyncio
 import base64
@@ -216,14 +216,20 @@ def _group_mode_matches(
     *,
     username: str = "",
     is_reply_to_us: bool = False,
+    mentioned: bool = False,
 ) -> bool:
-    """Apply one of the three documented auto-agent group modes."""
+    """Apply one of the three documented auto-agent group modes.
+
+    *mentioned* — згадка знайдена в entities повідомлення (наприклад,
+    текстова згадка без @username), а не лише в тексті.
+    """
     if mode == "all":
         return True
+    mention = mentioned or _has_bot_mention(text, username)
     if mode == "mention":
-        return _has_bot_mention(text, username)
+        return mention
     # ``addressed`` responds both to an explicit @username and to a reply.
-    return is_reply_to_us or _has_bot_mention(text, username)
+    return is_reply_to_us or mention
 
 
 # ── Історія чату ──────────────────────────────────────────────────────────────
@@ -731,7 +737,7 @@ class UsageStats:
 
 @loader.tds
 class MistralModule(loader.Module):
-    """Mistral AI v4.6: чат, зображення, OCR, TTS, транскрипція, агент-режим,
+    """Mistral AI v4.7: чат, зображення, OCR, TTS, транскрипція, агент-режим,
     векторна пам'ять, стрімінг, авто-мова, статистика, Werwolf інтеграція."""
 
     strings = {
@@ -976,6 +982,8 @@ class MistralModule(loader.Module):
         self._memory: Dict[tuple, collections.deque] = {}
         # Один запит до моделі на чат одночасно — інакше відповіді перемішуються
         self._chat_locks: Dict[tuple, asyncio.Lock] = {}
+        # Журнал рішень авто-агента (.mistraldebug): {chat_id: deque}
+        self._decisions: Dict[int, collections.deque] = {}
 
         self._active_agent_id:   Optional[str] = None
         self._active_agent_name: Optional[str] = None
@@ -1510,6 +1518,10 @@ class MistralModule(loader.Module):
                 "- Відповідай ЛИШЕ на повідомлення, позначене '>>>', і саме тій людині, "
                 "яка його написала. Решта історії — фон, на неї окремо не відповідай.\n"
                 "- Не плутай людей: те, що сказав один, не приписуй іншому.\n"
+                "- Відповідай по суті саме цього повідомлення. Давню історію згадуй лише "
+                "якщо вона прямо стосується питання; не продовжуй старі теми самочинно.\n"
+                "- Якщо до тебе нещодавно зверталися кілька людей, пам'ятай про всіх, "
+                "але відповідай тому, хто позначений '>>>'.\n"
                 "- Не починай відповідь з '[Ім'я]:' чи свого імені — пиши лише сам текст.\n"
                 "- Звертайся на ім'я тільки коли це доречно, а не в кожному повідомленні.\n"
                 "- Пиши коротко, як учасник чату, без зайвих вступів."
@@ -1898,21 +1910,52 @@ class MistralModule(loader.Module):
             return None
         return lang
 
+    def _log_decision(self, chat_id: int, who: str, text: str, decision: str):
+        log = self._decisions.get(chat_id)
+        if log is None:
+            log = self._decisions[chat_id] = collections.deque(maxlen=30)
+        log.append((time.time(), who, _snippet(text, 60), decision))
+        logger.debug("MistralAI [%s] %s: %s → %s", chat_id, who, _snippet(text, 60), decision)
+
+    def _mentions_me(self, message) -> bool:
+        """Згадка акаунту через Telegram entities (у т.ч. без @username)."""
+        if not self._me:
+            return False
+        raw = message.raw_text or ""
+        for ent in getattr(message, "entities", None) or []:
+            if getattr(ent, "user_id", None) == self._me.id:
+                return True
+            if type(ent).__name__ == "MessageEntityMention" and self._bot_name:
+                try:
+                    chunk = raw[ent.offset: ent.offset + ent.length]
+                except Exception:
+                    continue
+                if chunk.lstrip("@").lower() == self._bot_name:
+                    return True
+        return False
+
     async def watcher(self, message):
         if not message or not hasattr(message, "sender_id"):
             return
         if not self._ok():
             return
-        chat_id = message.chat_id
+        chat_id = getattr(message, "chat_id", None)
         if chat_id not in self._auto_chats:
             return
         if self._me and message.sender_id == self._me.id:
             return
-        if message.sender_id in self._csv_ints(self.config["agent_ignored_users"]):
-            return
         if getattr(message, "action", None):  # службові повідомлення
             return
+        try:
+            await self._handle_incoming(message, chat_id)
+        except Exception as e:
+            logger.exception("MistralAI watcher crashed")
+            self._log_decision(
+                chat_id, str(message.sender_id), message.raw_text or "",
+                f"❌ помилка: {e.__class__.__name__}: {_snippet(str(e), 120)}",
+            )
 
+    async def _handle_incoming(self, message, chat_id: int):
         raw = (message.raw_text or "").strip()
 
         # ── Визначаємо тип чату ───────────────────────────────────────────
@@ -1929,6 +1972,7 @@ class MistralModule(loader.Module):
         key       = self._thread_key(message)
         history   = self._get_plain_mem(key)
         sender_id = message.sender_id
+        ignored   = sender_id in self._csv_ints(self.config["agent_ignored_users"])
 
         # ── Чи звертаються до нас ─────────────────────────────────────────
         is_reply_to_us, reply_name, reply_text = await self._reply_info(message)
@@ -1938,6 +1982,7 @@ class MistralModule(loader.Module):
                 raw,
                 username=self._bot_name,
                 is_reply_to_us=is_reply_to_us,
+                mentioned=self._mentions_me(message),
             )
         else:
             addressed = bool(raw)
@@ -1961,18 +2006,33 @@ class MistralModule(loader.Module):
             "addressed": addressed,
         }
 
+        remember = is_group and self.config["agent_group_context"]
+
+        if ignored:
+            # Не відповідаємо, але в групі пам'ятаємо, що людина щось сказала,
+            # інакше відповіді іншим виглядають як розмова "в повітря".
+            if remember:
+                history.append(entry)
+            self._log_decision(chat_id, sender_name, text, "🚫 у agent_ignored_users")
+            return
+
         if not addressed:
             # Повідомлення не до нас — лише запам'ятовуємо як фон розмови.
-            if is_group and self.config["agent_group_context"]:
+            if remember:
                 history.append(entry)
+            self._log_decision(chat_id, sender_name, text, "· фон (не до мене)")
             return
 
         # ── Ліміти авто-відповідей ───────────────────────────────────────
         # Для груп ліміт рахується на чат; для OP/особистих — на користувача.
         limit_scope = self._limit_scope(chat_id, sender_id, is_group, group_title)
         if not self._limit_allowed(limit_scope):
-            if is_group and self.config["agent_group_context"]:
+            if remember:
                 history.append(entry)
+            self._log_decision(
+                chat_id, sender_name, text,
+                f"⛔ ліміт вичерпано ({limit_scope}); див. agent_limit_* у .config",
+            )
             return
 
         # Записуємо одразу, щоб зберегти хронологію, навіть якщо чекаємо lock.
@@ -2002,10 +2062,13 @@ class MistralModule(loader.Module):
 
         # Знімок історії рівно до повідомлення, на яке відповідаємо:
         # те, що написали пізніше, поки ми чекали, не збиває модель.
+        # Але власні відповіді, дані іншим поки це повідомлення чекало в черзі,
+        # залишаємо — інакше модель не знає, що вже відповіла сусідові.
         snapshot = list(history)
         for idx in range(len(snapshot) - 1, -1, -1):
             if snapshot[idx] is entry:
-                snapshot = snapshot[: idx + 1]
+                later = [e for e in snapshot[idx + 1:] if e.get("role") == ROLE_ASSISTANT]
+                snapshot = snapshot[:idx] + later + [entry]
                 break
         else:
             snapshot.append(entry)
@@ -2056,6 +2119,7 @@ class MistralModule(loader.Module):
         except RuntimeError as e:
             self._stats.inc(ok=False)
             logger.error("MistralAI watcher error: %s", e)
+            self._log_decision(chat_id, sender_name, text, f"❌ API: {_snippet(str(e), 100)}")
             try:
                 await message.client.send_message(
                     chat_id,
@@ -2117,12 +2181,33 @@ class MistralModule(loader.Module):
                 )
 
         if reply_text:
-            await message.client.send_message(
-                chat_id,
-                _md_to_html(reply_text),
-                parse_mode="html",
-                reply_to=message.id,
-            )
+            await self._send_reply(message, chat_id, reply_text)
+        self._log_decision(
+            chat_id, sender_name, text,
+            "⚠️ порожня відповідь API" if empty else "✅ відповів",
+        )
+
+    async def _send_reply(self, message, chat_id: int, reply_text: str):
+        """Надіслати відповідь; при помилці HTML/реплаю — запасні варіанти."""
+        attempts = (
+            dict(message=_md_to_html(reply_text), parse_mode="html", reply_to=message.id),
+            dict(message=reply_text[:4096], parse_mode=None, reply_to=message.id),
+            dict(message=reply_text[:4096], parse_mode=None),
+        )
+        last_error = None
+        for kwargs in attempts:
+            text = kwargs.pop("message")
+            if len(text) > 4096:
+                text = text[:4090] + "…"
+                if kwargs.get("parse_mode"):
+                    continue  # обрізаний HTML може бути битим — одразу plain
+            try:
+                await message.client.send_message(chat_id, text, **kwargs)
+                return
+            except Exception as e:
+                last_error = e
+                logger.warning("MistralAI: send failed (%s), retrying differently", e)
+        raise RuntimeError(f"не вдалося надіслати відповідь: {last_error}")
 
     async def _watcher_call(
         self,
@@ -2524,6 +2609,59 @@ class MistralModule(loader.Module):
                     del self._vec_mem[key]
         await utils.answer(message, self.strings["memory_cleared"].format(chat=chat_id))
 
+    @loader.command(ru_doc="— Чому авто-агент відповів / промовчав (останні рішення в чаті)")
+    async def mistraldebug(self, message):
+        """— Діагностика авто-агента в поточному чаті"""
+        chat_id = message.chat_id
+        is_group = not getattr(message, "is_private", False)
+        title = None
+        try:
+            chat = await message.get_chat()
+            title = getattr(chat, "title", None)
+        except Exception:
+            pass
+
+        lines = [
+            "<b>🩺 Діагностика авто-агента</b>",
+            f"Авто-агент тут: {'✅' if chat_id in self._auto_chats else '❌ (.mistralauto)'}",
+            f"Режим груп: <code>{_html_escape(self.config['agent_group_mode'])}</code>, "
+            f"мій username: <code>@{_html_escape(self._bot_name or '—')}</code>",
+            f"Агент: <code>{_html_escape(self._agent_id() or 'модель ' + str(self.config['agent_model']))}</code>",
+        ]
+        scope = self._limit_scope(chat_id, 0, is_group, title) if is_group else None
+        if is_group:
+            if scope:
+                day, month = self._limit_periods()
+                item = self._limit_state().get(scope, {})
+                dc = item.get("day_count", 0) if item.get("day") == day else 0
+                mc = item.get("month_count", 0) if item.get("month") == month else 0
+                lines.append(
+                    f"Ліміт групи: {dc}/{self.config['agent_limit_daily'] or '∞'} сьогодні, "
+                    f"{mc}/{self.config['agent_limit_monthly'] or '∞'} за місяць"
+                    + (" — <b>вичерпано</b>" if not self._limit_allowed(scope) else "")
+                )
+            else:
+                lines.append("Ліміт групи: без ліміту (виняток)")
+        ignored = self._csv_ints(self.config["agent_ignored_users"])
+        if ignored:
+            lines.append(
+                "Ігноровані: " + ", ".join(f"<code>{uid}</code>" for uid in sorted(ignored))
+            )
+        mem = sum(len(self._memory[k]) for k in self._chat_memories(chat_id))
+        lines.append(f"Повідомлень у пам'яті: {mem}")
+
+        log = self._decisions.get(chat_id)
+        lines.append("\n<b>Останні рішення:</b>")
+        if not log:
+            lines.append("<i>ще немає (журнал живе до перезапуску)</i>")
+        else:
+            for ts, who, text, decision in list(log)[-15:]:
+                lines.append(
+                    f"<code>{time.strftime('%H:%M:%S', time.localtime(ts))}</code> "
+                    f"<b>{_html_escape(who)}</b>: {_html_escape(text)}\n   → {_html_escape(decision)}"
+                )
+        await utils.answer(message, "\n".join(lines))
+
     @loader.command(ru_doc="— Думка агента про співрозмовника та короткий переказ історії")
     async def mistralthoughts(self, message):
         """— Показати, що авто-агент думає про співрозмовника, без запису у пам'ять"""
@@ -2809,6 +2947,7 @@ class MistralModule(loader.Module):
             "<code>.mistralmode [all|addressed|mention]</code> — Режим відповідей у групах\n"
             "<code>.mistralclear</code> — Очистити пам'ять (усього чату, включно з гілками)\n"
             "<code>.mistralthoughts</code> — Думка агента + коротка історія\n"
+            "<code>.mistraldebug</code> — Чому агент відповів / промовчав\n"
             "<i>У групах агент пам'ятає і фонову розмову (agent_group_context), "
             "розрізняє людей та реплаї; у форумах — окрема пам'ять на гілку.</i>\n"
             "<i>Ліміти авто-відповідей: 10/день і 80/місяць на групу або OP-користувача; винятки у .config</i>\n\n"

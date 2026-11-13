@@ -101,6 +101,18 @@ class GroupModeTests(unittest.TestCase):
             )
         )
 
+    def test_entity_mention_counts_as_mention(self):
+        self.assertTrue(
+            mistral._group_mode_matches(
+                "mention", "Влад, глянь", username="myassistant", mentioned=True
+            )
+        )
+        self.assertTrue(
+            mistral._group_mode_matches(
+                "addressed", "Влад, глянь", username="myassistant", mentioned=True
+            )
+        )
+
 
 def _u(name, text, uid=1, **kw):
     return {"role": "user", "name": name, "uid": uid, "text": text, **kw}
