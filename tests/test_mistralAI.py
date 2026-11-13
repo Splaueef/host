@@ -102,5 +102,80 @@ class GroupModeTests(unittest.TestCase):
         )
 
 
+def _u(name, text, uid=1, **kw):
+    return {"role": "user", "name": name, "uid": uid, "text": text, **kw}
+
+
+def _a(text):
+    return {"role": "assistant", "text": text}
+
+
+class HistoryFormattingTests(unittest.TestCase):
+    def test_group_messages_alternate_and_mark_trigger(self):
+        entries = [
+            _u("Олег", "хто йде на пиво?", 1),
+            _u("Іра", "я пас", 2),
+            _a("Я теж пас"),
+            _u("Олег", "а ти чого?", 1),
+            _u("Іра", "@bot скільки буде 2+2?", 2),
+        ]
+        msgs = mistral._build_chat_messages(entries, is_group=True)
+        roles = [m["role"] for m in msgs]
+        self.assertEqual(roles, ["user", "assistant", "user"])
+        self.assertIn("[Олег]: хто йде на пиво?", msgs[0]["content"])
+        self.assertIn("[Іра]: я пас", msgs[0]["content"])
+        last = msgs[-1]["content"]
+        self.assertIn("[Олег]: а ти чого?", last)
+        self.assertIn(">>> Зараз до тебе звертається [Іра]", last)
+        self.assertTrue(last.rstrip().endswith("[Іра]: @bot скільки буде 2+2?"))
+
+    def test_history_never_starts_with_assistant(self):
+        msgs = mistral._build_chat_messages([_a("старе"), _u("A", "привіт")], is_group=True)
+        self.assertEqual(msgs[0]["role"], "user")
+        self.assertEqual(len(msgs), 1)
+
+    def test_trigger_is_not_duplicated(self):
+        msgs = mistral._build_chat_messages([_u("A", "одне питання")], is_group=False)
+        self.assertEqual(msgs, [{"role": "user", "content": "одне питання"}])
+
+    def test_reply_context_is_shown(self):
+        entry = _u("Іра", "згодна", 2, reply_name="Олег", reply_text="погода класна")
+        msgs = mistral._build_chat_messages([entry], is_group=True)
+        self.assertIn("відповідь на повідомлення Олег: «погода класна»", msgs[0]["content"])
+        entry = _u("Іра", "чому?", 2, reply_to_us=True, reply_text="ні")
+        msgs = mistral._build_chat_messages([entry], is_group=True)
+        self.assertIn("відповідь на твоє повідомлення: «ні»", msgs[0]["content"])
+
+    def test_trim_keeps_newest_and_trigger(self):
+        entries = [_u("A", "x" * 500, i) for i in range(10)] + [_u("B", "останнє")]
+        trimmed = mistral._trim_history(entries, 1200)
+        self.assertEqual(trimmed[-1]["text"], "останнє")
+        self.assertLess(len(trimmed), len(entries))
+        self.assertEqual(mistral._trim_history(entries[-1:], 1)[0]["text"], "останнє")
+
+    def test_transcript_for_agents(self):
+        text = mistral._build_transcript(
+            [_u("Олег", "привіт"), _a("Привіт!"), _u("Іра", "як справи?", 2)], is_group=True
+        )
+        self.assertIn("[Олег]: привіт", text)
+        self.assertIn("[Ти]: Привіт!", text)
+        self.assertIn(">>> Зараз до тебе звертається [Іра]", text)
+
+
+class TextCleanupTests(unittest.TestCase):
+    def test_strip_speaker_prefix(self):
+        self.assertEqual(mistral._strip_speaker_prefix("[Бот]: привіт"), "привіт")
+        self.assertEqual(mistral._strip_speaker_prefix("Assistant: ok"), "ok")
+        self.assertEqual(
+            mistral._strip_speaker_prefix("[WERWOLF:user:SENDER]: x"), "[WERWOLF:user:SENDER]: x"
+        )
+        self.assertEqual(mistral._strip_speaker_prefix("звичайна відповідь"), "звичайна відповідь")
+
+    def test_strip_bot_mention(self):
+        self.assertEqual(mistral._strip_bot_mention("@MyBot, привіт", "mybot"), "привіт")
+        self.assertEqual(mistral._strip_bot_mention("@mybot", "mybot"), "@mybot")
+        self.assertEqual(mistral._strip_bot_mention("@mybot_x hi", "mybot"), "@mybot_x hi")
+
+
 if __name__ == "__main__":
     unittest.main()

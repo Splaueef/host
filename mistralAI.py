@@ -1,7 +1,7 @@
 # meta developer: @RotKranz 
 # meta syntax: .mistral | .mistralimg | .mistralagent | .mistralagentadd
 
-__version__ = (4, 5, 0)
+__version__ = (4, 6, 0)
 
 import asyncio
 import base64
@@ -224,6 +224,193 @@ def _group_mode_matches(
         return _has_bot_mention(text, username)
     # ``addressed`` responds both to an explicit @username and to a reply.
     return is_reply_to_us or _has_bot_mention(text, username)
+
+
+# ── Історія чату ──────────────────────────────────────────────────────────────
+# Кожен запис історії — dict:
+#   role       — "user" / "assistant"
+#   name       — ім'я автора (для груп)
+#   uid        — tg_id автора
+#   text       — текст повідомлення
+#   mid        — id повідомлення в Telegram
+#   reply_name — кому відповідає це повідомлення (якщо це реплай)
+#   reply_text — уривок повідомлення, на яке відповіли
+#   addressed  — чи було повідомлення звернене до асистента
+# Форматування у промпт відбувається лише в момент запиту, тому формат
+# зберігання не залежить від того, чи це chat-модель, чи Mistral-агент.
+
+_SPEAKER_PREFIX_RE = re.compile(
+    r"^\s*(?:\[(?!WERWOLF:)[^\]\n]{1,64}\]|(?:Assistant|Асистент|Ти|You)\s*(?:\([^)\n]{0,64}\))?)\s*:\s*",
+    re.IGNORECASE,
+)
+
+
+def _snippet(text: str, limit: int = 200) -> str:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _strip_bot_mention(text: str, username: str = "") -> str:
+    """Remove the assistant's own @username so the model sees the actual request."""
+    username = username.strip().lstrip("@")
+    if not username:
+        return text.strip()
+    cleaned = re.sub(
+        rf"(?<![\w@])@{re.escape(username)}(?!\w)[,:]?", "", text, flags=re.IGNORECASE
+    )
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    return cleaned or text.strip()
+
+
+def _strip_speaker_prefix(text: str) -> str:
+    """Models sometimes imitate the '[Name]: ' transcript format — drop it."""
+    return _SPEAKER_PREFIX_RE.sub("", str(text or ""), count=1).strip()
+
+
+def _media_placeholder(message) -> str:
+    for attr, label in (
+        ("sticker", "[стікер]"),
+        ("voice", "[голосове повідомлення]"),
+        ("video_note", "[відеокружечок]"),
+        ("gif", "[GIF]"),
+        ("photo", "[фото]"),
+        ("video", "[відео]"),
+        ("audio", "[аудіо]"),
+        ("document", "[файл]"),
+        ("poll", "[опитування]"),
+    ):
+        try:
+            if getattr(message, attr, None):
+                return label
+        except Exception:
+            continue
+    return ""
+
+
+def _reply_note(entry: dict, limit: int) -> str:
+    if entry.get("role") == ROLE_ASSISTANT:
+        return ""
+    quote_ = _snippet(entry.get("reply_text") or "", limit)
+    if entry.get("reply_to_us"):
+        target = "відповідь на твоє повідомлення"
+    elif entry.get("reply_name"):
+        target = f"відповідь на повідомлення {entry['reply_name']}"
+    elif quote_:
+        target = "відповідь на повідомлення"
+    else:
+        return ""
+    return target + (f": «{quote_}»" if quote_ else "")
+
+
+def _format_entry(entry: dict, is_group: bool, *, label_self: bool = False) -> str:
+    """One history entry → one transcript line."""
+    text = str(entry.get("text") or "").strip()
+    if entry.get("role") == ROLE_ASSISTANT:
+        prefix = "[Ти]" if label_self else ""
+    else:
+        name = entry.get("name") or entry.get("uid") or "Користувач"
+        prefix = f"[{name}]" if is_group or label_self else ""
+    reply = _reply_note(entry, 120)
+    reply = f" ({reply})" if reply else ""
+    head = f"{prefix}{reply}".strip()
+    return f"{head}: {text}" if head else text
+
+
+def _trim_history(entries: list, max_chars: int) -> list:
+    """Keep the newest entries that fit into *max_chars* (the last one always stays)."""
+    if max_chars <= 0 or not entries:
+        return list(entries)
+    kept, total = [], 0
+    for entry in reversed(entries):
+        size = len(str(entry.get("text") or "")) + 40
+        if kept and total + size > max_chars:
+            break
+        kept.append(entry)
+        total += size
+    kept.reverse()
+    return kept
+
+
+def _trigger_block(entry: dict, is_group: bool) -> str:
+    text = str(entry.get("text") or "").strip()
+    note = _reply_note(entry, 300)
+    if not is_group:
+        return f"({note})\n{text}" if note else text
+    name = entry.get("name") or entry.get("uid") or "Користувач"
+    lines = [f">>> Зараз до тебе звертається [{name}]. Відповідай саме на це повідомлення:"]
+    if note:
+        lines.append(f"({note})")
+    lines.append(f"[{name}]: {text}")
+    return "\n".join(lines)
+
+
+def _build_chat_messages(entries: list, is_group: bool, max_chars: int = 0) -> list:
+    """History → alternating chat messages for /v1/chat/completions.
+
+    * consecutive user entries (різні люди в групі) зливаються в одне
+      user-повідомлення, тож ролі завжди чергуються;
+    * останній запис — повідомлення, на яке треба відповісти, і воно
+      явно позначене, щоб модель не відповідала комусь іншому.
+    """
+    entries = _trim_history(entries, max_chars)
+    if not entries:
+        return []
+    *context, trigger = entries
+    messages: list = []
+    buf: list = []
+
+    def flush():
+        if buf:
+            messages.append({"role": ROLE_USER, "content": "\n".join(buf)})
+            buf.clear()
+
+    for entry in context:
+        if entry.get("role") == ROLE_ASSISTANT:
+            if not messages and not buf:
+                continue  # chat must not start with an assistant turn
+            flush()
+            text = str(entry.get("text") or "").strip()
+            if not text:
+                continue
+            if messages and messages[-1]["role"] == ROLE_ASSISTANT:
+                messages[-1]["content"] += "\n" + text
+            else:
+                messages.append({"role": ROLE_ASSISTANT, "content": text})
+        else:
+            line = _format_entry(entry, is_group)
+            if line:
+                buf.append(line)
+
+    if trigger.get("role") == ROLE_ASSISTANT:
+        flush()
+        return messages
+    if buf and is_group:
+        buf.append("")
+    buf.append(_trigger_block(trigger, is_group))
+    flush()
+    return messages
+
+
+def _build_transcript(entries: list, is_group: bool, max_chars: int = 0,
+                      *, with_trigger: bool = True) -> str:
+    """History → plain-text transcript (для Mistral-агентів / .mistralthoughts)."""
+    entries = _trim_history(entries, max_chars)
+    if not entries:
+        return ""
+    if not with_trigger or entries[-1].get("role") == ROLE_ASSISTANT:
+        return "\n".join(_format_entry(e, is_group, label_self=True) for e in entries)
+    *context, trigger = entries
+    parts = []
+    if context:
+        parts.append("Попередня історія чату:")
+        parts.extend(_format_entry(e, is_group, label_self=True) for e in context)
+        parts.append("")
+    if is_group:
+        parts.append(_trigger_block(trigger, True))
+    else:
+        parts.append("Нове повідомлення співрозмовника (відповідай на нього):\n"
+                     + _trigger_block(trigger, False))
+    return "\n".join(parts)
 
 
 def _cosine_similarity(a: list, b: list) -> float:
@@ -544,7 +731,7 @@ class UsageStats:
 
 @loader.tds
 class MistralModule(loader.Module):
-    """Mistral AI v4.1: чат, зображення, OCR, TTS, транскрипція, агент-режим,
+    """Mistral AI v4.6: чат, зображення, OCR, TTS, транскрипція, агент-режим,
     векторна пам'ять, стрімінг, авто-мова, статистика, Werwolf інтеграція."""
 
     strings = {
@@ -661,9 +848,20 @@ class MistralModule(loader.Module):
                 "ID Mistral-агента для авто-режиму (порожньо = модель+промпт)",
             ),
             loader.ConfigValue(
-                "agent_history_limit", 50,
-                "Глибина пам'яті авто-агента",
+                "agent_history_limit", 80,
+                "Глибина пам'яті авто-агента (кількість повідомлень на чат/гілку)",
                 validator=loader.validators.Integer(minimum=5, maximum=500),
+            ),
+            loader.ConfigValue(
+                "agent_group_context", True,
+                "Групи: запам'ятовувати і повідомлення, на які агент не відповідає "
+                "(щоб розуміти, про що йде розмова)",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "agent_context_chars", 12000,
+                "Максимум символів історії, що відправляються моделі за один запит",
+                validator=loader.validators.Integer(minimum=1000, maximum=200000),
             ),
             loader.ConfigValue(
                 "agent_typing", True,
@@ -774,8 +972,10 @@ class MistralModule(loader.Module):
         self._me = None
         self._auto_chats: Dict[int, bool] = {}
 
-        # Групова пам'ять: {chat_id: deque[dict]}  — завжди спільна для чату
-        self._memory: Dict[int, object] = {}
+        # Пам'ять: {(chat_id, topic_id): deque[dict]} — спільна для чату / гілки форуму
+        self._memory: Dict[tuple, collections.deque] = {}
+        # Один запит до моделі на чат одночасно — інакше відповіді перемішуються
+        self._chat_locks: Dict[tuple, asyncio.Lock] = {}
 
         self._active_agent_id:   Optional[str] = None
         self._active_agent_name: Optional[str] = None
@@ -930,25 +1130,54 @@ class MistralModule(loader.Module):
         }
         self.db.set("MistralAI", "agent_limits", state)
 
-    def _get_plain_mem(self, chat_id: int) -> collections.deque:
-        """Пам'ять для чату — завжди спільна.
-        В групах ім'я відправника вшивається у content: '[Ім'я]: текст'."""
-        lim = self.config["agent_history_limit"]
-        if chat_id not in self._memory or not isinstance(self._memory[chat_id], collections.deque):
-            self._memory[chat_id] = collections.deque(maxlen=lim)
-        return self._memory[chat_id]
+    @staticmethod
+    def _thread_key(message) -> tuple:
+        """(chat_id, topic_id): у форумах кожна гілка має окрему пам'ять."""
+        topic = None
+        rt = getattr(message, "reply_to", None)
+        if rt is not None and getattr(rt, "forum_topic", False):
+            topic = getattr(rt, "reply_to_top_id", None) or getattr(rt, "reply_to_msg_id", None)
+        return (message.chat_id, topic)
+
+    @staticmethod
+    def _is_real_reply(message) -> bool:
+        """Повідомлення в гілці форуму формально є 'реплаєм' на старт гілки."""
+        rt = getattr(message, "reply_to", None)
+        if not getattr(message, "is_reply", False) or rt is None:
+            return False
+        if getattr(rt, "forum_topic", False) and not getattr(rt, "reply_to_top_id", None):
+            return False
+        return True
+
+    def _get_plain_mem(self, key) -> collections.deque:
+        """Спільна пам'ять чату (або гілки форуму)."""
+        if not isinstance(key, tuple):
+            key = (key, None)
+        lim = int(self.config["agent_history_limit"])
+        mem = self._memory.get(key)
+        if not isinstance(mem, collections.deque):
+            mem = self._memory[key] = collections.deque(maxlen=lim)
+        elif mem.maxlen != lim:
+            mem = self._memory[key] = collections.deque(mem, maxlen=lim)
+        return mem
+
+    def _chat_lock(self, key) -> asyncio.Lock:
+        lock = self._chat_locks.get(key)
+        if lock is None:
+            lock = self._chat_locks[key] = asyncio.Lock()
+        return lock
+
+    def _chat_memories(self, chat_id: int) -> list:
+        return [k for k in self._memory if isinstance(k, tuple) and k[0] == chat_id]
 
     def _agent_id(self) -> str | None:
         return self._active_agent_id or (str(self.config["agent_mistral_id"] or "").strip() or None)
 
-    def _history_for_prompt(self, history) -> str:
-        lines = []
-        for m in list(history):
-            role = "Assistant" if m.get("role") == ROLE_ASSISTANT else "User"
-            content = str(m.get("content") or "").strip()
-            if content:
-                lines.append(f"{role}: {content}")
-        return "\n".join(lines)
+    def _history_for_prompt(self, history, is_group: bool = True) -> str:
+        return _build_transcript(
+            list(history), is_group, int(self.config["agent_context_chars"]),
+            with_trigger=False,
+        )
 
     def _get_vec_mem(self, chat_id: int) -> list:
         if not hasattr(self, "_vec_mem"):
@@ -1250,10 +1479,58 @@ class MistralModule(loader.Module):
             text = _mistral_content_to_text(data["choices"][0]["message"].get("content"))
         return text, m, time.monotonic() - t0
 
+    def _agent_context(
+        self,
+        chat_id: int | None,
+        sender_id: int | None,
+        sender_name: str | None,
+        is_group: bool,
+        group_title: str | None,
+    ) -> str:
+        """Службовий контекст Telegram для авто-агента (і chat-моделі, і агента)."""
+        me = self._me
+        me_name = ""
+        if me is not None:
+            me_name = " ".join(
+                p for p in (getattr(me, "first_name", None), getattr(me, "last_name", None)) if p
+            )
+            if getattr(me, "username", None):
+                me_name = f"{me_name} (@{me.username})".strip()
+        lines = [f"Поточний час (UTC): {time.strftime('%Y-%m-%d %H:%M', time.gmtime())}."]
+        if me_name:
+            lines.append(f"Ти пишеш від імені Telegram-акаунту {me_name}.")
+        if is_group:
+            title = f" «{group_title}»" if group_title else ""
+            lines.append(
+                f"Це груповий чат{title} (chat_id={chat_id}). Тут спілкуються різні люди.\n"
+                "Історія подана як транскрипт: кожне повідомлення людини має вигляд "
+                "'[Ім'я]: текст', позначка '(відповідь на повідомлення …)' показує, на що саме "
+                "відповіли. Твої попередні відповіді — це повідомлення асистента.\n"
+                "Правила:\n"
+                "- Відповідай ЛИШЕ на повідомлення, позначене '>>>', і саме тій людині, "
+                "яка його написала. Решта історії — фон, на неї окремо не відповідай.\n"
+                "- Не плутай людей: те, що сказав один, не приписуй іншому.\n"
+                "- Не починай відповідь з '[Ім'я]:' чи свого імені — пиши лише сам текст.\n"
+                "- Звертайся на ім'я тільки коли це доречно, а не в кожному повідомленні.\n"
+                "- Пиши коротко, як учасник чату, без зайвих вступів."
+            )
+        else:
+            lines.append("Це приватний чат з однією людиною.")
+        if sender_id is not None:
+            lines.append(
+                f"Поточний співрозмовник: {sender_name or sender_id}; tg_id={sender_id}."
+            )
+        if self._ww_ok():
+            lines.append(
+                "Werwolf: для статистики співрозмовника — [WERWOLF:user:SENDER]"
+                + ("; групи — [WERWOLF:group:CHAT]; зв'язків — [WERWOLF:relationships:CHAT]."
+                   if is_group else ".")
+            )
+        return "\n".join(lines)
+
     async def _chat_history(
         self,
-        history: collections.deque,
-        new_msg: str,
+        entries: list,
         chat_id: int | None = None,
         sender_id: int | None = None,
         sender_name: str | None = None,
@@ -1262,62 +1539,27 @@ class MistralModule(loader.Module):
         extra_context: list | None = None,
         system_override: str | None = None,
     ) -> str:
-        """Чат з пам'яттю.
+        """Чат з пам'яттю через /v1/chat/completions.
 
-        В групах повідомлення зберігаються у форматі '[Ім'я]: текст',
-        тому модель знає хто що написав.
-
-        Якщо Werwolf увімкнено — додаємо блок з інструкцією до системного промпту.
+        *entries* — знімок історії, останній запис якого — повідомлення,
+        на яке треба відповісти.
         """
-        base_system = system_override or self.config["agent_system_prompt"]
-
-        # Додаємо контекст про групу
-        if is_group:
-            group_ctx = (
-                f"\nТи зараз у груповому чаті{f' «{group_title}»' if group_title else ''}. "
-                f"Поточний chat_id: {chat_id}. "
-                "З тобою спілкуються різні люди — їх імена вказані у квадратних дужках, "
-                "наприклад [Олексій]: привіт. "
-                "Завжди звертайся до людини по імені. "
-                "Пам'ятай всю розмову — хто що питав і що ти відповідав."
-            )
-            system = base_system + group_ctx
-        else:
-            system = base_system
-
-        context_lines = []
-        if sender_id is not None:
-            context_lines.append(
-                f"Поточний співрозмовник: {sender_name or sender_id}; tg_id={sender_id}. "
-                "Для його/її RK/Werwolf статистики використовуй тег [WERWOLF:user:SENDER]."
-            )
-        if is_group:
-            context_lines.append(
-                "Для статистики цієї групи використовуй [WERWOLF:group:CHAT], "
-                "для зв'язків — [WERWOLF:relationships:CHAT]."
-            )
-        if context_lines:
-            system += "\n\nКонтекст Telegram:\n" + "\n".join(context_lines)
-
-        # Додаємо Werwolf інструкцію якщо є ключ
+        system = (system_override or self.config["agent_system_prompt"]).strip()
+        system += "\n\n=== КОНТЕКСТ ===\n" + self._agent_context(
+            chat_id, sender_id, sender_name, is_group, group_title
+        )
         if self._ww_ok():
-            system = system + _WW_SYSTEM_BLOCK
+            system += _WW_SYSTEM_BLOCK
+
+        if extra_context:
+            system += "\n\nМожливо корисні спогади з давніших розмов (не відповідай на них):\n" + "\n".join(
+                f"- {_snippet(e.content, 300)}" for e in extra_context
+            )
 
         messages = [{"role": "system", "content": system}]
-
-        # Релевантний контекст з векторної пам'яті
-        if extra_context:
-            ctx_text = "Корисний контекст з попередніх розмов:\n" + "\n".join(
-                f"{e.content}" for e in extra_context
-            )
-            messages.append({"role": "system", "content": ctx_text})
-
-        # Вся поточна пам'ять чату (вже містить '[Ім'я]: текст' для груп)
-        messages.extend(list(history))
-
-        # Поточне повідомлення (ще не збережене в history на момент виклику)
-        content = f"[{sender_name}]: {new_msg}" if (is_group and sender_name) else new_msg
-        messages.append({"role": ROLE_USER, "content": content})
+        messages.extend(
+            _build_chat_messages(entries, is_group, int(self.config["agent_context_chars"]))
+        )
 
         payload = {
             "model": self.config["agent_model"],
@@ -1609,77 +1851,164 @@ class MistralModule(loader.Module):
     # WATCHER — авто-агент
     # ════════════════════════════════════════════════════════════════════════════
 
+    async def _sender_name(self, message) -> str:
+        sender_id = message.sender_id
+        try:
+            sender = await message.get_sender()
+        except Exception:
+            sender = None
+        if sender is None:
+            return str(sender_id)
+        name = " ".join(
+            p for p in (getattr(sender, "first_name", None), getattr(sender, "last_name", None)) if p
+        ) or getattr(sender, "title", None) or ""
+        username = getattr(sender, "username", None)
+        if not name:
+            name = f"@{username}" if username else str(sender_id)
+        return name.strip()
+
+    async def _reply_info(self, message) -> tuple[bool, str | None, str | None]:
+        """(is_reply_to_us, reply_author_name, reply_text_snippet)."""
+        if not self._is_real_reply(message):
+            return False, None, None
+        try:
+            rep = await message.get_reply_message()
+        except Exception:
+            rep = None
+        if rep is None:
+            return False, None, None
+        to_us = bool(self._me and rep.sender_id == self._me.id)
+        name = None if to_us else await self._sender_name(rep)
+        text = (rep.raw_text or "").strip() or _media_placeholder(rep)
+        return to_us, name, _snippet(text, 300) or None
+
+    def _reply_lang(self, text: str) -> str | None:
+        """Мова для явної інструкції — тільки якщо текст достатньо довгий.
+
+        На коротких фразах ("ок", "лол", "+") langdetect часто помиляється
+        і змушує модель відповідати якоюсь випадковою мовою.
+        """
+        if not (self.config["agent_auto_lang"] and _HAS_LANGDETECT):
+            return None
+        letters = sum(ch.isalpha() for ch in text)
+        if letters < 25:
+            return None
+        lang = _detect_lang(text)
+        if not lang or lang in ("uk", "ru"):
+            return None
+        return lang
+
     async def watcher(self, message):
         if not message or not hasattr(message, "sender_id"):
             return
         if not self._ok():
             return
+        chat_id = message.chat_id
+        if chat_id not in self._auto_chats:
+            return
         if self._me and message.sender_id == self._me.id:
             return
         if message.sender_id in self._csv_ints(self.config["agent_ignored_users"]):
             return
-
-        chat_id = message.chat_id
-        if chat_id not in self._auto_chats:
+        if getattr(message, "action", None):  # службові повідомлення
             return
 
-        text = (message.raw_text or "").strip()
-        if not text:
-            return
+        raw = (message.raw_text or "").strip()
 
         # ── Визначаємо тип чату ───────────────────────────────────────────
-        is_group    = False
+        is_group    = bool(getattr(message, "is_group", False))
         group_title = None
         try:
-            chat     = await message.get_chat()
-            is_group = hasattr(chat, "title")
-            if is_group:
+            chat = await message.get_chat()
+            if hasattr(chat, "title"):
+                is_group    = True
                 group_title = getattr(chat, "title", None)
         except Exception:
             pass
 
-        # ── Фільтрація в групах ───────────────────────────────────────────
+        key       = self._thread_key(message)
+        history   = self._get_plain_mem(key)
+        sender_id = message.sender_id
+
+        # ── Чи звертаються до нас ─────────────────────────────────────────
+        is_reply_to_us, reply_name, reply_text = await self._reply_info(message)
         if is_group:
-            mode = self.config["agent_group_mode"]
-            is_reply_to_us = False
-            if message.is_reply:
-                try:
-                    rep = await message.get_reply_message()
-                    is_reply_to_us = bool(
-                        rep and self._me and rep.sender_id == self._me.id
-                    )
-                except Exception:
-                    pass
-            if not _group_mode_matches(
-                mode,
-                text,
+            addressed = bool(raw) and _group_mode_matches(
+                self.config["agent_group_mode"],
+                raw,
                 username=self._bot_name,
                 is_reply_to_us=is_reply_to_us,
-            ):
-                return
-
-        # ── Ім'я відправника ──────────────────────────────────────────────
-        sender_id = message.sender_id
-        try:
-            sender      = await message.get_sender()
-            sender_name = (
-                getattr(sender, "first_name", None)
-                or getattr(sender, "username", None)
-                or str(sender_id)
             )
-        except Exception:
-            sender_name = str(sender_id)
+        else:
+            addressed = bool(raw)
+
+        text = _strip_bot_mention(raw, self._bot_name) if is_group else raw
+        if not text:
+            text = _media_placeholder(message)
+        if not text:
+            return
+
+        sender_name = await self._sender_name(message)
+        entry = {
+            "role": ROLE_USER,
+            "name": sender_name,
+            "uid": sender_id,
+            "text": text,
+            "mid": message.id,
+            "reply_name": reply_name,
+            "reply_to_us": is_reply_to_us,
+            "reply_text": reply_text,
+            "addressed": addressed,
+        }
+
+        if not addressed:
+            # Повідомлення не до нас — лише запам'ятовуємо як фон розмови.
+            if is_group and self.config["agent_group_context"]:
+                history.append(entry)
+            return
 
         # ── Ліміти авто-відповідей ───────────────────────────────────────
         # Для груп ліміт рахується на чат; для OP/особистих — на користувача.
         limit_scope = self._limit_scope(chat_id, sender_id, is_group, group_title)
         if not self._limit_allowed(limit_scope):
+            if is_group and self.config["agent_group_context"]:
+                history.append(entry)
             return
 
-        # ── Спільна пам'ять чату ──────────────────────────────────────────
-        # Одна deque на весь чат (і для груп, і для особистих).
-        # В групах content зберігається як '[Ім'я]: текст'.
-        history = self._get_plain_mem(chat_id)
+        # Записуємо одразу, щоб зберегти хронологію, навіть якщо чекаємо lock.
+        history.append(entry)
+
+        async with self._chat_lock(key):
+            await self._answer_entry(
+                message, entry, history,
+                chat_id=chat_id, is_group=is_group, group_title=group_title,
+                limit_scope=limit_scope,
+            )
+
+    async def _answer_entry(
+        self,
+        message,
+        entry: dict,
+        history: collections.deque,
+        *,
+        chat_id: int,
+        is_group: bool,
+        group_title: str | None,
+        limit_scope: str | None,
+    ):
+        sender_id   = entry["uid"]
+        sender_name = entry["name"]
+        text        = entry["text"]
+
+        # Знімок історії рівно до повідомлення, на яке відповідаємо:
+        # те, що написали пізніше, поки ми чекали, не збиває модель.
+        snapshot = list(history)
+        for idx in range(len(snapshot) - 1, -1, -1):
+            if snapshot[idx] is entry:
+                snapshot = snapshot[: idx + 1]
+                break
+        else:
+            snapshot.append(entry)
 
         # ── Векторна пам'ять ──────────────────────────────────────────────
         extra_context: list | None = None
@@ -1687,58 +2016,43 @@ class MistralModule(loader.Module):
         if self.config["vector_memory"] and _HAS_NUMPY:
             try:
                 query_emb, _ = await self._embeddings(text)
-                extra_context = self._vec_mem_relevant(
-                    chat_id, query_emb, self.config["vector_top_k"]
-                )
+                recent = {str(e.get("text") or "") for e in snapshot}
+                extra_context = [
+                    e for e in self._vec_mem_relevant(chat_id, query_emb, self.config["vector_top_k"])
+                    if e.content not in recent
+                ]
             except Exception:
                 pass
 
         # ── Мовна адаптація ───────────────────────────────────────────────
         system_override = None
-        if self.config["agent_auto_lang"] and _HAS_LANGDETECT:
-            lang = _detect_lang(text)
-            if lang and lang not in ("uk", "ru"):
-                system_override = (
-                    self.config["agent_system_prompt"]
-                    + f"\nВідповідай мовою: {lang}."
-                )
-
-        # ── Зберігаємо вхідне повідомлення у пам'ять ─────────────────────
-        # В групах — з іменем, щоб модель знала хто говорив
-        stored_content = f"[{sender_name}]: {text}" if is_group else text
-        history.append({"role": ROLE_USER, "content": stored_content})
+        lang = self._reply_lang(text)
+        if lang:
+            system_override = (
+                self.config["agent_system_prompt"]
+                + f"\nПоточний співрозмовник пише мовою «{lang}» — відповідай цією мовою."
+            )
 
         agent_id = self._agent_id()
+        call_kwargs = dict(
+            agent_id=agent_id,
+            entries=snapshot,
+            chat_id=chat_id,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            is_group=is_group,
+            group_title=group_title,
+            extra_context=extra_context,
+            system_override=system_override,
+        )
 
         # ── Виклик моделі ─────────────────────────────────────────────────
         try:
             if self.config["agent_typing"]:
                 async with message.client.action(chat_id, "typing"):
-                    reply_text, images = await self._watcher_call(
-                        agent_id=agent_id,
-                        history=history,
-                        text=text,
-                        chat_id=chat_id,
-                        sender_id=sender_id,
-                        sender_name=sender_name,
-                        is_group=is_group,
-                        group_title=group_title,
-                        extra_context=extra_context,
-                        system_override=system_override,
-                    )
+                    reply_text, images = await self._watcher_call(**call_kwargs)
             else:
-                reply_text, images = await self._watcher_call(
-                    agent_id=agent_id,
-                    history=history,
-                    text=text,
-                    chat_id=chat_id,
-                    sender_id=sender_id,
-                    sender_name=sender_name,
-                    is_group=is_group,
-                    group_title=group_title,
-                    extra_context=extra_context,
-                    system_override=system_override,
-                )
+                reply_text, images = await self._watcher_call(**call_kwargs)
         except RuntimeError as e:
             self._stats.inc(ok=False)
             logger.error("MistralAI watcher error: %s", e)
@@ -1753,12 +2067,16 @@ class MistralModule(loader.Module):
                 logger.exception("MistralAI watcher failed to send API error message")
             return
 
-        if not (reply_text or "").strip() and not images:
+        reply_text = _strip_speaker_prefix(reply_text or "")
+        if not reply_text and not images:
             logger.warning("MistralAI watcher got an empty response")
-            reply_text = "⚠️ Mistral API повернув порожню відповідь. Спробуй вимкнути agent_stream або повторити запит."
+            reply_text = "⚠️ Mistral API повернув порожню відповідь. Спробуй повторити запит."
+            empty = True
+        else:
+            empty = False
 
         # ── Обробляємо Werwolf теги у відповіді ──────────────────────────
-        if self._ww_ok():
+        if self._ww_ok() and not empty:
             try:
                 reply_text = await self._ww_process_reply(reply_text, chat_id, sender_id)
             except Exception as e:
@@ -1767,12 +2085,22 @@ class MistralModule(loader.Module):
         self._stats.inc()
         self._limit_inc(limit_scope)
 
-        # ── Зберігаємо відповідь у пам'ять ───────────────────────────────
-        history.append({"role": ROLE_ASSISTANT, "content": reply_text})
+        # ── Зберігаємо відповідь у пам'ять (службові помилки — ні) ────────
+        if not empty:
+            history.append({
+                "role": ROLE_ASSISTANT,
+                "name": None,
+                "uid": self._me.id if self._me else None,
+                "text": reply_text or ("[надіслано зображення]" if images else ""),
+                "mid": None,
+                "reply_name": sender_name,
+                "reply_text": None,
+                "addressed": False,
+            })
 
         # Векторна пам'ять
-        if self.config["vector_memory"] and _HAS_NUMPY:
-            self._vec_mem_add(chat_id, ROLE_USER, stored_content, query_emb)
+        if self.config["vector_memory"] and _HAS_NUMPY and not empty:
+            self._vec_mem_add(chat_id, ROLE_USER, _format_entry(entry, is_group), query_emb)
             try:
                 rep_emb, _ = await self._embeddings(reply_text)
             except Exception:
@@ -1780,17 +2108,12 @@ class MistralModule(loader.Module):
             self._vec_mem_add(chat_id, ROLE_ASSISTANT, reply_text, rep_emb)
 
         # ── Надсилаємо відповідь РЕПЛЕЄМ на повідомлення ─────────────────
-        # reply_to=message.id гарантує що бот завжди відповідає на конкретне повідомлення
         for img in images:
             if img.startswith(b"http"):
-                await message.client.send_file(
-                    chat_id, img.decode(),
-                    reply_to=message.id,
-                )
+                await message.client.send_file(chat_id, img.decode(), reply_to=message.id)
             else:
                 await message.client.send_file(
-                    chat_id, _telegram_image_file(img),
-                    reply_to=message.id,
+                    chat_id, _telegram_image_file(img), reply_to=message.id,
                 )
 
         if reply_text:
@@ -1798,14 +2121,13 @@ class MistralModule(loader.Module):
                 chat_id,
                 _md_to_html(reply_text),
                 parse_mode="html",
-                reply_to=message.id,  # ← завжди реплай на повідомлення що спричинило реакцію
+                reply_to=message.id,
             )
 
     async def _watcher_call(
         self,
         agent_id: str | None,
-        history: collections.deque,
-        text: str,
+        entries: list,
         chat_id: int,
         sender_id: int,
         sender_name: str | None,
@@ -1815,43 +2137,41 @@ class MistralModule(loader.Module):
         system_override: str | None,
     ) -> tuple[str, list]:
         if agent_id:
-            # Для Mistral Platform агента — передаємо всю пам'ять як текст
-            history_text = "\n".join(
-                f"{'User' if m['role'] == ROLE_USER else 'Assistant'}: {m['content']}"
-                for m in history
-            )
+            # Mistral Platform агент: інструкції в нього свої, тому передаємо
+            # службовий контекст + структурований транскрипт одним входом.
+            parts = [
+                "=== КОНТЕКСТ (службова інформація, не цитуй її) ===",
+                self._agent_context(chat_id, sender_id, sender_name, is_group, group_title),
+            ]
+            if system_override:
+                lang = system_override.rsplit("\n", 1)[-1]
+                parts.append(lang)
             if self._ww_ok():
-                history_text = (
-                    _WW_SYSTEM_BLOCK
-                    + "\nКонтекст Telegram:\n"
-                    + f"sender_id={sender_id}; sender_name={sender_name}; chat_id={chat_id}; "
-                    + ("це група." if is_group else "це приватний чат.")
-                    + "\n\n"
-                    + history_text
+                parts.append(_WW_SYSTEM_BLOCK.strip())
+            if extra_context:
+                parts.append(
+                    "Можливо корисні спогади з давніших розмов:\n"
+                    + "\n".join(f"- {_snippet(e.content, 300)}" for e in extra_context)
                 )
+            parts.append("=== ЧАТ ===")
+            parts.append(
+                _build_transcript(entries, is_group, int(self.config["agent_context_chars"]))
+            )
             reply_text, images = await self._conversation(
-                prompt=history_text,
+                prompt="\n\n".join(parts),
                 agent_id=agent_id,
             )
         else:
-            original = self.config["agent_system_prompt"]
-            if system_override:
-                self.config["agent_system_prompt"] = system_override
-            try:
-                reply_text = await self._chat_history(
-                    history=history,
-                    new_msg=text,
-                    chat_id=chat_id,
-                    sender_id=sender_id,
-                    sender_name=sender_name,
-                    is_group=is_group,
-                    group_title=group_title,
-                    extra_context=extra_context,
-                    system_override=system_override,
-                )
-            finally:
-                if system_override:
-                    self.config["agent_system_prompt"] = original
+            reply_text = await self._chat_history(
+                entries=entries,
+                chat_id=chat_id,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                is_group=is_group,
+                group_title=group_title,
+                extra_context=extra_context,
+                system_override=system_override,
+            )
             images = []
         return reply_text, images
 
@@ -2196,8 +2516,8 @@ class MistralModule(loader.Module):
     async def mistralclear(self, message):
         """— Очистити пам'ять авто-агента"""
         chat_id = message.chat_id
-        if chat_id in self._memory:
-            del self._memory[chat_id]
+        for key in self._chat_memories(chat_id):
+            del self._memory[key]
         if hasattr(self, "_vec_mem"):
             for key in list(self._vec_mem.keys()):
                 if (isinstance(key, tuple) and key[0] == chat_id) or key == chat_id:
@@ -2215,11 +2535,15 @@ class MistralModule(loader.Module):
         if chat_id not in self._auto_chats or not agent_id:
             return await utils.answer(message, self.strings["agent_thoughts_unavailable"])
 
-        history = self._memory.get(chat_id)
+        history = self._memory.get(self._thread_key(message))
+        if not history:
+            keys = self._chat_memories(chat_id)
+            history = self._memory.get(keys[0]) if len(keys) == 1 else None
         if not history:
             return await utils.answer(message, self.strings["agent_thoughts_empty"])
 
-        history_text = self._history_for_prompt(history)
+        is_group = not getattr(message, "is_private", False)
+        history_text = self._history_for_prompt(history, is_group=is_group)
         if not history_text:
             return await utils.answer(message, self.strings["agent_thoughts_empty"])
 
@@ -2483,8 +2807,10 @@ class MistralModule(loader.Module):
             "<code>.mistralauto</code> — Увімк/вимк у чаті\n"
             "<code>.mistralautolist</code> — Активні чати\n"
             "<code>.mistralmode [all|addressed|mention]</code> — Режим відповідей у групах\n"
-            "<code>.mistralclear</code> — Очистити пам'ять\n"
+            "<code>.mistralclear</code> — Очистити пам'ять (усього чату, включно з гілками)\n"
             "<code>.mistralthoughts</code> — Думка агента + коротка історія\n"
+            "<i>У групах агент пам'ятає і фонову розмову (agent_group_context), "
+            "розрізняє людей та реплаї; у форумах — окрема пам'ять на гілку.</i>\n"
             "<i>Ліміти авто-відповідей: 10/день і 80/місяць на групу або OP-користувача; винятки у .config</i>\n\n"
             "<b>🎮 Werwolf інтеграція</b>\n"
             "<code>.wwkey &lt;ключ&gt;</code> — Встановити Werwolf ключ\n"
