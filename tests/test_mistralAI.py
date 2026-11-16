@@ -189,5 +189,60 @@ class TextCleanupTests(unittest.TestCase):
         self.assertEqual(mistral._strip_bot_mention("@mybot_x hi", "mybot"), "@mybot_x hi")
 
 
+class HumanModeTests(unittest.TestCase):
+    def _chance(self, text, **kw):
+        params = dict(base=25, now=1000.0, cooldown=120, dialog_window=180)
+        params.update(kw)
+        return mistral._human_reply_chance(text, **params)[0]
+
+    def test_dialog_continuation_is_likely(self):
+        self.assertGreaterEqual(
+            self._chance("а чому ти так думаєш", last_reply=950.0, last_partner=7, sender_id=7), 80
+        )
+        # інша людина — не діалог
+        self.assertLess(
+            self._chance("а чому ти так думаєш", last_reply=950.0, last_partner=7, sender_id=8), 80
+        )
+
+    def test_dialog_expires(self):
+        self.assertLess(
+            self._chance("а далі що", last_reply=100.0, last_partner=7, sender_id=7), 80
+        )
+
+    def test_low_effort_messages_rarely_answered(self):
+        self.assertLessEqual(self._chance("лол"), 10)
+        self.assertLessEqual(self._chance("ок", last_reply=990.0, last_partner=1, sender_id=1), 20)
+
+    def test_cooldown_blocks_spontaneous(self):
+        self.assertEqual(self._chance("хто що думає про новий фільм?", last_spontaneous=950.0), 0)
+        # але звернення на ім'я сильніше за кулдаун
+        self.assertGreater(
+            self._chance("x", last_spontaneous=950.0, name_mentioned=True), 90
+        )
+
+    def test_question_raises_chance(self):
+        self.assertGreater(self._chance("хто що думає про фільм?"), self._chance("дивився фільм"))
+
+    def test_name_mentioned(self):
+        self.assertTrue(mistral._name_mentioned("Владе, а ти що скажеш", ["Влад"]))
+        self.assertTrue(mistral._name_mentioned("що думаєш, влад?", ["Влад"]))
+        self.assertFalse(mistral._name_mentioned("Владислава прийшла", ["Влад"]))
+        self.assertFalse(mistral._name_mentioned("ок", ["Ян"]))  # надто коротке
+
+    def test_skip_detection(self):
+        for value in ("[SKIP]", "skip", " [skip] ", "SKIP.", ""):
+            self.assertTrue(mistral._is_skip_reply(value), value)
+        self.assertFalse(mistral._is_skip_reply("та ні, я б не скіпав"))
+
+    def test_spontaneous_trigger_wording(self):
+        msgs = mistral._build_chat_messages(
+            [_u("Олег", "хто дивився матч?", spontaneous=True)], is_group=True
+        )
+        content = msgs[-1]["content"]
+        self.assertIn("НЕ обов'язково до тебе", content)
+        self.assertIn("[SKIP]", content)
+        self.assertNotIn("Зараз до тебе звертається", content)
+
+
 if __name__ == "__main__":
     unittest.main()

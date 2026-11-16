@@ -1,7 +1,7 @@
 # meta developer: @RotKranz 
 # meta syntax: .mistral | .mistraldebug | .mistralimg | .mistralagent | .mistralagentadd
 
-__version__ = (4, 7, 0)
+__version__ = (4, 8, 0)
 
 import asyncio
 import base64
@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import math
+import random
 import re
 import subprocess
 import sys
@@ -232,6 +233,94 @@ def _group_mode_matches(
     return is_reply_to_us or mention
 
 
+# ── Режим "жива людина" в групах ──────────────────────────────────────────────
+# Агент сам вирішує, чи включатися в розмову: спершу дешевий локальний фільтр
+# (_human_reply_chance), потім модель може відповісти "[SKIP]" і промовчати.
+
+HUMAN_SKIP_TOKEN = "[SKIP]"
+_SKIP_RE = re.compile(r"^\W*\[?\s*(?:skip|пропуск|мовчу)\s*\]?\W*$", re.IGNORECASE)
+_LOW_EFFORT_RE = re.compile(
+    r"^\W*(?:ок|окей|ok|okay|ага|угу|лол|lol|кек|xd|хд|ха+|ах+|ахах\w*|хах\w*|"
+    r"\++|-+|\.+|да|ні|нє|нет|так|ясно|зрозуміло|норм|пон|спс|дякую|thx|ty|"
+    r"[)(]+|\[[^\]]+\])\W*$",
+    re.IGNORECASE,
+)
+
+
+def _is_skip_reply(text: str) -> bool:
+    """Модель вирішила промовчати (з урахуванням дрібних варіацій формату)."""
+    text = str(text or "").strip()
+    if not text:
+        return True
+    return HUMAN_SKIP_TOKEN.lower() in text.lower()[:20] or bool(_SKIP_RE.match(text))
+
+
+def _name_mentioned(text: str, names) -> bool:
+    """Чи згадали акаунт на ім'я без @ (наприклад, «Влад, а ти що думаєш?»)."""
+    low = str(text or "").lower()
+    for name in names:
+        name = str(name or "").strip().lower()
+        if len(name) < 3:
+            continue
+        # Ловимо і відмінки: «Влад», «Владе», «Владу», «Владом».
+        if re.search(rf"(?<!\w){re.escape(name)}\w{{0,3}}(?!\w)", low):
+            return True
+    return False
+
+
+def _keywords_hit(text: str, keywords) -> bool:
+    low = str(text or "").lower()
+    return any(k and k in low for k in (str(k).strip().lower() for k in keywords))
+
+
+def _human_reply_chance(
+    text: str,
+    *,
+    base: int,
+    now: float,
+    last_spontaneous: float = 0.0,
+    last_reply: float = 0.0,
+    last_partner=None,
+    sender_id=None,
+    cooldown: int = 120,
+    dialog_window: int = 180,
+    name_mentioned: bool = False,
+    keyword: bool = False,
+    is_media: bool = False,
+) -> tuple[int, str]:
+    """Ймовірність (0–100) спонтанно включитися в розмову + причина для журналу.
+
+    Чиста функція, щоб її можна було протестувати без Telegram.
+    """
+    text = str(text or "").strip()
+    in_dialog = (
+        last_partner is not None
+        and sender_id == last_partner
+        and last_reply
+        and now - last_reply <= dialog_window
+    )
+    if name_mentioned:
+        return 100, "звернулися на ім'я"
+    if in_dialog:
+        # Людина продовжує розмову з нами — майже завжди підтримуємо,
+        # але на «ок»/«лол» жива людина зазвичай не відповідає.
+        if _LOW_EFFORT_RE.match(text) or is_media:
+            return 15, "діалог, коротка репліка"
+        return 85, "продовження діалогу"
+    if last_spontaneous and now - last_spontaneous < cooldown:
+        return 0, f"кулдаун ({int(cooldown - (now - last_spontaneous))}с)"
+    if keyword:
+        return max(base, 70), "цікава тема"
+    if is_media or _LOW_EFFORT_RE.match(text) or len(text) < 4:
+        return base // 4, "коротке/медіа"
+    chance = base
+    if "?" in text:
+        chance += 20
+    if len(text) > 120:
+        chance += 10
+    return max(0, min(100, chance)), "загальна розмова"
+
+
 # ── Історія чату ──────────────────────────────────────────────────────────────
 # Кожен запис історії — dict:
 #   role       — "user" / "assistant"
@@ -343,7 +432,14 @@ def _trigger_block(entry: dict, is_group: bool) -> str:
     if not is_group:
         return f"({note})\n{text}" if note else text
     name = entry.get("name") or entry.get("uid") or "Користувач"
-    lines = [f">>> Зараз до тебе звертається [{name}]. Відповідай саме на це повідомлення:"]
+    if entry.get("spontaneous"):
+        lines = [
+            f">>> Останнє повідомлення в чаті від [{name}] — воно НЕ обов'язково до тебе. "
+            f"Якщо як учасник розмови тобі є що природно сказати — відреагуй на нього, "
+            f"інакше відповідай рівно {HUMAN_SKIP_TOKEN}:"
+        ]
+    else:
+        lines = [f">>> Зараз до тебе звертається [{name}]. Відповідай саме на це повідомлення:"]
     if note:
         lines.append(f"({note})")
     lines.append(f"[{name}]: {text}")
@@ -737,7 +833,7 @@ class UsageStats:
 
 @loader.tds
 class MistralModule(loader.Module):
-    """Mistral AI v4.7: чат, зображення, OCR, TTS, транскрипція, агент-режим,
+    """Mistral AI v4.8: чат, зображення, OCR, TTS, транскрипція, агент-режим,
     векторна пам'ять, стрімінг, авто-мова, статистика, Werwolf інтеграція."""
 
     strings = {
@@ -779,6 +875,14 @@ class MistralModule(loader.Module):
         "group_mode": (
             "<b>👥 Режим авто-агента в групах:</b> <code>{mode}</code>\n{description}"
         ),
+        "human_on": (
+            "<b>🧑 Живий режим у групах увімкнено.</b>\n"
+            "Агент завжди відповідає на @згадку/реплай, підтримує діалог, а в загальну "
+            "розмову включається сам, коли є що сказати (базовий шанс {chance}%, "
+            "пауза {cooldown}с). Тонке налаштування: <code>agent_human_*</code> у .config"
+        ),
+        "human_off": "<b>🤖 Живий режим у групах вимкнено</b> — діє <code>.mistralmode</code>.",
+        "human_invalid": "<b>❌ Використай</b> <code>.mistralhuman on</code> / <code>off</code>",
         "group_mode_invalid": (
             "<b>❌ Невідомий режим.</b> Використай <code>all</code>, "
             "<code>addressed</code> або <code>mention</code>."
@@ -878,6 +982,43 @@ class MistralModule(loader.Module):
                 "agent_group_mode", "addressed",
                 "Групи: all=усі повідомлення; addressed=@згадка або відповідь; mention=тільки @згадка",
                 validator=loader.validators.Choice(["all", "addressed", "mention"]),
+            ),
+            # ── Групи: режим живої людини ──────────────────────────────────
+            loader.ConfigValue(
+                "agent_group_human", False,
+                "Групи: поводитись як жива людина — відповідати на @згадки/реплаї, "
+                "а в решті розмови самому вирішувати, коли включитися "
+                "(підтримувати діалог, реагувати на цікаве, мовчати на «ок»/«лол»)",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "agent_human_chance", 25,
+                "Живий режим: базовий шанс (%) спонтанно включитися в загальну розмову",
+                validator=loader.validators.Integer(minimum=0, maximum=100),
+            ),
+            loader.ConfigValue(
+                "agent_human_cooldown", 180,
+                "Живий режим: мінімальна пауза (с) між спонтанними репліками в одному чаті",
+                validator=loader.validators.Integer(minimum=0, maximum=86400),
+            ),
+            loader.ConfigValue(
+                "agent_human_dialog_window", 240,
+                "Живий режим: скільки секунд після відповіді людині вважати, "
+                "що з нею триває діалог (її наступні повідомлення — до нас)",
+                validator=loader.validators.Integer(minimum=0, maximum=3600),
+            ),
+            loader.ConfigValue(
+                "agent_human_keywords", "",
+                "Живий режим: теми/слова через кому, на які агент охоче реагує",
+            ),
+            loader.ConfigValue(
+                "agent_human_names", "",
+                "Живий режим: імена/прізвиська акаунту через кому (порожньо = ім'я з профілю)",
+            ),
+            loader.ConfigValue(
+                "agent_human_delay", True,
+                "Живий режим: затримка «набору» перед відповіддю як у людини",
+                validator=loader.validators.Boolean(),
             ),
             loader.ConfigValue(
                 "agent_auto_lang", True,
@@ -984,6 +1125,8 @@ class MistralModule(loader.Module):
         self._chat_locks: Dict[tuple, asyncio.Lock] = {}
         # Журнал рішень авто-агента (.mistraldebug): {chat_id: deque}
         self._decisions: Dict[int, collections.deque] = {}
+        # Живий режим: {thread_key: {"spont": ts, "reply": ts, "partner": uid}}
+        self._human_state: Dict[tuple, dict] = {}
 
         self._active_agent_id:   Optional[str] = None
         self._active_agent_name: Optional[str] = None
@@ -1526,6 +1669,19 @@ class MistralModule(loader.Module):
                 "- Звертайся на ім'я тільки коли це доречно, а не в кожному повідомленні.\n"
                 "- Пиши коротко, як учасник чату, без зайвих вступів."
             )
+            if self.config["agent_group_human"]:
+                lines.append(
+                    "Ти — звичайний учасник цієї групи, а не бот-помічник:\n"
+                    "- Пиши як людина в месенджері: зазвичай 1–2 короткі речення, "
+                    "розмовно, без списків, заголовків і markdown; без «Чим можу допомогти?».\n"
+                    "- Можеш жартувати, погоджуватися, сперечатися, ставити зустрічні "
+                    "питання, підхоплювати тему — як живий співрозмовник.\n"
+                    "- Не кожне повідомлення потребує відповіді. Якщо повідомлення "
+                    "позначене як НЕ обов'язково до тебе, а тобі нема що природно додати "
+                    "(люди говорять між собою, тема тебе не стосується, «ок»/«лол», "
+                    f"привітання не тобі) — відповідай рівно {HUMAN_SKIP_TOKEN} і нічого більше.\n"
+                    "- Не вклинюйся в чужі приватні суперечки і не відповідай за інших."
+                )
         else:
             lines.append("Це приватний чат з однією людиною.")
         if sender_id is not None:
@@ -1976,14 +2132,22 @@ class MistralModule(loader.Module):
 
         # ── Чи звертаються до нас ─────────────────────────────────────────
         is_reply_to_us, reply_name, reply_text = await self._reply_info(message)
+        human = is_group and bool(self.config["agent_group_human"])
         if is_group:
+            # У живому режимі «обов'язкові» відповіді — лише @згадка / реплай,
+            # усе інше агент вирішує сам (режим all тут не має сенсу).
+            mode = self.config["agent_group_mode"]
+            if human and mode == "all":
+                mode = "addressed"
             addressed = bool(raw) and _group_mode_matches(
-                self.config["agent_group_mode"],
+                mode,
                 raw,
                 username=self._bot_name,
                 is_reply_to_us=is_reply_to_us,
                 mentioned=self._mentions_me(message),
             )
+            if human and not addressed and raw and _name_mentioned(raw, self._human_names()):
+                addressed = True  # «Владе, а ти що думаєш?» — звертаються саме до нас
         else:
             addressed = bool(raw)
 
@@ -2016,12 +2180,25 @@ class MistralModule(loader.Module):
             self._log_decision(chat_id, sender_name, text, "🚫 у agent_ignored_users")
             return
 
+        spontaneous = False
         if not addressed:
-            # Повідомлення не до нас — лише запам'ятовуємо як фон розмови.
-            if remember:
-                history.append(entry)
-            self._log_decision(chat_id, sender_name, text, "· фон (не до мене)")
-            return
+            note = ""
+            if human:
+                spontaneous, note = await self._human_decide(message, key, sender_id, raw)
+                if spontaneous and self._chat_lock(key).locked():
+                    # Вже пишемо комусь відповідь — людина не відповідає на все підряд.
+                    spontaneous, note = False, note + "; зайнятий іншою відповіддю"
+            if not spontaneous:
+                # Повідомлення не до нас — лише запам'ятовуємо як фон розмови.
+                if remember:
+                    history.append(entry)
+                self._log_decision(
+                    chat_id, sender_name, text,
+                    "· фон (не до мене)" + (f" — {note}" if note else ""),
+                )
+                return
+            entry["spontaneous"] = True
+            self._log_decision(chat_id, sender_name, text, f"🎲 думаю, чи включитися — {note}")
 
         # ── Ліміти авто-відповідей ───────────────────────────────────────
         # Для груп ліміт рахується на чат; для OP/особистих — на користувача.
@@ -2042,8 +2219,62 @@ class MistralModule(loader.Module):
             await self._answer_entry(
                 message, entry, history,
                 chat_id=chat_id, is_group=is_group, group_title=group_title,
-                limit_scope=limit_scope,
+                limit_scope=limit_scope, key=key, human=human,
             )
+
+    # ── Живий режим ───────────────────────────────────────────────────────────
+
+    def _human_names(self) -> list:
+        names = [
+            n.strip() for n in str(self.config["agent_human_names"] or "").split(",")
+            if n.strip()
+        ]
+        if not names and self._me is not None:
+            names = [getattr(self._me, "first_name", None) or ""]
+        return names
+
+    async def _human_decide(self, message, key, sender_id, raw: str) -> tuple[bool, str]:
+        """Чи варто спонтанно включитися в розмову (живий режим у групах)."""
+        try:
+            sender = await message.get_sender()
+            if getattr(sender, "bot", False):
+                return False, "пише бот"
+        except Exception:
+            pass
+        if getattr(message, "fwd_from", None):
+            return False, "переслане"
+        state = self._human_state.get(key, {})
+        keywords = [k for k in str(self.config["agent_human_keywords"] or "").split(",") if k.strip()]
+        chance, reason = _human_reply_chance(
+            raw,
+            base=int(self.config["agent_human_chance"]),
+            now=time.time(),
+            last_spontaneous=state.get("spont", 0.0),
+            last_reply=state.get("reply", 0.0),
+            last_partner=state.get("partner"),
+            sender_id=sender_id,
+            cooldown=int(self.config["agent_human_cooldown"]),
+            dialog_window=int(self.config["agent_human_dialog_window"]),
+            name_mentioned=_name_mentioned(raw, self._human_names()),
+            keyword=_keywords_hit(raw, keywords),
+            is_media=not raw,
+        )
+        ok = chance > 0 and random.randint(1, 100) <= chance
+        return ok, f"{reason}, шанс {chance}%"
+
+    def _human_mark_replied(self, key, sender_id, spontaneous: bool):
+        state = self._human_state.setdefault(key, {})
+        now = time.time()
+        state["reply"] = now
+        state["partner"] = sender_id
+        if spontaneous:
+            state["spont"] = now
+
+    @staticmethod
+    def _human_typing_delay(reply_text: str) -> float:
+        """Скільки «друкувала б» людина: ~18 символів/с, 1.5–10 с, з розкидом."""
+        base = min(1.5 + len(reply_text or "") / 18, 10.0)
+        return base * random.uniform(0.7, 1.3)
 
     async def _answer_entry(
         self,
@@ -2055,7 +2286,10 @@ class MistralModule(loader.Module):
         is_group: bool,
         group_title: str | None,
         limit_scope: str | None,
+        key=None,
+        human: bool = False,
     ):
+        spontaneous = bool(entry.get("spontaneous"))
         sender_id   = entry["uid"]
         sender_name = entry["name"]
         text        = entry["text"]
@@ -2110,6 +2344,7 @@ class MistralModule(loader.Module):
         )
 
         # ── Виклик моделі ─────────────────────────────────────────────────
+        started = time.monotonic()
         try:
             if self.config["agent_typing"]:
                 async with message.client.action(chat_id, "typing"):
@@ -2120,6 +2355,8 @@ class MistralModule(loader.Module):
             self._stats.inc(ok=False)
             logger.error("MistralAI watcher error: %s", e)
             self._log_decision(chat_id, sender_name, text, f"❌ API: {_snippet(str(e), 100)}")
+            if spontaneous:
+                return  # нас не питали — помилку в чат не пишемо
             try:
                 await message.client.send_message(
                     chat_id,
@@ -2132,6 +2369,16 @@ class MistralModule(loader.Module):
             return
 
         reply_text = _strip_speaker_prefix(reply_text or "")
+        if human and not images and _is_skip_reply(reply_text):
+            # Модель вирішила промовчати — як людина, що прочитала й не відповіла.
+            self._stats.inc()
+            self._log_decision(chat_id, sender_name, text, "🤐 вирішив промовчати")
+            return
+        if spontaneous and not reply_text and not images:
+            self._log_decision(chat_id, sender_name, text, "🤐 порожня відповідь — мовчу")
+            return
+        if human:
+            reply_text = reply_text.replace(HUMAN_SKIP_TOKEN, "").strip()
         if not reply_text and not images:
             logger.warning("MistralAI watcher got an empty response")
             reply_text = "⚠️ Mistral API повернув порожню відповідь. Спробуй повторити запит."
@@ -2180,18 +2427,47 @@ class MistralModule(loader.Module):
                     chat_id, _telegram_image_file(img), reply_to=message.id,
                 )
 
+        if human and not empty and self.config["agent_human_delay"]:
+            delay = self._human_typing_delay(reply_text) - (time.monotonic() - started)
+            if delay > 0:
+                try:
+                    async with message.client.action(chat_id, "typing"):
+                        await asyncio.sleep(delay)
+                except Exception:
+                    await asyncio.sleep(delay)
+
+        reply_to = message.id
+        if spontaneous:
+            # Якщо після повідомлення ніхто нічого не писав — людина відповідає
+            # просто в чат, без цитування.
+            later = False
+            for e in reversed(history):
+                if e is entry:
+                    break
+                if e.get("role") == ROLE_USER:
+                    later = True
+                    break
+            if not later:
+                reply_to = None
+
         if reply_text:
-            await self._send_reply(message, chat_id, reply_text)
+            await self._send_reply(message, chat_id, reply_text, reply_to=reply_to)
+        if human and not empty and key is not None:
+            self._human_mark_replied(key, sender_id, spontaneous)
         self._log_decision(
             chat_id, sender_name, text,
-            "⚠️ порожня відповідь API" if empty else "✅ відповів",
+            "⚠️ порожня відповідь API" if empty
+            else ("💬 включився в розмову" if spontaneous else "✅ відповів"),
         )
 
-    async def _send_reply(self, message, chat_id: int, reply_text: str):
+    async def _send_reply(self, message, chat_id: int, reply_text: str,
+                          reply_to: int | None | bool = True):
         """Надіслати відповідь; при помилці HTML/реплаю — запасні варіанти."""
+        if reply_to is True:
+            reply_to = message.id
         attempts = (
-            dict(message=_md_to_html(reply_text), parse_mode="html", reply_to=message.id),
-            dict(message=reply_text[:4096], parse_mode=None, reply_to=message.id),
+            dict(message=_md_to_html(reply_text), parse_mode="html", reply_to=reply_to),
+            dict(message=reply_text[:4096], parse_mode=None, reply_to=reply_to),
             dict(message=reply_text[:4096], parse_mode=None),
         )
         last_error = None
@@ -2597,12 +2873,32 @@ class MistralModule(loader.Module):
             ),
         )
 
+    @loader.command(ru_doc="[on|off] — Живий режим авто-агента в групах")
+    async def mistralhuman(self, message):
+        """[on|off] — Групи: поводитись як жива людина (сам вирішує, коли відповідати)"""
+        arg = utils.get_args_raw(message).strip().lower()
+        if arg in ("on", "1", "true", "так", "вкл"):
+            self.config["agent_group_human"] = True
+        elif arg in ("off", "0", "false", "ні", "викл"):
+            self.config["agent_group_human"] = False
+        elif arg:
+            return await utils.answer(message, self.strings["human_invalid"])
+        await utils.answer(
+            message,
+            self.strings["human_on" if self.config["agent_group_human"] else "human_off"].format(
+                chance=self.config["agent_human_chance"],
+                cooldown=self.config["agent_human_cooldown"],
+            ),
+        )
+
     @loader.command(ru_doc="— Очистити пам'ять авто-агента у поточному чаті")
     async def mistralclear(self, message):
         """— Очистити пам'ять авто-агента"""
         chat_id = message.chat_id
         for key in self._chat_memories(chat_id):
             del self._memory[key]
+        for key in [k for k in self._human_state if k[0] == chat_id]:
+            del self._human_state[key]
         if hasattr(self, "_vec_mem"):
             for key in list(self._vec_mem.keys()):
                 if (isinstance(key, tuple) and key[0] == chat_id) or key == chat_id:
@@ -2628,6 +2924,16 @@ class MistralModule(loader.Module):
             f"мій username: <code>@{_html_escape(self._bot_name or '—')}</code>",
             f"Агент: <code>{_html_escape(self._agent_id() or 'модель ' + str(self.config['agent_model']))}</code>",
         ]
+        if is_group:
+            if self.config["agent_group_human"]:
+                lines.append(
+                    f"Живий режим: ✅ (шанс {self.config['agent_human_chance']}%, "
+                    f"кулдаун {self.config['agent_human_cooldown']}с, "
+                    f"діалог {self.config['agent_human_dialog_window']}с, "
+                    f"імена: {_html_escape(', '.join(self._human_names()) or '—')})"
+                )
+            else:
+                lines.append("Живий режим: ❌ (.mistralhuman on)")
         scope = self._limit_scope(chat_id, 0, is_group, title) if is_group else None
         if is_group:
             if scope:
@@ -2945,6 +3251,7 @@ class MistralModule(loader.Module):
             "<code>.mistralauto</code> — Увімк/вимк у чаті\n"
             "<code>.mistralautolist</code> — Активні чати\n"
             "<code>.mistralmode [all|addressed|mention]</code> — Режим відповідей у групах\n"
+            "<code>.mistralhuman [on|off]</code> — Живий режим у групах (сам вирішує, коли говорити)\n"
             "<code>.mistralclear</code> — Очистити пам'ять (усього чату, включно з гілками)\n"
             "<code>.mistralthoughts</code> — Думка агента + коротка історія\n"
             "<code>.mistraldebug</code> — Чому агент відповів / промовчав\n"
