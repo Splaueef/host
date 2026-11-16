@@ -1,7 +1,7 @@
 # meta developer: @Huai_Baike
-# meta syntax: .wwhelp | .я | .ти | .чат | .топ | .зв | .профіль | .нік | .переказ | .пет | .друзі | .графік
+# meta syntax: .wwhelp | .я (або просто «йа») | .ти | .чат | .топ | .зв | .профіль | .нік | .переказ | .пет | .друзі | .графік
 
-__version__ = (9, 0, 0)
+__version__ = (9, 1, 0)
 
 import asyncio
 import html
@@ -56,6 +56,14 @@ def _f(v, d=0.0) -> float:
 
 def _vip(level: int) -> str:
     return ["", "⭐", "🌟", "💎", "👑"][max(0, min(_n(level), 4))]
+
+_YA_ALIAS_RE = re.compile(r"^\s*йа\s*[!.?)]*\s*$", re.IGNORECASE)
+
+
+def _is_ya_alias(text) -> bool:
+    """«йа» / «Йа» / «ЙА!» без команди — те саме, що .я."""
+    return bool(_YA_ALIAS_RE.match(str(text or "")))
+
 
 def _sep() -> str: return "—" * 16
 
@@ -556,7 +564,7 @@ class WerwolfStatsMod(loader.Module):
         "help":    (
             "<b>🐺 Werwolf API · команди</b>\n\n"
             "<b>Статистика</b>\n"
-            "<code>.я</code> · <code>.ти</code> · <code>.чат</code> · "
+            "<code>.я</code> (або просто <code>йа</code>) · <code>.ти</code> · <code>.чат</code> · "
             "<code>.топ</code> · <code>.зв</code> · <code>.графік</code>\n\n"
             "<b>Акаунт</b>\n"
             "<code>.профіль</code> · <code>.пет</code> · <code>.друзі</code> · "
@@ -581,6 +589,11 @@ class WerwolfStatsMod(loader.Module):
                 "api_key", "",
                 "Особистий API-ключ (/api у боті → .wwkey YOUR_KEY)",
                 validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "ya_alias", True,
+                "Писати просто «йа» / «Йа» замість .я — показує твою статистику",
+                validator=loader.validators.Boolean(),
             ),
         )
         self._session = None
@@ -851,6 +864,19 @@ class WerwolfStatsMod(loader.Module):
         if not await self._guard(message): return
         tg_name = getattr(self._me, "first_name", None) or getattr(self._me, "username", None)
         await self._show_user(message, self._me.id, tg_name)
+
+    @loader.watcher(only_messages=True, out=True)
+    async def ya_watcher(self, message):
+        """«йа» без префікса працює як .я (лише власні повідомлення)."""
+        if not self.config["ya_alias"]:
+            return
+        if not getattr(message, "out", False):
+            return
+        if getattr(message, "fwd_from", None) or getattr(message, "via_bot_id", None):
+            return
+        if not _is_ya_alias(getattr(message, "raw_text", "")):
+            return
+        await self.я(message)
 
     @loader.command()
     async def ти(self, message):

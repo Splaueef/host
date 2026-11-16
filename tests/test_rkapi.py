@@ -34,11 +34,13 @@ def _load_module():
     loader.Module = object
     loader.tds = lambda value: value
     loader.command = lambda *args, **kwargs: (lambda value: value)
+    loader.watcher = lambda *args, **kwargs: (lambda value: value)
     loader.ModuleConfig = lambda *args: dict()
     loader.ConfigValue = lambda *args, **kwargs: None
     loader.validators = types.SimpleNamespace(
         String=lambda: None,
         Integer=lambda **kwargs: None,
+        Boolean=lambda: None,
     )
     package.loader = loader
     package.utils = utils
@@ -58,6 +60,42 @@ def _load_module():
 
 
 rkapi = _load_module()
+
+
+class YaAliasTests(unittest.IsolatedAsyncioTestCase):
+    def test_alias_matches_only_bare_ya(self):
+        for text in ("йа", "Йа", "ЙА", " йа ", "йа!", "Йа)"):
+            self.assertTrue(rkapi._is_ya_alias(text), text)
+        for text in ("я", ".я", "йа тут", "майа", "ya", "", None):
+            self.assertFalse(rkapi._is_ya_alias(text), text)
+
+    def _mod(self, **cfg):
+        mod = rkapi.WerwolfStatsMod.__new__(rkapi.WerwolfStatsMod)
+        mod.config = {"ya_alias": True, **cfg}
+        mod.calls = []
+
+        async def fake_ya(message):
+            mod.calls.append(message)
+
+        mod.я = fake_ya
+        return mod
+
+    async def test_watcher_runs_ya_for_own_message(self):
+        mod = self._mod()
+        msg = types.SimpleNamespace(out=True, raw_text="Йа", fwd_from=None, via_bot_id=None)
+        await mod.ya_watcher(msg)
+        self.assertEqual(mod.calls, [msg])
+
+    async def test_watcher_ignores_others_forwards_and_disabled(self):
+        incoming = types.SimpleNamespace(out=False, raw_text="йа", fwd_from=None, via_bot_id=None)
+        forwarded = types.SimpleNamespace(out=True, raw_text="йа", fwd_from=object(), via_bot_id=None)
+        for mod, msg in (
+            (self._mod(), incoming),
+            (self._mod(), forwarded),
+            (self._mod(ya_alias=False), types.SimpleNamespace(out=True, raw_text="йа")),
+        ):
+            await mod.ya_watcher(msg)
+            self.assertEqual(mod.calls, [])
 
 
 class HelperTests(unittest.IsolatedAsyncioTestCase):
