@@ -1,4 +1,4 @@
-__version__ = (7, 3, 0)
+__version__ = (7, 3, 1)
 VERSION = ".".join(map(str, __version__))
 
 import os
@@ -417,6 +417,51 @@ def _music_search_queries(query: str) -> list[str]:
 def _ig_shortcode(url: str) -> str | None:
     m = re.search(r"instagram\.com/(?:p|reel|tv|reels)/([A-Za-z0-9_-]+)", url)
     return m.group(1) if m else None
+
+
+def _load_ig_cookies(il, cookies_path: str) -> bool:
+    """Put Instagram cookies from a Netscape cookies.txt into an Instaloader session."""
+    import http.cookiejar
+
+    jar = http.cookiejar.MozillaCookieJar()
+    try:
+        jar.load(cookies_path, ignore_discard=True, ignore_expires=True)
+    except Exception as e:
+        logger.warning("Could not load Instagram cookies for instaloader: %s", e)
+        return False
+    session = il.context._session
+    found = {}
+    for cookie in jar:
+        if cookie.domain.lstrip(".").endswith("instagram.com"):
+            session.cookies.set(cookie.name, cookie.value, domain=cookie.domain, path=cookie.path)
+            found[cookie.name] = cookie.value
+    if "sessionid" not in found:
+        return False
+    if found.get("csrftoken"):
+        session.headers.update({"X-CSRFToken": found["csrftoken"]})
+    il.context.username = found.get("ds_user_id") or "cookies"
+    return True
+
+
+def _ig_embed_media_url(html_text: str) -> tuple[str | None, str]:
+    """Extract the best media URL from an Instagram /embed/ page."""
+    def _unescape(value: str) -> str:
+        # The embed JSON is escaped once or twice depending on the page build.
+        value = re.sub(r"\\+/", "/", value)
+        value = re.sub(r"\\+u0026", "&", value)
+        return value.replace("\\", "")
+
+    text = re.sub(r'\\+"', '"', html_text)
+    m = re.search(r'"video_url"\s*:\s*"([^"]+)"', text)
+    if m:
+        return _unescape(m.group(1)), ".mp4"
+    m = re.search(r'<video[^>]+src="([^"]+)"', html_text)
+    if m:
+        return m.group(1).replace("&amp;", "&"), ".mp4"
+    m = re.search(r'class="EmbeddedMediaImage"[^>]*src="([^"]+)"', html_text)
+    if m:
+        return m.group(1).replace("&amp;", "&"), ".jpg"
+    return None, ""
 
 
 def _cookie_file_has_domain(path: str, domains: tuple[str, ...]) -> bool:
@@ -1481,10 +1526,12 @@ class VideoDownloaderMod(loader.Module):
             if _is_youtube_url(url):
                 return _normalize_youtube_url(url)
             if _url_is(url, "instagram.com", "instagr.am"):
-                clean_path = parts.path.rstrip("/")
+                # Share links carry tracking params (igsh, gwpx, utm_*); they
+                # are never needed and can confuse extractors.
+                clean_path = re.sub(r"^/reels/", "/reel/", parts.path.rstrip("/"))
                 params = dict(parse_qsl(parts.query))
-                clean_params = {k: v for k, v in params.items() if not k.startswith("utm_")}
-                qs = urlencode(clean_params) if clean_params else ""
+                keep = {k: v for k, v in params.items() if k == "img_index"}
+                qs = urlencode(keep) if keep else ""
                 return urlunsplit((parts.scheme, parts.netloc, clean_path, qs, ""))
             if _url_is(url, "x.com", "twitter.com"):
                 return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
@@ -1807,14 +1854,24 @@ class VideoDownloaderMod(loader.Module):
             return None
 
         out_dir = base_name + "_ig"
+        cookies = self._download_cookies(url)
 
         def _fetch():
             try:
                 import instaloader
             except ImportError:
                 return None
+            class _NoWaitRateController(instaloader.RateController):
+                # Instagram answers anonymous GraphQL with 401 "Please wait a
+                # few minutes"; instaloader would sleep for minutes. Fail fast
+                # and let the next method run instead.
+                def sleep(self, secs):
+                    return None
+
             try:
                 il = instaloader.Instaloader(
+                    max_connection_attempts=1,
+                    rate_controller=lambda ctx: _NoWaitRateController(ctx),
                     download_videos=True,
                     download_video_thumbnails=False,
                     download_geotags=False,
@@ -1828,7 +1885,9 @@ class VideoDownloaderMod(loader.Module):
                 )
                 user = self.config["ig_username"]
                 pwd  = self.config["ig_password"]
-                if user and pwd:
+                if cookies and _load_ig_cookies(il, cookies):
+                    pass
+                elif user and pwd:
                     try:
                         il.login(user, pwd)
                     except Exception as e:
@@ -1884,6 +1943,51 @@ class VideoDownloaderMod(loader.Module):
             finally:
                 # FIX: завжди чистимо тимчасову директорію
                 shutil.rmtree(out_dir, ignore_errors=True)
+
+        return await utils.run_sync(_fetch)
+
+    async def _dl_instagram_embed(self, url: str, base_name: str) -> list | None:
+        """Public embed page: works without login while GraphQL is rate-limited."""
+        shortcode = _ig_shortcode(url)
+        if not shortcode:
+            return None
+
+        def _fetch():
+            try:
+                import requests
+
+                headers = {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.8",
+                }
+                page = _safe_requests_get(
+                    requests,
+                    f"https://www.instagram.com/p/{shortcode}/embed/captioned/",
+                    timeout=20, headers=headers,
+                )
+                if page.status_code != 200:
+                    logger.info("Instagram embed returned HTTP %s", page.status_code)
+                    return None
+                media_url, ext = _ig_embed_media_url(page.text)
+                if not media_url:
+                    return None
+                max_bytes = int(self.config.get("max_size", 0) or 0) * 1024 * 1024
+                resp = _safe_requests_get(
+                    requests, media_url, timeout=120, stream=True, headers=headers,
+                )
+                try:
+                    if resp.status_code != 200 or _response_too_large(resp, max_bytes):
+                        return None
+                    path = f"{base_name}_igembed{ext}"
+                    return [path] if _write_response_limited(resp, path, max_bytes) else None
+                finally:
+                    resp.close()
+            except Exception as e:
+                logger.warning("Instagram embed fallback failed for %s: %s", shortcode, e)
+                return None
 
         return await utils.run_sync(_fetch)
 
@@ -3112,15 +3216,22 @@ class VideoDownloaderMod(loader.Module):
                 return result
 
         if _url_is(url, "instagram.com", "instagr.am", "threads.net"):
-            result = await self._dl_instagram_instaloader(url, base_name, audio)
-            if result:
-                return result
+            # yt-dlp first: it uses cookies.txt and the mobile API, so it is
+            # the least affected by anonymous GraphQL rate limits.
             result = await self._dl_instagram_ytdlp(url, base_name, audio)
             if result:
                 return result
+            result = await self._dl_instagram_instaloader(url, base_name, audio)
+            if result:
+                return result
             if not audio:
-                return await self._dl_gallery_dl(url, base_name)
-            return None
+                result = await self._dl_instagram_embed(url, base_name)
+                if result:
+                    return result
+                result = await self._dl_gallery_dl(url, base_name)
+                if result:
+                    return result
+            return await self._dl_cobalt(url, base_name, audio)
 
         if _url_is(url, "x.com", "twitter.com") and not audio:
             photo_result = await self._dl_twitter_photos(url, base_name)
