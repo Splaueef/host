@@ -681,6 +681,29 @@ class InstagramSessionTests(unittest.TestCase):
             self.assertEqual(vdlt._ig_session_status(shared), "ok")
 
 
+class YtDlpCliTests(unittest.TestCase):
+    def test_cli_command_ends_with_the_url(self):
+        module = _module()
+        module._youtube_cookie_candidates = lambda url: [(None, False, "")]
+        module._js_runtime = None
+        module._cookie_manager = lambda: types.SimpleNamespace(
+            browser_user=vdlt.getpass.getuser(), firefox_profile="/nonexistent"
+        )
+        seen = []
+
+        def fake_run(cmd, **kwargs):
+            seen.append(cmd)
+            return types.SimpleNamespace(returncode=1, stdout="")
+
+        url = "https://www.instagram.com/reel/abc"
+        with unittest.mock.patch.object(vdlt.subprocess, "run", fake_run):
+            module._run_ytdlp_cli_sync(url, "b", False)
+            module._run_ytdlp_cli_sync(url, "b", False, True)
+        self.assertEqual(len(seen), 2)
+        for cmd in seen:
+            self.assertEqual(cmd[-2:], ["--", url])
+
+
 class MediaInfoTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         _install_utils()

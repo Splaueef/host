@@ -1,4 +1,4 @@
-__version__ = (7, 3, 3)
+__version__ = (7, 3, 4)
 VERSION = ".".join(map(str, __version__))
 
 import os
@@ -2096,8 +2096,26 @@ class VideoDownloaderMod(loader.Module):
                 ]
             )
             postprocessors = self._audio_postprocessor() if audio else []
+            errors: list[str] = []
+
+            class _ErrorLog:
+                # quiet=True hides yt-dlp's own output, and with ignoreerrors
+                # report_error() never raises — collect the messages instead.
+                def debug(self, msg):
+                    pass
+
+                info = debug
+
+                def warning(self, msg):
+                    pass
+
+                def error(self, msg):
+                    errors.append(str(msg))
+
             for fmt in fmt_chain:
+                errors.clear()
                 opts = {
+                    "logger": _ErrorLog(),
                     "format": fmt,
                     "merge_output_format": "mp4" if not audio else None,
                     "outtmpl": f"{base_name}_ytdlp_%(autonumber)s.%(ext)s",
@@ -2125,6 +2143,9 @@ class VideoDownloaderMod(loader.Module):
                     ])
                     if found_files:
                         return found_files
+                    if errors:
+                        raise RuntimeError(errors[-1])
+                    logger.warning("Instagram yt-dlp fmt '%s' produced no file", fmt)
                 except Exception as e:
                     logger.warning("Instagram yt-dlp fmt '%s' failed: %s", fmt, e)
                     for p in glob.glob(f"{base_name}_ytdlp_*"):
@@ -2857,6 +2878,8 @@ class VideoDownloaderMod(loader.Module):
             max_size = int(self.config.get("max_size", 0) or 0)
             if max_size > 0:
                 dl_cmd += ["--max-filesize", f"{max_size}M"]
+            # "--" keeps a URL that starts with "-" from being read as an option.
+            dl_cmd += ["--", url]
             try:
                 proc = subprocess.run(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=int(self.config.get("task_timeout", _TASK_TIMEOUT)), env=_subprocess_env_for_cookie_owner())
             except subprocess.TimeoutExpired:
