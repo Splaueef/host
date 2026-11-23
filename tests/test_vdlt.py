@@ -625,6 +625,62 @@ class InstagramChainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, ["c.mp4"])
 
 
+class InstagramAuthTests(unittest.IsolatedAsyncioTestCase):
+    def test_refusals_are_classified_as_auth(self):
+        for message in (
+            'JSON Query to graphql/query: Expecting value: line 1 column 1 (char 0)',
+            '401 Unauthorized - "Please wait a few minutes before you try again."',
+            '[instagram][error] HTTP redirect to home page (https://www.instagram.com/)',
+        ):
+            self.assertTrue(vdlt._is_instagram_auth_error(message), message)
+        self.assertFalse(vdlt._is_instagram_auth_error("ffmpeg not found"))
+
+    async def test_refused_instagram_reports_auth_required(self):
+        module = _module()
+
+        async def refused(*args):
+            args[-1].append("x")
+            return None
+
+        module._dl_instagram_ytdlp = refused
+        module._dl_instagram_instaloader = refused
+        module._dl_instagram_embed = refused
+        module._dl_gallery_dl = refused
+        module._dl_cobalt = unittest.mock.AsyncMock(return_value=None)
+        result = await module._download(
+            "https://www.instagram.com/reel/abc", "b", None, False
+        )
+        self.assertEqual(result, "AUTH_REQUIRED")
+        self.assertIn("cookies", vdlt.VideoDownloaderMod.strings["err_instagram_auth"])
+
+
+class InstagramSessionTests(unittest.TestCase):
+    def _write(self, folder, *lines):
+        path = os.path.join(folder, "cookies.txt")
+        with open(path, "w") as f:
+            f.write("# Netscape HTTP Cookie File\n" + "\n".join(lines) + "\n")
+        return path
+
+    def test_session_cookie_is_detected(self):
+        future = str(int(time.time()) + 86400)
+        with tempfile.TemporaryDirectory() as folder:
+            ok = self._write(folder, f"#HttpOnly_.instagram.com\tTRUE\t/\tTRUE\t{future}\tsessionid\t1%3Aabc")
+            self.assertEqual(vdlt._ig_session_status(ok), "ok")
+            missing = self._write(folder, f".instagram.com\tTRUE\t/\tTRUE\t{future}\tcsrftoken\tx")
+            self.assertEqual(vdlt._ig_session_status(missing), "missing")
+            old = self._write(folder, ".instagram.com\tTRUE\t/\tTRUE\t1000\tsessionid\tx")
+            self.assertEqual(vdlt._ig_session_status(old), "expired")
+
+    def test_private_copy_protects_shared_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            shared = self._write(folder, ".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tx")
+            copy = vdlt._private_cookie_copy(shared, os.path.join(folder, "task"))
+            self.assertNotEqual(copy, shared)
+            with open(copy, "w") as f:
+                f.write("")
+            self.assertEqual(vdlt._ig_session_status(shared), "ok")
+
+
 class MediaInfoTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         _install_utils()

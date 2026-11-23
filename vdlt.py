@@ -1,4 +1,4 @@
-__version__ = (7, 3, 1)
+__version__ = (7, 3, 3)
 VERSION = ".".join(map(str, __version__))
 
 import os
@@ -443,6 +443,20 @@ def _load_ig_cookies(il, cookies_path: str) -> bool:
     return True
 
 
+_IG_AUTH_MARKERS = (
+    "please wait a few minutes", "401", "login required", "log in",
+    "redirect to home page", "rate-limit", "rate limit", "expecting value",
+    "requested content is not available", "empty media response",
+    "checkpoint", "not logged in", "cookies",
+)
+
+
+def _is_instagram_auth_error(error) -> bool:
+    """Instagram serves HTML/401/redirects instead of media to anonymous or flagged clients."""
+    text = str(error or "").lower()
+    return any(marker in text for marker in _IG_AUTH_MARKERS)
+
+
 def _ig_embed_media_url(html_text: str) -> tuple[str | None, str]:
     """Extract the best media URL from an Instagram /embed/ page."""
     def _unescape(value: str) -> str:
@@ -478,6 +492,50 @@ def _cookie_file_has_domain(path: str, domains: tuple[str, ...]) -> bool:
     except Exception as e:
         logger.warning("Could not read cookies file %s: %s", path, e)
     return False
+
+
+def _ig_session_status(path: str) -> str:
+    """'ok', 'expired' or 'missing' for the Instagram login cookie (sessionid)."""
+    expired = False
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#HttpOnly_"):
+                    line = line[len("#HttpOnly_"):]
+                elif not line or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) < 7 or "instagram.com" not in fields[0].lower():
+                    continue
+                if fields[5] != "sessionid" or not fields[6].strip('"'):
+                    continue
+                try:
+                    expires = int(float(fields[4] or 0))
+                except ValueError:
+                    expires = 0
+                if expires and expires < time.time():
+                    expired = True
+                    continue
+                return "ok"
+    except OSError:
+        pass
+    return "expired" if expired else "missing"
+
+
+def _private_cookie_copy(path: str | None, folder: str) -> str | None:
+    """Copy cookies for one task: yt-dlp and gallery-dl write the jar back,
+    and an Instagram logout response would otherwise wipe the shared session."""
+    if not path:
+        return None
+    try:
+        os.makedirs(folder, exist_ok=True)
+        copy = os.path.join(folder, f"cookies_{os.urandom(4).hex()}.txt")
+        shutil.copyfile(path, copy)
+        return copy
+    except OSError as e:
+        logger.warning("Could not copy cookies %s: %s", path, e)
+        return path
 
 
 def _cookie_domains_status(path: str | None = None) -> dict[str, bool]:
@@ -938,6 +996,7 @@ class VideoDownloaderMod(loader.Module):
         "music_choose":       "<b>🎤 Знайдені треки виконавця {artist}:</b>\nОберіть потрібний трек:",
         "music_choose_match": "<b>🎵 Знайдено кілька треків:</b>\nОберіть потрібний:",
         "err_file":           "<b>❌ Не вдалося отримати файл.</b>",
+        "err_instagram_auth": "<b>❌ Instagram не віддає цей допис без входу (сервер обмежено як анонімного клієнта). Додай cookies залогіненого Instagram у <code>cookies.txt</code> (перевірка: <code>.vdlcookies</code>) або увійди в Instagram у Firefox-профілі модуля. Як запасний варіант можна задати <code>cobalt_api_url</code>.</b>",
         "err_youtube_auth":   "<b>❌ YouTube просить підтвердити, що це не бот. Якщо відео приватне/18+, онови cookies: <code>.vdlcookies</code>. Для публічних відео модуль спершу пробує режим без cookies, щоб YouTube рідше ротував сесію.</b>",
         "err_youtube_auth_vc": "<b>❌ YouTube просить підтвердити, що це не бот, навіть після оновлення сесії у віртуальному браузері VoiceChat. Перевір вхід в акаунт: <code>.vcbrowser</code>.</b>",
         "err_size":           "<b>❌ Файл завеликий ({} МБ). Знижую якість...</b>",
@@ -1123,6 +1182,22 @@ class VideoDownloaderMod(loader.Module):
     def _cookies_for(self, url: str) -> str | None:
         """This module's own cookies file (VoiceChat reads it as well)."""
         return self._cookie_manager().file_for(url)
+
+    def _instagram_cookies(self, url: str, base_name: str) -> str | None:
+        """A per-task copy of cookies.txt for Instagram, if it holds a live session."""
+        cookies = self._download_cookies(url)
+        if not cookies:
+            logger.warning("Instagram: cookies.txt has no instagram.com cookies")
+            return None
+        status = _ig_session_status(cookies)
+        if status != "ok":
+            logger.warning(
+                "Instagram: sessionid in cookies.txt is %s — log in and export cookies again",
+                status,
+            )
+        return _private_cookie_copy(
+            cookies, os.path.join(os.path.dirname(base_name) or ".", "ig_cookies")
+        )
 
     def _download_cookies(self, url: str) -> str | None:
         """Cookies for a download: VoiceChat's YouTube session comes first."""
@@ -1848,13 +1923,15 @@ class VideoDownloaderMod(loader.Module):
 
     # ── Instagram ─────────────────────────────────────────────────────────────
 
-    async def _dl_instagram_instaloader(self, url: str, base_name: str, audio: bool) -> list | None:
+    async def _dl_instagram_instaloader(
+        self, url: str, base_name: str, audio: bool, notes: list | None = None
+    ) -> list | None:
         shortcode = _ig_shortcode(url)
         if not shortcode:
             return None
 
         out_dir = base_name + "_ig"
-        cookies = self._download_cookies(url)
+        cookies = self._instagram_cookies(url, base_name)
 
         def _fetch():
             try:
@@ -1885,7 +1962,8 @@ class VideoDownloaderMod(loader.Module):
                 )
                 user = self.config["ig_username"]
                 pwd  = self.config["ig_password"]
-                if cookies and _load_ig_cookies(il, cookies):
+                with_session = bool(cookies and _load_ig_cookies(il, cookies))
+                if with_session:
                     pass
                 elif user and pwd:
                     try:
@@ -1939,6 +2017,8 @@ class VideoDownloaderMod(loader.Module):
                 return results
             except Exception as e:
                 logger.warning("instaloader failed for %s: %s", shortcode, e)
+                if notes is not None and _is_instagram_auth_error(e):
+                    notes.append("instaloader")
                 return None
             finally:
                 # FIX: завжди чистимо тимчасову директорію
@@ -1946,7 +2026,9 @@ class VideoDownloaderMod(loader.Module):
 
         return await utils.run_sync(_fetch)
 
-    async def _dl_instagram_embed(self, url: str, base_name: str) -> list | None:
+    async def _dl_instagram_embed(
+        self, url: str, base_name: str, notes: list | None = None
+    ) -> list | None:
         """Public embed page: works without login while GraphQL is rate-limited."""
         shortcode = _ig_shortcode(url)
         if not shortcode:
@@ -1969,10 +2051,15 @@ class VideoDownloaderMod(loader.Module):
                     timeout=20, headers=headers,
                 )
                 if page.status_code != 200:
-                    logger.info("Instagram embed returned HTTP %s", page.status_code)
+                    logger.warning("Instagram embed returned HTTP %s", page.status_code)
+                    if notes is not None:
+                        notes.append("embed")
                     return None
                 media_url, ext = _ig_embed_media_url(page.text)
                 if not media_url:
+                    logger.warning("Instagram embed page for %s has no media URL", shortcode)
+                    if notes is not None:
+                        notes.append("embed")
                     return None
                 max_bytes = int(self.config.get("max_size", 0) or 0) * 1024 * 1024
                 resp = _safe_requests_get(
@@ -1991,10 +2078,12 @@ class VideoDownloaderMod(loader.Module):
 
         return await utils.run_sync(_fetch)
 
-    async def _dl_instagram_ytdlp(self, url: str, base_name: str, audio: bool) -> list | None:
+    async def _dl_instagram_ytdlp(
+        self, url: str, base_name: str, audio: bool, notes: list | None = None
+    ) -> list | None:
         import yt_dlp
 
-        cookies = self._download_cookies(url)
+        cookies = self._instagram_cookies(url, base_name)
         is_vertical = _is_vertical_url(url)
 
         def _dl():
@@ -2014,7 +2103,9 @@ class VideoDownloaderMod(loader.Module):
                     "outtmpl": f"{base_name}_ytdlp_%(autonumber)s.%(ext)s",
                     "quiet": True, "no_warnings": True,
                     "noplaylist": False,
-                    "ignoreerrors": True,
+                    # Extraction errors must surface so they can be logged and
+                    # classified; only per-item download errors are skipped.
+                    "ignoreerrors": "only_download",
                     "postprocessors": postprocessors,
                 }
                 opts.update(self._fast_ytdlp_opts())
@@ -2041,6 +2132,11 @@ class VideoDownloaderMod(loader.Module):
                             os.remove(p)
                         except Exception:
                             pass
+                    if _is_instagram_auth_error(e):
+                        # Another format will not help when the page itself is refused.
+                        if notes is not None:
+                            notes.append("yt-dlp")
+                        return None
             return None
 
         return await utils.run_sync(_dl)
@@ -2939,10 +3035,16 @@ class VideoDownloaderMod(loader.Module):
             logger.warning("yt-dlp update failed: %s", e)
             return False, str(e)
 
-    async def _dl_gallery_dl(self, url: str, base_name: str) -> list | None:
+    async def _dl_gallery_dl(
+        self, url: str, base_name: str, notes: list | None = None
+    ) -> list | None:
         if not self.config.get("use_gallery_dl", True):
             return None
-        cookies = self._download_cookies(url)
+        cookies = (
+            self._instagram_cookies(url, base_name)
+            if _url_is(url, "instagram.com", "instagr.am", "threads.net")
+            else self._download_cookies(url)
+        )
 
         def _run():
             try:
@@ -2973,6 +3075,8 @@ class VideoDownloaderMod(loader.Module):
                 )
                 if proc.returncode != 0:
                     logger.warning("gallery-dl failed: %s", proc.stdout[-500:])
+                    if notes is not None and _is_instagram_auth_error(proc.stdout):
+                        notes.append("gallery-dl")
                     return None
             except Exception as e:
                 logger.warning("gallery-dl failed: %s", e)
@@ -3218,20 +3322,32 @@ class VideoDownloaderMod(loader.Module):
         if _url_is(url, "instagram.com", "instagr.am", "threads.net"):
             # yt-dlp first: it uses cookies.txt and the mobile API, so it is
             # the least affected by anonymous GraphQL rate limits.
-            result = await self._dl_instagram_ytdlp(url, base_name, audio)
+            notes: list[str] = []
+            result = await self._dl_instagram_ytdlp(url, base_name, audio, notes)
             if result:
                 return result
-            result = await self._dl_instagram_instaloader(url, base_name, audio)
+            result = await self._dl_instagram_instaloader(url, base_name, audio, notes)
             if result:
                 return result
             if not audio:
-                result = await self._dl_instagram_embed(url, base_name)
+                result = await self._dl_instagram_embed(url, base_name, notes)
                 if result:
                     return result
-                result = await self._dl_gallery_dl(url, base_name)
+                result = await self._dl_gallery_dl(url, base_name, notes)
                 if result:
                     return result
-            return await self._dl_cobalt(url, base_name, audio)
+            result = await self._dl_cobalt(url, base_name, audio)
+            if result:
+                return result
+            if notes:
+                # Instagram refused anonymous access: retry with the logged-in
+                # Firefox session and tell the user cookies are needed.
+                logger.warning(
+                    "Instagram requires login for %s (refused by: %s)",
+                    url, ", ".join(dict.fromkeys(notes)),
+                )
+                return "AUTH_REQUIRED"
+            return None
 
         if _url_is(url, "x.com", "twitter.com") and not audio:
             photo_result = await self._dl_twitter_photos(url, base_name)
@@ -4193,11 +4309,13 @@ class VideoDownloaderMod(loader.Module):
             else:
                 logger.warning("All methods failed for url=%s", url)
                 self._stats["err"] += 1
-                await status_msg.edit(
-                    self._youtube_auth_text()
-                    if auth_failed and _is_youtube_url(url)
-                    else self.strings("err_file")
-                )
+                if auth_failed and _is_youtube_url(url):
+                    text = self._youtube_auth_text()
+                elif auth_failed and _url_is(url, "instagram.com", "instagr.am", "threads.net"):
+                    text = self.strings("err_instagram_auth")
+                else:
+                    text = self.strings("err_file")
+                await status_msg.edit(text)
 
         except asyncio.TimeoutError:
             self._stats["err"] += 1
@@ -4656,9 +4774,20 @@ class VideoDownloaderMod(loader.Module):
             return "❌ відсутній"
         _merge_platform_cookies()
         statuses = _cookie_domains_status(self._cookie_manager().cookies_file)
-        domains = "\n".join(
-            f"   {'✅' if ok else '❌'} {name}" for name, ok in statuses.items()
-        )
+        ig_note = {
+            "ok": "сесія ✅",
+            "expired": "sessionid протермінований ❌ — увійди знову й переекспортуй",
+            "missing": "немає sessionid ❌ — експортовано без входу в акаунт",
+        }
+
+        def _line(name, ok):
+            line = f"   {'✅' if ok else '❌'} {name}"
+            if name == "Instagram" and ok:
+                status = _ig_session_status(self._cookie_manager().cookies_file)
+                line += f" ({ig_note[status]})"
+            return line
+
+        domains = "\n".join(_line(name, ok) for name, ok in statuses.items())
         await utils.answer(
             message,
             self.strings("cookies_status").format(
