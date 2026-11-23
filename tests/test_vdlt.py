@@ -328,6 +328,28 @@ class UrlRoutingTests(unittest.TestCase):
         self.assertTrue(vdlt._is_supported_url("https://www.instagram.com/reel/abc"))
         self.assertTrue(vdlt._is_youtube_url("https://youtu.be/xyz"))
 
+    def test_instagram_share_params_are_dropped(self):
+        module = _module()
+        self.assertEqual(
+            module._normalize("https://www.instagram.com/reel/DfVTJTgoVSS?gwpx=OGtt&igsh=abc"),
+            "https://www.instagram.com/reel/DfVTJTgoVSS",
+        )
+        self.assertEqual(
+            module._normalize("https://www.instagram.com/reels/abc/?utm_source=x"),
+            "https://www.instagram.com/reel/abc",
+        )
+
+    def test_instagram_embed_media_url_is_unescaped(self):
+        page = r'x \"video_url\":\"https:\\\/\\\/cdn.ig\\\/v.mp4?a=1\\u0026b=2\" y'
+        self.assertEqual(
+            vdlt._ig_embed_media_url(page), ("https://cdn.ig/v.mp4?a=1&b=2", ".mp4")
+        )
+        image = '<img class="EmbeddedMediaImage" src="https://cdn.ig/p.jpg?a=1&amp;b=2">'
+        self.assertEqual(
+            vdlt._ig_embed_media_url(image), ("https://cdn.ig/p.jpg?a=1&b=2", ".jpg")
+        )
+        self.assertEqual(vdlt._ig_embed_media_url("<html></html>"), (None, ""))
+
     def test_www_prefix_is_removed_as_a_label(self):
         self.assertEqual(vdlt._strip_www("www.youtube.com"), "youtube.com")
         # str.lstrip("www.") used to turn this into "eb.whatsapp.com".
@@ -566,6 +588,41 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
         rendered = status.edit.await_args.args[0]
         self.assertIn("A &amp; B", rendered)
         self.assertIn("1 &lt;b&gt;2&lt;/b&gt;", rendered)
+
+
+class InstagramChainTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rate_limited_instagram_falls_through_to_embed(self):
+        module = _module()
+        calls = []
+
+        def step(name, value=None):
+            async def run(*args, **kwargs):
+                calls.append(name)
+                return value
+            return run
+
+        module._dl_instagram_ytdlp = step("ytdlp")
+        module._dl_instagram_instaloader = step("instaloader")
+        module._dl_instagram_embed = step("embed", ["clip.mp4"])
+        module._dl_gallery_dl = step("gallery")
+        module._dl_cobalt = step("cobalt")
+
+        result = await module._download(
+            "https://www.instagram.com/reel/abc", "b", None, False
+        )
+        self.assertEqual(result, ["clip.mp4"])
+        self.assertEqual(calls, ["ytdlp", "instaloader", "embed"])
+
+    async def test_cobalt_is_the_last_instagram_fallback(self):
+        module = _module()
+        for name in ("_dl_instagram_ytdlp", "_dl_instagram_instaloader",
+                     "_dl_instagram_embed", "_dl_gallery_dl"):
+            setattr(module, name, unittest.mock.AsyncMock(return_value=None))
+        module._dl_cobalt = unittest.mock.AsyncMock(return_value=["c.mp4"])
+        result = await module._download(
+            "https://www.instagram.com/reel/abc", "b", None, False
+        )
+        self.assertEqual(result, ["c.mp4"])
 
 
 class MediaInfoTests(unittest.IsolatedAsyncioTestCase):
