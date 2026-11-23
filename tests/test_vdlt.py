@@ -625,6 +625,35 @@ class InstagramChainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, ["c.mp4"])
 
 
+class InstagramAuthTests(unittest.IsolatedAsyncioTestCase):
+    def test_refusals_are_classified_as_auth(self):
+        for message in (
+            'JSON Query to graphql/query: Expecting value: line 1 column 1 (char 0)',
+            '401 Unauthorized - "Please wait a few minutes before you try again."',
+            '[instagram][error] HTTP redirect to home page (https://www.instagram.com/)',
+        ):
+            self.assertTrue(vdlt._is_instagram_auth_error(message), message)
+        self.assertFalse(vdlt._is_instagram_auth_error("ffmpeg not found"))
+
+    async def test_refused_instagram_reports_auth_required(self):
+        module = _module()
+
+        async def refused(*args):
+            args[-1].append("x")
+            return None
+
+        module._dl_instagram_ytdlp = refused
+        module._dl_instagram_instaloader = refused
+        module._dl_instagram_embed = refused
+        module._dl_gallery_dl = refused
+        module._dl_cobalt = unittest.mock.AsyncMock(return_value=None)
+        result = await module._download(
+            "https://www.instagram.com/reel/abc", "b", None, False
+        )
+        self.assertEqual(result, "AUTH_REQUIRED")
+        self.assertIn("cookies", vdlt.VideoDownloaderMod.strings["err_instagram_auth"])
+
+
 class MediaInfoTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         _install_utils()
