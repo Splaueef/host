@@ -654,6 +654,33 @@ class InstagramAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("cookies", vdlt.VideoDownloaderMod.strings["err_instagram_auth"])
 
 
+class InstagramSessionTests(unittest.TestCase):
+    def _write(self, folder, *lines):
+        path = os.path.join(folder, "cookies.txt")
+        with open(path, "w") as f:
+            f.write("# Netscape HTTP Cookie File\n" + "\n".join(lines) + "\n")
+        return path
+
+    def test_session_cookie_is_detected(self):
+        future = str(int(time.time()) + 86400)
+        with tempfile.TemporaryDirectory() as folder:
+            ok = self._write(folder, f"#HttpOnly_.instagram.com\tTRUE\t/\tTRUE\t{future}\tsessionid\t1%3Aabc")
+            self.assertEqual(vdlt._ig_session_status(ok), "ok")
+            missing = self._write(folder, f".instagram.com\tTRUE\t/\tTRUE\t{future}\tcsrftoken\tx")
+            self.assertEqual(vdlt._ig_session_status(missing), "missing")
+            old = self._write(folder, ".instagram.com\tTRUE\t/\tTRUE\t1000\tsessionid\tx")
+            self.assertEqual(vdlt._ig_session_status(old), "expired")
+
+    def test_private_copy_protects_shared_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            shared = self._write(folder, ".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tx")
+            copy = vdlt._private_cookie_copy(shared, os.path.join(folder, "task"))
+            self.assertNotEqual(copy, shared)
+            with open(copy, "w") as f:
+                f.write("")
+            self.assertEqual(vdlt._ig_session_status(shared), "ok")
+
+
 class MediaInfoTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         _install_utils()

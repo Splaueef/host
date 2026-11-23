@@ -1,4 +1,4 @@
-__version__ = (7, 3, 2)
+__version__ = (7, 3, 3)
 VERSION = ".".join(map(str, __version__))
 
 import os
@@ -492,6 +492,50 @@ def _cookie_file_has_domain(path: str, domains: tuple[str, ...]) -> bool:
     except Exception as e:
         logger.warning("Could not read cookies file %s: %s", path, e)
     return False
+
+
+def _ig_session_status(path: str) -> str:
+    """'ok', 'expired' or 'missing' for the Instagram login cookie (sessionid)."""
+    expired = False
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#HttpOnly_"):
+                    line = line[len("#HttpOnly_"):]
+                elif not line or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) < 7 or "instagram.com" not in fields[0].lower():
+                    continue
+                if fields[5] != "sessionid" or not fields[6].strip('"'):
+                    continue
+                try:
+                    expires = int(float(fields[4] or 0))
+                except ValueError:
+                    expires = 0
+                if expires and expires < time.time():
+                    expired = True
+                    continue
+                return "ok"
+    except OSError:
+        pass
+    return "expired" if expired else "missing"
+
+
+def _private_cookie_copy(path: str | None, folder: str) -> str | None:
+    """Copy cookies for one task: yt-dlp and gallery-dl write the jar back,
+    and an Instagram logout response would otherwise wipe the shared session."""
+    if not path:
+        return None
+    try:
+        os.makedirs(folder, exist_ok=True)
+        copy = os.path.join(folder, f"cookies_{os.urandom(4).hex()}.txt")
+        shutil.copyfile(path, copy)
+        return copy
+    except OSError as e:
+        logger.warning("Could not copy cookies %s: %s", path, e)
+        return path
 
 
 def _cookie_domains_status(path: str | None = None) -> dict[str, bool]:
@@ -1138,6 +1182,22 @@ class VideoDownloaderMod(loader.Module):
     def _cookies_for(self, url: str) -> str | None:
         """This module's own cookies file (VoiceChat reads it as well)."""
         return self._cookie_manager().file_for(url)
+
+    def _instagram_cookies(self, url: str, base_name: str) -> str | None:
+        """A per-task copy of cookies.txt for Instagram, if it holds a live session."""
+        cookies = self._download_cookies(url)
+        if not cookies:
+            logger.warning("Instagram: cookies.txt has no instagram.com cookies")
+            return None
+        status = _ig_session_status(cookies)
+        if status != "ok":
+            logger.warning(
+                "Instagram: sessionid in cookies.txt is %s — log in and export cookies again",
+                status,
+            )
+        return _private_cookie_copy(
+            cookies, os.path.join(os.path.dirname(base_name) or ".", "ig_cookies")
+        )
 
     def _download_cookies(self, url: str) -> str | None:
         """Cookies for a download: VoiceChat's YouTube session comes first."""
@@ -1871,7 +1931,7 @@ class VideoDownloaderMod(loader.Module):
             return None
 
         out_dir = base_name + "_ig"
-        cookies = self._download_cookies(url)
+        cookies = self._instagram_cookies(url, base_name)
 
         def _fetch():
             try:
@@ -2023,7 +2083,7 @@ class VideoDownloaderMod(loader.Module):
     ) -> list | None:
         import yt_dlp
 
-        cookies = self._download_cookies(url)
+        cookies = self._instagram_cookies(url, base_name)
         is_vertical = _is_vertical_url(url)
 
         def _dl():
@@ -2980,7 +3040,11 @@ class VideoDownloaderMod(loader.Module):
     ) -> list | None:
         if not self.config.get("use_gallery_dl", True):
             return None
-        cookies = self._download_cookies(url)
+        cookies = (
+            self._instagram_cookies(url, base_name)
+            if _url_is(url, "instagram.com", "instagr.am", "threads.net")
+            else self._download_cookies(url)
+        )
 
         def _run():
             try:
@@ -4710,9 +4774,20 @@ class VideoDownloaderMod(loader.Module):
             return "❌ відсутній"
         _merge_platform_cookies()
         statuses = _cookie_domains_status(self._cookie_manager().cookies_file)
-        domains = "\n".join(
-            f"   {'✅' if ok else '❌'} {name}" for name, ok in statuses.items()
-        )
+        ig_note = {
+            "ok": "сесія ✅",
+            "expired": "sessionid протермінований ❌ — увійди знову й переекспортуй",
+            "missing": "немає sessionid ❌ — експортовано без входу в акаунт",
+        }
+
+        def _line(name, ok):
+            line = f"   {'✅' if ok else '❌'} {name}"
+            if name == "Instagram" and ok:
+                status = _ig_session_status(self._cookie_manager().cookies_file)
+                line += f" ({ig_note[status]})"
+            return line
+
+        domains = "\n".join(_line(name, ok) for name, ok in statuses.items())
         await utils.answer(
             message,
             self.strings("cookies_status").format(
